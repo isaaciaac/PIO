@@ -5,6 +5,7 @@ from typing import Optional
 
 from vibe.config import VibeConfig
 from vibe.policy import PolicyDeniedError, ToolPolicy
+from vibe.routes import DiffStats
 from vibe.tools.cmd import Cmd, CmdResult, CmdTool
 from vibe.tools.fs import FileReadResult, FsTool
 from vibe.tools.git import GitCommitResult, GitTool
@@ -98,3 +99,23 @@ class Toolbox:
         self._require_tool_allowed(agent_id=agent_id, tool="git")
         self.policy.check(agent_id=agent_id, tool="git", detail=f"git commit -m {message!r}")
         return self.git.commit(message, allow_empty=allow_empty)
+
+    def git_diff_stats(self, *, agent_id: str) -> DiffStats:
+        self._require_tool_allowed(agent_id=agent_id, tool="git")
+        self.policy.check(agent_id=agent_id, tool="git", detail="git diff --numstat")
+        r = self.git.diff_numstat()
+        raw = self.cmd.artifacts.read_bytes(r.stdout).decode("utf-8", errors="replace")
+        files: list[str] = []
+        added = 0
+        deleted = 0
+        for line in raw.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            a, d, path = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            files.append(path)
+            if a.isdigit():
+                added += int(a)
+            if d.isdigit():
+                deleted += int(d)
+        return DiffStats(file_count=len(files), loc_added=added, loc_deleted=deleted, paths=tuple(files), pointer=r.stdout)

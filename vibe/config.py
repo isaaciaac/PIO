@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel, Field
 
+from vibe.schemas.packs import RouteLevel
+
 
 class ProviderConfig(BaseModel):
     id: str
@@ -38,16 +40,29 @@ class PolicyConfig(BaseModel):
     mode: Literal["allow_all", "prompt", "chat_only"] = "allow_all"
 
 
+class RouteProfile(BaseModel):
+    agents: List[str] = Field(default_factory=list)
+
+
+class RoutesConfig(BaseModel):
+    levels: Dict[RouteLevel, RouteProfile] = Field(default_factory=dict)
+
+
 class VibeConfig(BaseModel):
     version: str = "0.1"
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    routes: RoutesConfig = Field(default_factory=RoutesConfig)
     providers: Dict[str, ProviderConfig]
     agents: Dict[str, AgentConfig]
 
     @staticmethod
     def load(path: Path) -> "VibeConfig":
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        return VibeConfig.model_validate(data)
+        cfg = VibeConfig.model_validate(data)
+        if not cfg.routes.levels:
+            cfg.routes = default_routes(list(cfg.agents.keys()))
+        _migrate_config_in_memory(cfg)
+        return cfg
 
     def redacted(self) -> "VibeConfig":
         # Keys are always in env vars; nothing to redact besides repeating env var name.
@@ -104,7 +119,15 @@ def default_config() -> VibeConfig:
             model="qwen-plus",
             purpose="Orchestrate workflow and state transitions",
             io_schema="vibe.schemas.packs.Plan",
-            ledger_write_types=["PLAN_CREATED", "CONTEXT_PACKET_BUILT", "STATE_TRANSITION", "CHECKPOINT_CREATED", "BRANCH_CREATED"],
+            ledger_write_types=[
+                "ROUTE_SELECTED",
+                "AGENTS_ACTIVATED",
+                "PLAN_CREATED",
+                "CONTEXT_PACKET_BUILT",
+                "STATE_TRANSITION",
+                "CHECKPOINT_CREATED",
+                "BRANCH_CREATED",
+            ],
             tools_allowed=["read_file", "run_cmd", "git", "search", "write_file"],
         ),
         "log_compressor": agent(
@@ -325,10 +348,57 @@ def default_config() -> VibeConfig:
         ),
     }
 
-    return VibeConfig(providers=providers, agents=agents)
+    return VibeConfig(providers=providers, agents=agents, routes=default_routes(list(agents.keys())))
 
 
 def write_default_config(repo_root: Path, cfg: VibeConfig) -> None:
     cfg_path = repo_root / ".vibe" / "vibe.yaml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg.model_dump(), sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def default_routes(agent_ids: List[str]) -> RoutesConfig:
+    return RoutesConfig(
+        levels={
+            "L0": RouteProfile(agents=["router", "coder_backend", "qa"]),
+            "L1": RouteProfile(agents=["pm", "router", "coder_backend", "qa"]),
+            "L2": RouteProfile(
+                agents=[
+                    "pm",
+                    "requirements_analyst",
+                    "architect",
+                    "api_confirm",
+                    "coder_backend",
+                    "code_reviewer",
+                    "qa",
+                ]
+            ),
+            "L3": RouteProfile(
+                agents=[
+                    "pm",
+                    "requirements_analyst",
+                    "architect",
+                    "api_confirm",
+                    "coder_backend",
+                    "code_reviewer",
+                    "qa",
+                    "env_engineer",
+                    "devops",
+                    "security",
+                    "doc_writer",
+                    "release_manager",
+                ]
+            ),
+            "L4": RouteProfile(agents=sorted(set(agent_ids))),
+        }
+    )
+
+
+def _migrate_config_in_memory(cfg: VibeConfig) -> None:
+    # Backward compatible defaults for older vibe.yaml files.
+    router = cfg.agents.get("router")
+    if router:
+        needed = {"ROUTE_SELECTED", "AGENTS_ACTIVATED"}
+        existing = set(router.memory_scope.ledger_write_types or [])
+        if not needed.issubset(existing):
+            router.memory_scope.ledger_write_types = sorted(existing | needed)

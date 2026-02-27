@@ -39,9 +39,19 @@ vibe checkpoint list
 - `vibe config show`
 - `vibe task add "..."`（写入 `REQ_CREATED` 到 ledger）
 - `vibe chat "..."`（PM 自然语言对话；可用 `--json` 输出结构化结果）
-- `vibe run [--task <event_id>] [--mock]`（mock 下闭环并产出 green checkpoint）
+- `vibe run [--task <event_id>] [--mock] [--route auto|L0|L1|L2|L3|L4]`（mock 下闭环并产出 checkpoint）
 - `vibe checkpoint list/create/restore`
 - `vibe branch create --from <checkpoint_id> [--name <git_branch>]`
+
+## 路由等级（L0–L4）
+
+`vibe run` 支持按风险/范围选择不同的门禁等级：
+
+- `--route auto`（默认）：由 `RouteDecider` 硬逻辑选择（低风险默认走 `L1`）
+- `--route L0`：极速路径（仅 smoke 验证；检查点一定是 `green=false` / draft）
+- `--route L1`：标准路径（PM→Router→Coder→QA；通过才允许 `green=true`）
+
+> 说明：`L2+` 的门禁流程会在后续 Phase 补齐；当前选择 `L2/L3/L4` 会报 “not implemented yet”。
 
 ## 权限模式（允许 / 每次提示 / 仅聊天）
 

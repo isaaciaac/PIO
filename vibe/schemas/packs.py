@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+RouteLevel = Literal["L0", "L1", "L2", "L3", "L4"]
+
+
 class RequirementPack(BaseModel):
     summary: str
     acceptance: List[str] = Field(default_factory=list)
@@ -67,6 +70,11 @@ class ChatReply(BaseModel):
     reply: str
     suggested_actions: List[str] = Field(default_factory=list)
     pointers: List[str] = Field(default_factory=list)
+
+
+class RouteDecision(BaseModel):
+    route_level: RouteLevel
+    reasons: List[str] = Field(default_factory=list)
 
 
 class ReviewReport(BaseModel):

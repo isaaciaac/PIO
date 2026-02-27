@@ -150,13 +150,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const mock = Boolean(msg?.mock);
           const mode = String(msg?.mode || "chat").trim();
           const agent = String(msg?.agent || "pm").trim();
+          const route = String(msg?.route || "auto").trim();
           if (!text) return;
           if (mode === "chat") {
             await this.handlePmChat(root, text, mock, agent);
           } else if (mode === "prompt") {
-            await this.handleChatSend(root, text, mock, "prompt");
+            await this.handleChatSend(root, text, mock, "prompt", route);
           } else if (mode === "allow_all") {
-            await this.handleChatSend(root, text, mock, "allow_all");
+            await this.handleChatSend(root, text, mock, "allow_all", route);
           } else {
             await this.handlePmChat(root, text, mock, agent);
           }
@@ -264,7 +265,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleChatSend(root: string, text: string, mock: boolean, policyOverride: string): Promise<void> {
+  private async handleChatSend(root: string, text: string, mock: boolean, policyOverride: string, route: string): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.addMessage("user", text);
@@ -288,7 +289,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
       this.addMessage("assistant", `已创建任务：${taskId}`, "任务");
 
-      const runArgs = ["run", "--task", taskId, "--path", root];
+      const runArgs = ["run", "--task", taskId, "--path", root, "--route", route || "auto"];
       if (mock) runArgs.push("--mock");
       const runRes = await runVibeCapture(runArgs, {
         cwd: root,
@@ -513,6 +514,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               <option value="prompt">确认权限（写项目）</option>
               <option value="allow_all">完全授权（写项目）</option>
             </select>
+            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（未实现等级会报错）">
+              <option value="auto" selected>路由：自动</option>
+              <option value="L0">路由：L0 极速</option>
+              <option value="L1">路由：L1 标准</option>
+              <option value="L2">路由：L2 安全</option>
+              <option value="L3">路由：L3 发布</option>
+              <option value="L4">路由：L4 全路径</option>
+            </select>
             <span class="agentWrap" id="agentWrap" title="选择要对话的角色（仅聊天模式生效）">
               <label for="agent">角色</label>
               <select id="agent">
@@ -548,6 +557,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elStatus = document.getElementById('status');
       const elMock = document.getElementById('mock');
       const elMode = document.getElementById('mode');
+      const elRoute = document.getElementById('route');
       const elAgent = document.getElementById('agent');
       const elAgentWrap = document.getElementById('agentWrap');
 
@@ -586,8 +596,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const text = (elInput.value || '').trim();
         if (!text) return;
         const mode = (elMode && elMode.value) ? elMode.value : 'chat';
+        const route = (elRoute && elRoute.value) ? elRoute.value : 'auto';
         const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
-        vscode.postMessage({ type: 'chatSend', mode, agent, text, mock: !!elMock.checked });
+        vscode.postMessage({ type: 'chatSend', mode, route, agent, text, mock: !!elMock.checked });
         elInput.value = '';
       }
 

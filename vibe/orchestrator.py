@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 from uuid import uuid4
 
 from vibe.agents.registry import AGENT_REGISTRY
@@ -16,6 +16,7 @@ from vibe.storage.checkpoints import CheckpointsStore
 from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
+from vibe.routes import DiffStats, decide_route
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,50 @@ class Orchestrator:
             recent.append(packs.ContextEventRef(id=evt.id, summary=evt.summary, pointers=evt.pointers))
         return packs.ContextPacket(repo_pointers=pointers, recent_events=recent)
 
-    def _run_tests(self) -> packs.TestReport:
+    def _recent_test_fail_count(self, *, lookback_events: int = 50) -> int:
+        count = 0
+        for evt in self.ledger.iter_events(limit=lookback_events, reverse=True):
+            if evt.type == "TEST_FAILED":
+                count += 1
+        return count
+
+    def _git_diff_stats_best_effort(self) -> DiffStats:
+        try:
+            return self.toolbox.git_diff_stats(agent_id="router")
+        except Exception:
+            return DiffStats()
+
+    def _agents_for_route(self, route_level: packs.RouteLevel) -> list[str]:
+        profile = (self.config.routes.levels or {}).get(route_level)
+        agents = list(profile.agents) if profile else []
+        if not agents:
+            # Backward compatible fallback: treat as L1 minimal set.
+            agents = ["pm", "router", "coder_backend", "qa"] if route_level != "L0" else ["router", "coder_backend", "qa"]
+        # Router is mandatory for ledger/gates.
+        if "router" not in agents:
+            agents = ["router", *agents]
+        # De-duplicate while preserving order.
+        out: list[str] = []
+        seen: set[str] = set()
+        for a in agents:
+            a = str(a).strip()
+            if not a or a in seen:
+                continue
+            seen.add(a)
+            out.append(a)
+        return out
+
+    def _append_guarded(self, *, event: LedgerEvent, activated_agents: Set[str]) -> None:
+        if event.agent != "user" and event.agent not in activated_agents:
+            raise RuntimeError(f"Agent not activated for this route: {event.agent}")
+        agent_cfg = self.config.agents.get(event.agent)
+        if agent_cfg and agent_cfg.memory_scope.ledger_write_types:
+            allowed = set(agent_cfg.memory_scope.ledger_write_types)
+            if event.type not in allowed:
+                raise RuntimeError(f"Ledger write type not allowed for agent {event.agent}: {event.type}")
+        self.ledger.append(event)
+
+    def _run_tests(self, *, profile: str) -> packs.TestReport:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
             return packs.TestReport(
                 commands=["mock"],
@@ -101,12 +145,25 @@ class Orchestrator:
             )
 
         commands: List[str] = []
-        if (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists():
-            commands = ["pytest -q"]
-        elif (self.repo_root / "package.json").exists():
-            commands = ["npm test"]
+
+        is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
+        is_node = (self.repo_root / "package.json").exists()
+
+        p = profile.strip().lower()
+        if p == "smoke":
+            if is_py:
+                commands = ["python -m compileall ."]
+            elif is_node:
+                commands = ["npm test"]
+            else:
+                return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
         else:
-            return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
+            if is_py:
+                commands = ["python -m compileall .", "pytest -q"]
+            elif is_node:
+                commands = ["npm test"]
+            else:
+                return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
 
         results: List[packs.TestResult] = []
         blockers: List[str] = []
@@ -121,61 +178,123 @@ class Orchestrator:
 
         return packs.TestReport(commands=commands, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
-    def run(self, *, task_id: Optional[str] = None) -> RunResult:
+    def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None) -> RunResult:
         task_evt = self._find_task(task_id)
         task_text = str(task_evt.meta.get("text") or task_evt.summary)
 
+        diff = self._git_diff_stats_best_effort()
+        decision = decide_route(
+            task_text=task_text,
+            diff=diff,
+            recent_test_fail_count=self._recent_test_fail_count(),
+            requested_level=route,
+        )
+        route_level = decision.route_level
+        activated_agents_list = self._agents_for_route(route_level)
+        activated_agents: Set[str] = set(activated_agents_list)
+
+        # Ledger: route selection + activation set (must be auditable).
+        route_pointers = [p for p in [diff.pointer] if p]
+        self._append_guarded(
+            event=new_event(
+                agent="router",
+                type="ROUTE_SELECTED",
+                summary=f"Selected route {route_level}",
+                branch_id=self.branch_id,
+                pointers=route_pointers,
+                meta={
+                    "route_level": route_level,
+                    "reasons": decision.reasons,
+                    "diff": {
+                        "files": diff.file_count,
+                        "loc_added": diff.loc_added,
+                        "loc_deleted": diff.loc_deleted,
+                        "loc_changed": diff.loc_changed,
+                    },
+                },
+            ),
+            activated_agents=activated_agents,
+        )
+        self._append_guarded(
+            event=new_event(
+                agent="router",
+                type="AGENTS_ACTIVATED",
+                summary=f"Activated {len(activated_agents_list)} agents",
+                branch_id=self.branch_id,
+                pointers=[],
+                meta={"route_level": route_level, "agents": activated_agents_list},
+            ),
+            activated_agents=activated_agents,
+        )
+
+        if route_level not in {"L0", "L1"}:
+            raise NotImplementedError(f"Route level {route_level} is not implemented yet (Phase 2+).")
+
         router = self._agent("router")
-        pm = self._agent("pm")
+        pm = self._agent("pm") if "pm" in activated_agents else None
         coder = self._agent("coder_backend")
 
         ctx = self._build_context_packet()
-        self.ledger.append(
-            new_event(
+        self._append_guarded(
+            event=new_event(
                 agent="router",
                 type="CONTEXT_PACKET_BUILT",
                 summary="Built ContextPacket",
                 branch_id=self.branch_id,
                 pointers=ctx.repo_pointers,
-            )
-        )
-
-        req, _req_meta = pm.chat_json(
-            schema=packs.RequirementPack,
-            system=(
-                "You are PM. Return JSON only for RequirementPack with fields: "
-                "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
-                "No extra keys. No wrapping object. No markdown."
+                meta={"route_level": route_level},
             ),
-            user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
-        )
-        self.ledger.append(
-            new_event(
-                agent="pm",
-                type="AC_DEFINED",
-                summary="Acceptance criteria defined",
-                branch_id=self.branch_id,
-                pointers=[],
-                meta={"acceptance": req.acceptance},
-            )
+            activated_agents=activated_agents,
         )
 
+        req: packs.RequirementPack | None = None
+        if route_level != "L0":
+            if not pm:
+                raise RuntimeError("pm must be activated for L1+ routes")
+            req, _req_meta = pm.chat_json(
+                schema=packs.RequirementPack,
+                system=(
+                    "You are PM. Return JSON only for RequirementPack with fields: "
+                    "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
+                    "No extra keys. No wrapping object. No markdown."
+                ),
+                user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
+            )
+            self._append_guarded(
+                event=new_event(
+                    agent="pm",
+                    type="AC_DEFINED",
+                    summary="Acceptance criteria defined",
+                    branch_id=self.branch_id,
+                    pointers=[],
+                    meta={"acceptance": req.acceptance, "route_level": route_level},
+                ),
+                activated_agents=activated_agents,
+            )
+
+        plan_user = (
+            f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            if req is not None
+            else f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
+        )
         plan, _plan_meta = router.chat_json(
             schema=packs.Plan,
             system=(
                 "You are Router. Return JSON only for Plan: {tasks:[{id,title,agent,description}]}. "
                 "No extra keys. No markdown."
             ),
-            user=f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
+            user=plan_user,
         )
-        self.ledger.append(
-            new_event(
+        self._append_guarded(
+            event=new_event(
                 agent="router",
                 type="PLAN_CREATED",
                 summary=f"Planned {len(plan.tasks)} tasks",
                 branch_id=self.branch_id,
                 pointers=[],
-            )
+                meta={"route_level": route_level},
+            ),
+            activated_agents=activated_agents,
         )
 
         change, _change_meta = coder.chat_json(
@@ -185,21 +304,26 @@ class Orchestrator:
                 "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "No extra keys. No markdown."
             ),
-            user=f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
+            user=(
+                f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+                if req is not None
+                else f"Task:\n{task_text}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            ),
         )
         if change.kind == "noop" or not change.patch_pointer:
             patch_ptr = self.artifacts.put_text("mock: no code changes", suffix=".patch.txt", kind="patch").to_pointer()
             change = packs.CodeChange(kind="patch", summary=change.summary or "mock patch", patch_pointer=patch_ptr, files_changed=change.files_changed)
 
-        self.ledger.append(
-            new_event(
+        self._append_guarded(
+            event=new_event(
                 agent="coder_backend",
                 type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                 summary=change.summary,
                 branch_id=self.branch_id,
                 pointers=[p for p in [change.patch_pointer, change.commit_hash] if p],
-                meta={"files_changed": change.files_changed},
-            )
+                meta={"files_changed": change.files_changed, "route_level": route_level},
+            ),
+            activated_agents=activated_agents,
         )
 
         if self.policy.mode == "chat_only":
@@ -209,47 +333,112 @@ class Orchestrator:
                 artifacts.append(change.patch_pointer)
             cp = self.checkpoints.create(
                 checkpoint_id=checkpoint_id,
-                label=req.summary,
+                label=(req.summary if req is not None else task_text.strip().splitlines()[0][:120]),
                 repo_ref="no-git",
                 ledger_offset=self.ledger.count_lines(),
                 artifacts=artifacts,
                 green=False,
                 restore_steps=["policy(chat_only): no restore steps recorded"],
-                meta={"reason": "chat_only"},
+                meta={"reason": "chat_only", "route_level": route_level, "agents": activated_agents_list},
             )
-            self.ledger.append(
-                new_event(
+            self._append_guarded(
+                event=new_event(
                     agent="router",
                     type="CHECKPOINT_CREATED",
                     summary=f"Created checkpoint {cp.id} (non-green, chat_only)",
                     branch_id=self.branch_id,
                     pointers=artifacts,
-                    meta={"green": False, "repo_ref": "no-git"},
-                )
+                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list},
+                ),
+                activated_agents=activated_agents,
             )
             return RunResult(checkpoint_id=cp.id, green=False)
 
         # QA
-        self.ledger.append(
-            new_event(
+        qa_profile = "smoke" if route_level == "L0" else "unit"
+        self._append_guarded(
+            event=new_event(
                 agent="qa",
                 type="TEST_RUN",
-                summary="mock: tests skipped" if os.getenv("VIBE_MOCK_MODE", "").strip() == "1" else "Running tests",
+                summary="mock: tests skipped" if os.getenv("VIBE_MOCK_MODE", "").strip() == "1" else f"Running tests ({qa_profile})",
                 branch_id=self.branch_id,
                 pointers=[],
-            )
+                meta={"profile": qa_profile, "route_level": route_level},
+            ),
+            activated_agents=activated_agents,
         )
-        report = self._run_tests()
-        self.ledger.append(
-            new_event(
+        report = self._run_tests(profile=qa_profile)
+        self._append_guarded(
+            event=new_event(
                 agent="qa",
                 type="TEST_PASSED" if report.passed else "TEST_FAILED",
                 summary="Tests passed" if report.passed else "Tests failed",
                 branch_id=self.branch_id,
                 pointers=report.pointers,
-                meta={"blockers": report.blockers},
-            )
+                meta={"blockers": report.blockers, "profile": qa_profile, "route_level": route_level},
+            ),
+            activated_agents=activated_agents,
         )
+
+        if route_level == "L0":
+            # L0 never produces green checkpoints.
+            artifacts: List[str] = []
+            if change.patch_pointer:
+                artifacts.append(change.patch_pointer)
+            artifacts.extend(report.pointers)
+            checkpoint_id = f"ckpt_{uuid4().hex[:12]}"
+            cp = self.checkpoints.create(
+                checkpoint_id=checkpoint_id,
+                label=task_text.strip().splitlines()[0][:120],
+                repo_ref="no-git",
+                ledger_offset=self.ledger.count_lines(),
+                artifacts=artifacts,
+                green=False,
+                restore_steps=["L0(draft): re-run with L1+ to get green"],
+                meta={"draft": True, "route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile},
+            )
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="CHECKPOINT_CREATED",
+                    summary=f"Created draft checkpoint {cp.id} (L0)",
+                    branch_id=self.branch_id,
+                    pointers=artifacts,
+                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list},
+                ),
+                activated_agents=activated_agents,
+            )
+            return RunResult(checkpoint_id=cp.id, green=False)
+
+        # L1+ gates: if we couldn't find any QA commands, do not mark green.
+        if not report.commands:
+            artifacts: List[str] = []
+            if change.patch_pointer:
+                artifacts.append(change.patch_pointer)
+            artifacts.extend(report.pointers)
+            checkpoint_id = f"ckpt_{uuid4().hex[:12]}"
+            cp = self.checkpoints.create(
+                checkpoint_id=checkpoint_id,
+                label=(req.summary if req is not None else task_text.strip().splitlines()[0][:120]),
+                repo_ref="no-git",
+                ledger_offset=self.ledger.count_lines(),
+                artifacts=artifacts,
+                green=False,
+                restore_steps=["QA: no test commands detected; configure tests/lint then re-run"],
+                meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile, "reason": "qa_no_commands"},
+            )
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="CHECKPOINT_CREATED",
+                    summary=f"Created checkpoint {cp.id} (non-green, no QA commands)",
+                    branch_id=self.branch_id,
+                    pointers=artifacts,
+                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list},
+                ),
+                activated_agents=activated_agents,
+            )
+            return RunResult(checkpoint_id=cp.id, green=False)
 
         if not report.passed:
             max_loops = 3
@@ -273,35 +462,39 @@ class Orchestrator:
                 ).to_pointer()
                 if change.kind != "commit":
                     change = packs.CodeChange(kind="patch", summary=change.summary or f"fix {blocker}", patch_pointer=patch_ptr)
-                self.ledger.append(
-                    new_event(
+                self._append_guarded(
+                    event=new_event(
                         agent="coder_backend",
                         type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
                         pointers=[p for p in [change.patch_pointer, change.commit_hash] if p],
-                        meta={"blocker": blocker},
-                    )
+                        meta={"blocker": blocker, "route_level": route_level},
+                    ),
+                    activated_agents=activated_agents,
                 )
-                self.ledger.append(
-                    new_event(
+                self._append_guarded(
+                    event=new_event(
                         agent="qa",
                         type="TEST_RUN",
                         summary=f"Fix-loop {loop}: re-running tests",
                         branch_id=self.branch_id,
                         pointers=[],
-                    )
+                        meta={"profile": qa_profile, "route_level": route_level},
+                    ),
+                    activated_agents=activated_agents,
                 )
-                report = self._run_tests()
-                self.ledger.append(
-                    new_event(
+                report = self._run_tests(profile=qa_profile)
+                self._append_guarded(
+                    event=new_event(
                         agent="qa",
                         type="TEST_PASSED" if report.passed else "TEST_FAILED",
                         summary="Tests passed" if report.passed else "Tests failed",
                         branch_id=self.branch_id,
                         pointers=report.pointers,
-                        meta={"blockers": report.blockers, "loop": loop},
-                    )
+                        meta={"blockers": report.blockers, "loop": loop, "profile": qa_profile, "route_level": route_level},
+                    ),
+                    activated_agents=activated_agents,
                 )
             if not report.passed:
                 raise RuntimeError("Tests failed after fix-loop.")
@@ -325,22 +518,24 @@ class Orchestrator:
         )
         cp = self.checkpoints.create(
             checkpoint_id=checkpoint_id,
-            label=req.summary,
+            label=(req.summary if req is not None else task_text.strip().splitlines()[0][:120]),
             repo_ref=repo_ref,
             ledger_offset=self.ledger.count_lines(),
             artifacts=artifacts,
             green=True,
             restore_steps=restore_steps,
+            meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile},
         )
-        self.ledger.append(
-            new_event(
+        self._append_guarded(
+            event=new_event(
                 agent="router",
                 type="CHECKPOINT_CREATED",
                 summary=f"Created green checkpoint {cp.id}",
                 branch_id=self.branch_id,
                 pointers=artifacts,
-                meta={"green": True, "repo_ref": repo_ref},
-            )
+                meta={"green": True, "repo_ref": repo_ref, "route_level": route_level, "agents": activated_agents_list},
+            ),
+            activated_agents=activated_agents,
         )
 
         return RunResult(checkpoint_id=cp.id, green=True)

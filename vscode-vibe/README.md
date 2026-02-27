@@ -87,6 +87,7 @@ npm run package:vsix
   - `确认权限（写项目）`：执行工作流（`task add + run`），每次工具动作都会弹窗询问是否允许
   - `完全授权（写项目）`：执行工作流（`task add + run`），不弹窗，全部允许
 - 聊天模式下可选择“角色”，会将对话历史分别保存在 `.vibe/views/<agent_id>/chat.jsonl`
+- 写项目模式下可选择“路由等级”（`auto/L0..L4`），会在运行时传给 `vibe run --route ...`
 - 勾选 `Mock` 可无 key 运行闭环
 - 点击 `发送`（或 `Ctrl+Enter` 发送）
 

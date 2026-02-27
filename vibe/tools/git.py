@@ -51,6 +51,9 @@ class GitTool:
     def diff(self) -> CmdResult:
         return self._run(["diff"], timeout_s=60)
 
+    def diff_numstat(self) -> CmdResult:
+        return self._run(["diff", "--numstat"], timeout_s=60)
+
     def commit(self, message: str, *, allow_empty: bool = False) -> GitCommitResult:
         args = ["commit", "-m", message]
         if allow_empty:
@@ -72,4 +75,3 @@ class GitTool:
 
     def worktree_add(self, path: Path, branch: str) -> CmdResult:
         return self._run(["worktree", "add", str(path), branch], timeout_s=600)
-

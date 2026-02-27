@@ -208,13 +208,14 @@ def run(
     task: Optional[str] = typer.Option(None, "--task", help="Task event id (default: latest)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
     mock: bool = typer.Option(False, "--mock", help="Force mock mode for this run"),
+    route: str = typer.Option("auto", "--route", help="Route level: auto|L0|L1|L2|L3|L4"),
 ) -> None:
     if mock:
         os.environ["VIBE_MOCK_MODE"] = "1"
     repo_root = find_repo_root(path or Path.cwd())
     try:
         orch = Orchestrator(repo_root, policy_mode=(ctx.obj or {}).get("policy"))
-        result = orch.run(task_id=task)
+        result = orch.run(task_id=task, route=route)
         typer.echo(result.checkpoint_id)
     except PolicyDeniedError as e:
         typer.echo(str(e), err=True)
