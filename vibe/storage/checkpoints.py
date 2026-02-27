@@ -67,6 +67,7 @@ class CheckpointsStore:
     def create(
         self,
         *,
+        checkpoint_id: Optional[str] = None,
         label: str,
         repo_ref: str,
         ledger_offset: int,
@@ -78,7 +79,7 @@ class CheckpointsStore:
     ) -> Checkpoint:
         file = self.load()
         cp = Checkpoint(
-            id=f"ckpt_{uuid4().hex[:12]}",
+            id=checkpoint_id or f"ckpt_{uuid4().hex[:12]}",
             label=label,
             created_at=_now_iso(),
             repo_ref=repo_ref,
@@ -135,4 +136,3 @@ class CheckpointsStore:
                     path.unlink()
                 except OSError:
                     pass
-
