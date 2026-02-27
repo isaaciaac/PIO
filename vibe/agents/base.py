@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
-from vibe.config import AgentConfig
+from vibe.config import AgentConfig, ProviderConfig
 from vibe.providers.base import ProviderError, ProviderResult
 from vibe.providers.dashscope import DashScopeProvider
 from vibe.providers.deepseek import DeepSeekProvider
@@ -25,17 +25,21 @@ class BaseAgent:
     default_provider: str
     default_model: str
 
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(self, config: AgentConfig, *, providers: Dict[str, ProviderConfig]) -> None:
         self.config = config
+        self.providers = providers
         self.provider = self._make_provider(config.provider)
 
     def _make_provider(self, provider_id: str):
         if mock_mode_enabled() or provider_id == "mock":
             return MockProvider()
+        prov = self.providers.get(provider_id)
+        if not prov:
+            raise ProviderError(f"Provider not configured: {provider_id}")
         if provider_id == "deepseek":
-            return DeepSeekProvider()
+            return DeepSeekProvider(base_url=prov.base_url, api_key_env=prov.api_key_env or "DEEPSEEK_API_KEY")
         if provider_id == "dashscope":
-            return DashScopeProvider()
+            return DashScopeProvider(base_url=prov.base_url, api_key_env=prov.api_key_env or "DASHSCOPE_API_KEY")
         raise ProviderError(f"Unknown provider: {provider_id}")
 
     def chat_json(
@@ -55,4 +59,3 @@ class BaseAgent:
         else:
             msgs = messages
         return self.provider.chat_json(model=self.config.model, messages=msgs, schema=schema, temperature=temperature)
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -188,7 +188,7 @@ def branch_create(
             {
                 "id": branch_name,
                 "git_branch": branch_name,
-                "created_at": datetime.utcnow().isoformat() + "Z",
+                "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "derived_from": checkpoint_id,
                 "repo_ref": cp.repo_ref,
             },

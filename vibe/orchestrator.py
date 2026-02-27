@@ -47,7 +47,7 @@ class Orchestrator:
         if not cls:
             raise KeyError(f"Unknown agent id: {agent_id}")
         cfg = self.config.agents[agent_id]
-        return cls(cfg)
+        return cls(cfg, providers=self.config.providers)
 
     def _find_task(self, task_id: Optional[str]) -> LedgerEvent:
         if task_id:
