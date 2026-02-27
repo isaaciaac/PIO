@@ -23,6 +23,5 @@ test = [
 [project.scripts]
 vibe = "vibe.cli:app"
 
-[tool.setuptools]
-packages = ["vibe"]
-
+[tool.setuptools.packages.find]
+include = ["vibe*"]
