@@ -35,7 +35,7 @@
     ],
     "views": {
       "explorer": [
-        { "id": "vibe.dashboard", "name": "Vibe" }
+        { "type": "webview", "id": "vibe.dashboard", "name": "Vibe" }
       ]
     },
     "configuration": {
