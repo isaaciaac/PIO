@@ -58,6 +58,12 @@ class OpenAICompatProvider:
     def _api_key(self) -> str:
         if not self.api_key_env:
             raise ProviderError(f"{self.provider_id} requires no api key env, but _api_key() was called")
+        # Common misconfig: user puts the *actual key* into api_key_env.
+        if self.api_key_env.startswith("sk-") or self.api_key_env.startswith("ds-") or len(self.api_key_env) > 40:
+            raise ProviderError(
+                f"Invalid api_key_env for provider {self.provider_id}: it looks like an API key, not an env var name. "
+                f"Set api_key_env to something like 'DEEPSEEK_API_KEY'/'DASHSCOPE_API_KEY', and put the real key into that env var."
+            )
         key = os.getenv(self.api_key_env)
         if not key:
             raise ProviderError(f"Missing env var {self.api_key_env} for provider {self.provider_id}")
@@ -92,4 +98,3 @@ def ensure_deepseek_reasoner_format(messages: List[Dict[str, str]]) -> List[Dict
         out.append({"role": "user", "content": "Context follows."})
     out.extend(messages[i:])
     return out
-
