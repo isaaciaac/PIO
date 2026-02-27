@@ -42,6 +42,18 @@ vibe checkpoint list
 - `vibe checkpoint list/create/restore`
 - `vibe branch create --from <checkpoint_id> [--name <git_branch>]`
 
+## VS Code 扩展（最小 IDE 封装）
+
+扩展源码在 `vscode-vibe/`，提供 Dashboard + 一组 `Vibe:` 命令（调用本机 `vibe` CLI）。
+
+```bash
+cd vscode-vibe
+npm install
+npm run compile
+```
+
+然后在 VS Code 中打开仓库，按 `F5` 启动 Extension Development Host。
+
 ## 国内模型接入（可选）
 
 - DeepSeek：设置 `DEEPSEEK_API_KEY`
