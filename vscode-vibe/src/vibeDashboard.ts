@@ -268,52 +268,188 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: var(--vscode-font-family); padding: 10px; }
-      h3 { margin: 6px 0 10px; }
-      button { margin: 6px 0; padding: 7px 8px; }
-      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
-      .messages { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 8px; height: 45vh; overflow: auto; background: var(--vscode-editor-background); }
-      .msg { padding: 8px; border-radius: 8px; margin: 6px 0; border: 1px solid transparent; }
-      .msg.user { background: rgba(0, 122, 204, 0.12); border-color: rgba(0, 122, 204, 0.25); }
-      .msg.assistant { background: rgba(128, 128, 128, 0.10); border-color: rgba(128, 128, 128, 0.18); }
-      .msg.system { background: rgba(70, 130, 180, 0.10); border-color: rgba(70, 130, 180, 0.18); }
-      .meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 10px; }
-      .meta small { color: var(--vscode-descriptionForeground); }
-      textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 64px; max-height: 180px; padding: 8px; border-radius: 6px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
-      .sendRow { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin-top: 8px; }
-      .status { margin-top: 8px; color: var(--vscode-descriptionForeground); }
-      .title { font-size: 12px; opacity: 0.8; margin-bottom: 4px; }
+      :root {
+        --vibe-radius: 10px;
+        --vibe-gap: 10px;
+      }
+
+      html, body { height: 100%; }
+      body {
+        font-family: var(--vscode-font-family);
+        margin: 0;
+        padding: 0;
+        color: var(--vscode-foreground);
+        background: var(--vscode-sideBar-background);
+      }
+
+      .app {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--vibe-gap);
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--vscode-panel-border);
+        background: var(--vscode-sideBar-background);
+      }
+
+      .brand {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        user-select: none;
+      }
+      .brand strong { font-weight: 700; letter-spacing: 0.2px; }
+      .brand small { color: var(--vscode-descriptionForeground); }
+
+      .toolbar { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+
+      button {
+        cursor: pointer;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        padding: 6px 10px;
+        font: inherit;
+      }
+      button.primary {
+        background: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+      }
+      button.primary:hover { background: var(--vscode-button-hoverBackground); }
+      button.secondary {
+        background: transparent;
+        color: var(--vscode-foreground);
+        border-color: var(--vscode-panel-border);
+      }
+      button.secondary:hover { background: var(--vscode-list-hoverBackground); }
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+      .chat {
+        flex: 1;
+        overflow: auto;
+        padding: 12px;
+        background: var(--vscode-editor-background);
+      }
+
+      .msg {
+        max-width: 92%;
+        border-radius: var(--vibe-radius);
+        padding: 10px 12px;
+        margin: 8px 0;
+        border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border));
+        background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      }
+      .msg .title {
+        font-size: 11px;
+        opacity: 0.8;
+        margin-bottom: 6px;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .msg.user {
+        margin-left: auto;
+        background: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+        border-color: var(--vscode-button-background);
+      }
+      .msg.user .title { color: var(--vscode-button-foreground); }
+      .msg.system {
+        background: var(--vscode-notifications-background, rgba(70, 130, 180, 0.10));
+        border-color: var(--vscode-notifications-border, var(--vscode-panel-border));
+      }
       pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+      .composer {
+        padding: 10px 12px;
+        border-top: 1px solid var(--vscode-panel-border);
+        background: var(--vscode-sideBar-background);
+      }
+
+      .metaRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+        color: var(--vscode-descriptionForeground);
+        font-size: 12px;
+      }
+
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        resize: vertical;
+        min-height: 84px;
+        max-height: 220px;
+        padding: 10px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+        background: var(--vscode-input-background);
+        color: var(--vscode-input-foreground);
+        outline: none;
+      }
+      textarea:focus { border-color: var(--vscode-focusBorder); }
+
+      .sendRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 8px;
+      }
+
+      .status { color: var(--vscode-descriptionForeground); font-size: 12px; }
+
+      .btnRow {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
     </style>
   </head>
   <body>
-    <h3>Vibe (Sidebar)</h3>
-    <div class="actions">
-      <button id="init">Init</button>
-      <button id="clear">Clear Chat</button>
-      <button id="config">Open Config</button>
-      <button id="ledger">Open Ledger</button>
-    </div>
+    <div class="app">
+      <div class="topbar">
+        <div class="brand">
+          <strong>Vibe</strong>
+          <small>multi-agent workflow</small>
+        </div>
+        <div class="toolbar">
+          <button class="secondary" id="init" title="Initialize .vibe in this workspace">Init</button>
+          <button class="secondary" id="config" title="Open .vibe/vibe.yaml">Config</button>
+          <button class="secondary" id="ledger" title="Open .vibe/ledger.jsonl">Ledger</button>
+          <button class="secondary" id="checkpoints" title="List checkpoints in Output">Checkpoints</button>
+          <button class="secondary" id="clear" title="Clear chat history">Clear</button>
+        </div>
+      </div>
 
-    <div id="messages" class="messages"></div>
+      <div id="messages" class="chat"></div>
 
-    <div class="meta">
-      <label><input type="checkbox" id="mock" /> Mock</label>
-      <small>Settings: <code>vibe.cliPath</code> / <code>vibe.permissionMode</code></small>
-    </div>
+      <div class="composer">
+        <div class="metaRow">
+          <label><input type="checkbox" id="mock" /> Mock</label>
+          <span>Settings: <code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
+        </div>
 
-    <textarea id="input" placeholder="Describe your task…"></textarea>
-    <div class="sendRow">
-      <div class="status" id="status"></div>
-      <button id="send">Send</button>
-    </div>
+        <textarea id="input" placeholder="Describe your task… (Ctrl/⌘ + Enter to send)"></textarea>
 
-    <div class="row">
-      <button id="runMock">Run (Mock)</button>
-      <button id="run">Run</button>
+        <div class="sendRow">
+          <div class="status" id="status"></div>
+          <div class="btnRow">
+            <button class="secondary" id="runMock" title="Run workflow in mock mode">Run Mock</button>
+            <button class="secondary" id="run" title="Run workflow">Run</button>
+            <button class="primary" id="send" title="Add task and run workflow">Send</button>
+          </div>
+        </div>
+      </div>
     </div>
-    <button id="checkpoints">Checkpoint List</button>
     <script>
       const vscode = acquireVsCodeApi();
 
@@ -333,7 +469,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         for (const m of messages) {
           const div = document.createElement('div');
           div.className = 'msg ' + (m.role || 'assistant');
-          const title = m.title ? '<div class=\"title\">' + escapeHtml(m.title) + '</div>' : '';
+          const titleLeft = m.title ? escapeHtml(m.title) : '';
+          const title = titleLeft ? '<div class=\"title\"><span>' + titleLeft + '</span><span></span></div>' : '';
           div.innerHTML = title + '<pre>' + escapeHtml(m.text || '') + '</pre>';
           elMessages.appendChild(div);
         }

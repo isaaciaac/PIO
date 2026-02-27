@@ -26,6 +26,15 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vibe",
+          "title": "Vibe",
+          "icon": "resources/vibe.svg"
+        }
+      ]
+    },
     "commands": [
       { "command": "vibe.init", "title": "Vibe: Init" },
       { "command": "vibe.addTask", "title": "Vibe: Add Task" },
@@ -42,9 +51,7 @@
       { "command": "vibe.clearStoredApiKeys", "title": "Vibe: Clear Stored API Keys" }
     ],
     "views": {
-      "explorer": [
-        { "type": "webview", "id": "vibe.dashboard", "name": "Vibe" }
-      ]
+      "vibe": [{ "type": "webview", "id": "vibe.dashboard", "name": "Chat" }]
     },
     "configuration": {
       "title": "Vibe",
