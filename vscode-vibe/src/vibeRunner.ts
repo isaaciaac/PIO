@@ -27,9 +27,8 @@ export async function runVibe(args: string[], options: RunVibeOptions): Promise<
   if (options.mock) {
     env.VIBE_MOCK_MODE = "1";
   }
-  if (permissionMode === "prompt") {
-    env.VIBE_APPROVAL_DIR = path.join(options.cwd, ".vibe", "approvals");
-  }
+  // Always provide an approval channel so 'config' -> policy.mode=prompt works without a TTY.
+  env.VIBE_APPROVAL_DIR = path.join(options.cwd, ".vibe", "approvals");
 
   options.output.appendLine(`$ ${cli} ${finalArgs.join(" ")}`);
 
