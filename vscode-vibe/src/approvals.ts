@@ -37,12 +37,12 @@ export function registerApprovalWatcher(context: vscode.ExtensionContext, output
     const req = (await readJsonWithRetry(uri)) as ToolRequest;
     if (!req?.id) return;
 
-    const message = `Allow ${req.agent_id} to use ${req.tool}?`;
+    const message = `允许 ${req.agent_id} 使用 ${req.tool} 吗？`;
     const detail = req.detail || "";
-    output.appendLine(`[approval] ${req.id}: ${message} ${detail}`);
+    output.appendLine(`[授权] ${req.id}: ${message} ${detail}`);
 
-    const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, "Allow", "Deny");
-    const allow = choice === "Allow";
+    const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, "允许", "拒绝");
+    const allow = choice === "允许";
 
     const respDir = vscode.Uri.joinPath(root, ".vibe", "approvals", "responses");
     await vscode.workspace.fs.createDirectory(respDir);
@@ -56,7 +56,7 @@ export function registerApprovalWatcher(context: vscode.ExtensionContext, output
       .then(() => handle(uri))
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
-        output.appendLine(`[approval] error: ${msg}`);
+        output.appendLine(`[授权] 错误：${msg}`);
       });
   };
 

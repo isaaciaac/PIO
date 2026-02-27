@@ -10,7 +10,7 @@ const SECRET_DASHSCOPE_API_KEY = "DASHSCOPE_API_KEY";
 function requireWorkspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) {
-    throw new Error("No workspace folder open.");
+    throw new Error("未打开工作区文件夹。");
   }
   return folder.uri.fsPath;
 }
@@ -21,34 +21,34 @@ async function setSecretKey(
   secretKey: string
 ): Promise<void> {
   const value = await vscode.window.showInputBox({
-    title: `Vibe: Set ${label} API Key`,
-    prompt: `${label} API Key (stored in VS Code SecretStorage)`,
+    title: `Vibe：设置 ${label} 密钥`,
+    prompt: `${label} 密钥（将安全存储在 VS Code SecretStorage）`,
     password: true,
     ignoreFocusOut: true,
-    validateInput: (v) => (v.trim().length === 0 ? "API key cannot be empty." : undefined),
+    validateInput: (v) => (v.trim().length === 0 ? "密钥不能为空。" : undefined),
   });
   if (!value) return;
   await context.secrets.store(secretKey, value.trim());
-  vscode.window.showInformationMessage(`${label} API key stored securely (SecretStorage).`);
+  vscode.window.showInformationMessage(`${label} 密钥已安全保存（SecretStorage）。`);
 }
 
 async function showApiKeyStatus(context: vscode.ExtensionContext): Promise<void> {
-  const ds = (await context.secrets.get(SECRET_DEEPSEEK_API_KEY)) ? "stored" : "not set";
-  const qs = (await context.secrets.get(SECRET_DASHSCOPE_API_KEY)) ? "stored" : "not set";
-  vscode.window.showInformationMessage(`Vibe API keys — DeepSeek: ${ds}; DashScope: ${qs}.`);
+  const ds = (await context.secrets.get(SECRET_DEEPSEEK_API_KEY)) ? "已保存" : "未设置";
+  const qs = (await context.secrets.get(SECRET_DASHSCOPE_API_KEY)) ? "已保存" : "未设置";
+  vscode.window.showInformationMessage(`Vibe 密钥状态：DeepSeek：${ds}；DashScope：${qs}。`);
 }
 
 async function clearStoredApiKeys(context: vscode.ExtensionContext): Promise<void> {
   const choice = await vscode.window.showWarningMessage(
-    "Clear stored API keys from VS Code SecretStorage?",
-    { modal: true, detail: "This only removes keys saved by the Vibe extension. It does not change your shell environment variables." },
-    "Clear",
-    "Cancel"
+    "确认清除已保存的密钥吗？",
+    { modal: true, detail: "只会清除 Vibe 扩展保存在 VS Code SecretStorage 里的密钥，不会修改你的系统/终端环境变量。" },
+    "清除",
+    "取消"
   );
-  if (choice !== "Clear") return;
+  if (choice !== "清除") return;
   await context.secrets.delete(SECRET_DEEPSEEK_API_KEY);
   await context.secrets.delete(SECRET_DASHSCOPE_API_KEY);
-  vscode.window.showInformationMessage("Stored Vibe API keys cleared.");
+  vscode.window.showInformationMessage("已清除已保存的 Vibe 密钥。");
 }
 
 async function openFileIfExists(absPath: string): Promise<void> {
@@ -58,7 +58,7 @@ async function openFileIfExists(absPath: string): Promise<void> {
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc, { preview: false });
   } catch {
-    throw new Error(`File not found: ${absPath}`);
+    throw new Error(`文件不存在：${absPath}`);
   }
 }
 
@@ -72,12 +72,12 @@ async function ensureVibeInit(root: string, output: vscode.OutputChannel): Promi
   }
 
   const choice = await vscode.window.showInformationMessage(
-    "No .vibe config found in this workspace. Run Vibe: Init now?",
-    "Init",
-    "Cancel"
+    "当前工作区未找到 .vibe 配置。现在初始化 Vibe 吗？",
+    "初始化",
+    "取消"
   );
-  if (choice !== "Init") {
-    throw new Error("Missing .vibe. Run 'Vibe: Init' first.");
+  if (choice !== "初始化") {
+    throw new Error("缺少 .vibe。请先运行“Vibe：初始化”。");
   }
   output.show(true);
   await runVibe(["init", "--path", root], { cwd: root, mock: false, output });
@@ -116,34 +116,34 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.init", async () => {
       await exec(["init", "--path", requireWorkspaceRoot()]);
-      vscode.window.showInformationMessage("Vibe initialized.");
+      vscode.window.showInformationMessage("Vibe 初始化完成。");
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.addTask", async () => {
       const text = await vscode.window.showInputBox({
-        title: "Vibe: Add Task",
-        prompt: "Task description",
-        validateInput: (v) => (v.trim().length === 0 ? "Task cannot be empty." : undefined),
+        title: "Vibe：添加任务",
+        prompt: "请输入任务描述",
+        validateInput: (v) => (v.trim().length === 0 ? "任务描述不能为空。" : undefined),
       });
       if (!text) return;
       await exec(["task", "add", text, "--path", requireWorkspaceRoot()]);
-      vscode.window.showInformationMessage("Task added to ledger.");
+      vscode.window.showInformationMessage("任务已写入账本（ledger）。");
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.runMock", async () => {
       await exec(["run", "--mock", "--path", requireWorkspaceRoot()], { mock: true });
-      vscode.window.showInformationMessage("Vibe run completed (mock).");
+      vscode.window.showInformationMessage("Vibe 运行完成（模拟）。");
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.run", async () => {
       await exec(["run", "--path", requireWorkspaceRoot()]);
-      vscode.window.showInformationMessage("Vibe run completed.");
+      vscode.window.showInformationMessage("Vibe 运行完成。");
     })
   );
 
@@ -167,7 +167,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("vibe.checkpointList", async () => {
       const root = requireWorkspaceRoot();
       await exec(["checkpoint", "list", "--path", root]);
-      vscode.window.showInformationMessage("Printed checkpoints to Vibe output.");
+      vscode.window.showInformationMessage("检查点列表已输出到「输出」→ Vibe。");
     })
   );
 
@@ -176,13 +176,13 @@ export function activate(context: vscode.ExtensionContext) {
       const root = requireWorkspaceRoot();
       const ids = await readCheckpointIds(root);
       if (ids.length === 0) {
-        vscode.window.showWarningMessage("No checkpoints found.");
+        vscode.window.showWarningMessage("未找到检查点。");
         return;
       }
-      const pick = await vscode.window.showQuickPick(ids, { title: "Restore checkpoint" });
+      const pick = await vscode.window.showQuickPick(ids, { title: "选择要恢复的检查点" });
       if (!pick) return;
       await exec(["checkpoint", "restore", pick, "--path", root]);
-      vscode.window.showInformationMessage(`Restored checkpoint ${pick}.`);
+      vscode.window.showInformationMessage(`已恢复检查点：${pick}。`);
     })
   );
 
@@ -191,21 +191,21 @@ export function activate(context: vscode.ExtensionContext) {
       const root = requireWorkspaceRoot();
       const ids = await readCheckpointIds(root);
       if (ids.length === 0) {
-        vscode.window.showWarningMessage("No checkpoints found.");
+        vscode.window.showWarningMessage("未找到检查点。");
         return;
       }
-      const checkpointId = await vscode.window.showQuickPick(ids, { title: "Create branch from checkpoint" });
+      const checkpointId = await vscode.window.showQuickPick(ids, { title: "选择检查点以创建分支" });
       if (!checkpointId) return;
       const branchName = await vscode.window.showInputBox({
-        title: "New branch name (optional)",
-        prompt: "Leave empty to use default",
+        title: "新分支名（可选）",
+        prompt: "留空使用默认名称",
       });
       const args = ["branch", "create", "--from", checkpointId, "--path", root];
       if (branchName && branchName.trim().length > 0) {
         args.push("--name", branchName.trim());
       }
       await exec(args);
-      vscode.window.showInformationMessage(`Branch created from ${checkpointId}.`);
+      vscode.window.showInformationMessage(`已从检查点创建分支：${checkpointId}。`);
     })
   );
 

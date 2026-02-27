@@ -2,7 +2,7 @@
   "name": "vibe-coding",
   "displayName": "Vibe Coding",
   "description": "Run the vibe multi-agent workflow from VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -36,22 +36,22 @@
       ]
     },
     "commands": [
-      { "command": "vibe.init", "title": "Vibe: Init" },
-      { "command": "vibe.addTask", "title": "Vibe: Add Task" },
-      { "command": "vibe.run", "title": "Vibe: Run" },
-      { "command": "vibe.runMock", "title": "Vibe: Run (Mock)" },
-      { "command": "vibe.openConfig", "title": "Vibe: Open Config (vibe.yaml)" },
-      { "command": "vibe.openLedger", "title": "Vibe: Open Ledger (ledger.jsonl)" },
-      { "command": "vibe.checkpointList", "title": "Vibe: Checkpoint List" },
-      { "command": "vibe.checkpointRestore", "title": "Vibe: Checkpoint Restore" },
-      { "command": "vibe.branchCreateFromCheckpoint", "title": "Vibe: Branch Create From Checkpoint" },
-      { "command": "vibe.setDeepSeekApiKey", "title": "Vibe: Set DeepSeek API Key" },
-      { "command": "vibe.setDashScopeApiKey", "title": "Vibe: Set DashScope API Key" },
-      { "command": "vibe.showApiKeyStatus", "title": "Vibe: Show API Key Status" },
-      { "command": "vibe.clearStoredApiKeys", "title": "Vibe: Clear Stored API Keys" }
+      { "command": "vibe.init", "title": "Vibe：初始化" },
+      { "command": "vibe.addTask", "title": "Vibe：添加任务" },
+      { "command": "vibe.run", "title": "Vibe：运行工作流" },
+      { "command": "vibe.runMock", "title": "Vibe：运行工作流（模拟）" },
+      { "command": "vibe.openConfig", "title": "Vibe：打开配置（vibe.yaml）" },
+      { "command": "vibe.openLedger", "title": "Vibe：打开账本（ledger.jsonl）" },
+      { "command": "vibe.checkpointList", "title": "Vibe：查看检查点列表" },
+      { "command": "vibe.checkpointRestore", "title": "Vibe：恢复检查点" },
+      { "command": "vibe.branchCreateFromCheckpoint", "title": "Vibe：从检查点创建分支" },
+      { "command": "vibe.setDeepSeekApiKey", "title": "Vibe：设置 DeepSeek 密钥" },
+      { "command": "vibe.setDashScopeApiKey", "title": "Vibe：设置 DashScope 密钥" },
+      { "command": "vibe.showApiKeyStatus", "title": "Vibe：查看密钥状态" },
+      { "command": "vibe.clearStoredApiKeys", "title": "Vibe：清除已保存密钥" }
     ],
     "views": {
-      "vibe": [{ "type": "webview", "id": "vibe.dashboard", "name": "Chat" }]
+      "vibe": [{ "type": "webview", "id": "vibe.dashboard", "name": "聊天" }]
     },
     "configuration": {
       "title": "Vibe",

@@ -7,6 +7,7 @@ export interface RunVibeOptions {
   mock: boolean;
   output: vscode.OutputChannel;
   envOverrides?: NodeJS.ProcessEnv;
+  policyOverride?: string;
 }
 
 export class VibeRunError extends Error {
@@ -41,7 +42,7 @@ export interface RunVibeCaptureOptions extends RunVibeOptions {
 
 export async function runVibeCapture(args: string[], options: RunVibeCaptureOptions): Promise<{ stdout: string; stderr: string }> {
   const cli = getCliPath();
-  const permissionMode = getPermissionMode();
+  const permissionMode = (options.policyOverride ?? getPermissionMode()).trim();
   const finalArgs = permissionMode !== "config" ? ["--policy", permissionMode, ...args] : args;
   const env: NodeJS.ProcessEnv = { ...process.env, ...(options.envOverrides || {}) };
   if (options.mock) {

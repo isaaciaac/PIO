@@ -89,18 +89,18 @@ async function countLedgerLines(workspaceRoot: string): Promise<number> {
 
 function formatRunSummary(checkpointId: string, green: boolean | undefined, events: LedgerEvent[]): string {
   const lines: string[] = [];
-  lines.push(`checkpoint: ${checkpointId}`);
-  if (green !== undefined) lines.push(`green: ${green}`);
+  lines.push(`检查点：${checkpointId}`);
+  if (green !== undefined) lines.push(`通过（绿灯）：${green}`);
   if (events.length) {
     lines.push("");
-    lines.push("events:");
+    lines.push("事件：");
     for (const e of events.slice(0, 12)) {
-      const agent = e.agent || "unknown";
-      const type = e.type || "EVENT";
+      const agent = e.agent || "未知";
+      const type = e.type || "事件";
       const summary = (e.summary || "").trim();
-      lines.push(`- ${agent} ${type}: ${summary}`);
+      lines.push(`- ${agent} ${type}：${summary}`);
     }
-    if (events.length > 12) lines.push(`- ... (${events.length - 12} more)`);
+    if (events.length > 12) lines.push(`- ……（还有 ${events.length - 12} 条）`);
   }
   return lines.join("\n");
 }
@@ -113,7 +113,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "Chat 模式：由 PM 代理用自然语言回答；Workflow 模式：把输入写入任务并运行工作流。Mock 可无 key 运行闭环。",
+      text: "选择模式：聊天（PM）/ 确认权限（写项目）/ 完全授权（写项目）。勾选“模拟”可无密钥跑通闭环。",
       ts: Date.now(),
     },
   ];
@@ -150,8 +150,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const mock = Boolean(msg?.mock);
           const mode = String(msg?.mode || "chat").trim();
           if (!text) return;
-          if (mode === "workflow") {
-            await this.handleChatSend(root, text, mock);
+          if (mode === "chat") {
+            await this.handlePmChat(root, text, mock);
+          } else if (mode === "prompt") {
+            await this.handleChatSend(root, text, mock, "prompt");
+          } else if (mode === "allow_all") {
+            await this.handleChatSend(root, text, mock, "allow_all");
           } else {
             await this.handlePmChat(root, text, mock);
           }
@@ -159,14 +163,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         }
         if (msg?.type === "init") {
           await runVibe(["init", "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
-        } else if (msg?.type === "addTask") {
-          const text = await vscode.window.showInputBox({ title: "Vibe: Add Task", prompt: "Task description" });
-          if (!text) return;
-          await runVibe(["task", "add", text, "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
-        } else if (msg?.type === "runMock") {
-          await runVibe(["run", "--mock", "--path", root], { cwd: root, mock: true, output: this.output, envOverrides });
-        } else if (msg?.type === "run") {
-          await runVibe(["run", "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
         } else if (msg?.type === "openConfig") {
           await vscode.commands.executeCommand("vibe.openConfig");
           return;
@@ -229,7 +225,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         cwd: root,
         mock,
         output: this.output,
-        title: mock ? "Vibe: Chat (Mock)" : "Vibe: Chat",
+        title: mock ? "Vibe：聊天（模拟）" : "Vibe：聊天",
         envOverrides,
       });
 
@@ -245,20 +241,20 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         : [];
 
       const assistantText = actions.length
-        ? `${replyText}\n\nNext:\n- ${actions.join("\n- ")}`
-        : replyText || "(no reply)";
+        ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}`
+        : replyText || "（无回复）";
 
-      this.addMessage("assistant", assistantText, "pm");
+      this.addMessage("assistant", assistantText, "产品经理");
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
-            ? "\n\nHint: set keys via Command Palette → 'Vibe: Set DeepSeek API Key' / 'Vibe: Set DashScope API Key'."
+            ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
             : "";
-        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "error");
+        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "错误");
       } else {
         const message = e instanceof Error ? e.message : String(e);
-        this.addMessage("assistant", message, "error");
+        this.addMessage("assistant", message, "错误");
       }
     } finally {
       this.running = false;
@@ -266,7 +262,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleChatSend(root: string, text: string, mock: boolean): Promise<void> {
+  private async handleChatSend(root: string, text: string, mock: boolean, policyOverride: string): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.addMessage("user", text);
@@ -283,11 +279,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         cwd: root,
         mock: false,
         output: this.output,
-        title: "Vibe: Add Task",
+        title: "Vibe：创建任务",
         envOverrides,
+        policyOverride,
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
-      this.addMessage("assistant", `task: ${taskId}`, "task");
+      this.addMessage("assistant", `已创建任务：${taskId}`, "任务");
 
       const runArgs = ["run", "--task", taskId, "--path", root];
       if (mock) runArgs.push("--mock");
@@ -295,23 +292,24 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         cwd: root,
         mock,
         output: this.output,
-        title: mock ? "Vibe: Run (Mock)" : "Vibe: Run",
+        title: mock ? "Vibe：运行（模拟）" : "Vibe：运行",
         envOverrides,
+        policyOverride,
       });
       const checkpointId = lastNonEmptyLine(runRes.stdout) || "(unknown_checkpoint_id)";
       const cp = await readCheckpoint(root, checkpointId);
       const events = await readLedgerEventsSince(root, before);
-      this.addMessage("assistant", formatRunSummary(checkpointId, cp?.green, events), "run");
+      this.addMessage("assistant", formatRunSummary(checkpointId, cp?.green, events), "工作流");
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
-            ? "\n\nHint: set keys via Command Palette → 'Vibe: Set DeepSeek API Key' / 'Vibe: Set DashScope API Key'."
+            ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
             : "";
-        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "error");
+        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "错误");
       } else {
         const message = e instanceof Error ? e.message : String(e);
-        this.addMessage("assistant", message, "error");
+        this.addMessage("assistant", message, "错误");
       }
     } finally {
       this.running = false;
@@ -488,14 +486,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       <div class="topbar">
         <div class="brand">
           <strong>Vibe</strong>
-          <small>multi-agent workflow</small>
+          <small>多代理工作流</small>
         </div>
         <div class="toolbar">
-          <button class="secondary" id="init" title="Initialize .vibe in this workspace">Init</button>
-          <button class="secondary" id="config" title="Open .vibe/vibe.yaml">Config</button>
-          <button class="secondary" id="ledger" title="Open .vibe/ledger.jsonl">Ledger</button>
-          <button class="secondary" id="checkpoints" title="List checkpoints in Output">Checkpoints</button>
-          <button class="secondary" id="clear" title="Clear chat history">Clear</button>
+          <button class="secondary" id="init" title="在当前工作区初始化 .vibe">初始化</button>
+          <button class="secondary" id="config" title="打开 .vibe/vibe.yaml">配置</button>
+          <button class="secondary" id="ledger" title="打开 .vibe/ledger.jsonl">账本</button>
+          <button class="secondary" id="checkpoints" title="在「输出」中打印检查点列表">检查点</button>
+          <button class="secondary" id="clear" title="清空聊天记录">清空</button>
         </div>
       </div>
 
@@ -504,23 +502,22 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       <div class="composer">
         <div class="metaRow">
           <div class="leftMeta">
-            <label><input type="checkbox" id="mock" /> Mock</label>
-            <select id="mode" title="Chat: PM 对话；Workflow: 写入任务并运行工作流">
-              <option value="chat" selected>Chat (PM)</option>
-              <option value="workflow">Workflow</option>
+            <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
+            <select id="mode" title="选择是否写项目：聊天不会写代码；确认权限/完全授权会执行工作流">
+              <option value="chat" selected>聊天（PM）</option>
+              <option value="prompt">确认权限（写项目）</option>
+              <option value="allow_all">完全授权（写项目）</option>
             </select>
           </div>
-          <span>Settings: <code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
+          <span>设置：<code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
 
-        <textarea id="input" placeholder="Describe your task… (Ctrl/⌘ + Enter to send)"></textarea>
+        <textarea id="input" placeholder="请输入你的问题或需求…（Ctrl/⌘ + Enter 发送）"></textarea>
 
         <div class="sendRow">
           <div class="status" id="status"></div>
           <div class="btnRow">
-            <button class="secondary" id="runMock" title="Run workflow in mock mode">Run Mock</button>
-            <button class="secondary" id="run" title="Run workflow">Run</button>
-            <button class="primary" id="send" title="Add task and run workflow">Send</button>
+            <button class="primary" id="send" title="发送（由上方模式决定：聊天或工作流）">发送</button>
           </div>
         </div>
       </div>
@@ -550,7 +547,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           div.innerHTML = title + '<pre>' + escapeHtml(m.text || '') + '</pre>';
           elMessages.appendChild(div);
         }
-        elStatus.textContent = state.running ? 'Running… (check Output -> Vibe for details)' : '';
+        elStatus.textContent = state.running ? '运行中…（详情见「输出」→ Vibe）' : '';
         elSend.disabled = !!state.running;
         elInput.disabled = !!state.running;
         if (!state.running) {
@@ -584,8 +581,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));
       document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearChat'}));
-      document.getElementById('runMock').addEventListener('click', () => vscode.postMessage({type:'runMock'}));
-      document.getElementById('run').addEventListener('click', () => vscode.postMessage({type:'run'}));
       document.getElementById('config').addEventListener('click', () => vscode.postMessage({type:'openConfig'}));
       document.getElementById('ledger').addEventListener('click', () => vscode.postMessage({type:'openLedger'}));
       document.getElementById('checkpoints').addEventListener('click', () => vscode.postMessage({type:'checkpoints'}));
