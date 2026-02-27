@@ -61,6 +61,20 @@ npm run compile
 - 打开 Command Palette（`Ctrl+Shift+P`），搜索 `Vibe:` 命令
 - 或在 Explorer 面板底部找到 `Vibe` 视图（Dashboard）直接点按钮
 
+## 权限模式（像“工具审批”一样）
+
+扩展支持三种权限模式（Settings -> 搜索 `Vibe: Permission Mode`）：
+
+- `allow_all`：不提示，全部允许（默认建议）
+- `prompt`：每次工具动作（如 `run_cmd/git/read_file/write_file/search`）都会弹窗询问是否允许
+- `chat_only`：禁止本地工具动作（只做“聊天/产出结构化结果”，不会跑命令/改代码）
+- `config`：不覆盖 CLI 参数，使用工作区 `.vibe/vibe.yaml` 里的 `policy.mode`
+
+当选择 `prompt` 时，扩展会通过 `.vibe/approvals/` 与 CLI 交互：
+
+- CLI 写入：`.vibe/approvals/requests/*.json`
+- 扩展弹窗询问后写回：`.vibe/approvals/responses/*.json`
+
 ### 命令与行为对应
 
 - `Vibe: Init`
@@ -102,4 +116,3 @@ npm run compile
 - DashScope：`DASHSCOPE_API_KEY`
 
 建议在“启动 Extension Development Host 之前”的终端里设置环境变量，再启动 VS Code，这样扩展运行时能继承到。
-

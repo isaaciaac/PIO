@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { registerApprovalWatcher } from "./approvals";
 import { VibeDashboardViewProvider } from "./vibeDashboard";
 import { readCheckpointIds, runVibe } from "./vibeRunner";
 
@@ -25,6 +26,8 @@ async function openFileIfExists(absPath: string): Promise<void> {
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Vibe");
   context.subscriptions.push(output);
+
+  registerApprovalWatcher(context, output);
 
   const dashboard = new VibeDashboardViewProvider(output);
   context.subscriptions.push(

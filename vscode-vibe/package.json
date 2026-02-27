@@ -45,6 +45,12 @@
           "type": "string",
           "default": "vibe",
           "description": "Path to the vibe CLI (must be available in PATH or absolute path)."
+        },
+        "vibe.permissionMode": {
+          "type": "string",
+          "default": "config",
+          "enum": ["config", "allow_all", "prompt", "chat_only"],
+          "description": "Tool permission mode. 'config' uses .vibe/vibe.yaml policy.mode; 'prompt' requires approvals for each tool use."
         }
       }
     }
@@ -60,4 +66,3 @@
     "typescript": "^5.4.5"
   }
 }
-

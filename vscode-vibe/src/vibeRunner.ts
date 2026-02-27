@@ -14,20 +14,30 @@ function getCliPath(): string {
   return cliPath;
 }
 
+function getPermissionMode(): string {
+  const cfg = vscode.workspace.getConfiguration("vibe");
+  return (cfg.get<string>("permissionMode") || "config").trim();
+}
+
 export async function runVibe(args: string[], options: RunVibeOptions): Promise<void> {
   const cli = getCliPath();
+  const permissionMode = getPermissionMode();
+  const finalArgs = permissionMode !== "config" ? ["--policy", permissionMode, ...args] : args;
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (options.mock) {
     env.VIBE_MOCK_MODE = "1";
   }
+  if (permissionMode === "prompt") {
+    env.VIBE_APPROVAL_DIR = path.join(options.cwd, ".vibe", "approvals");
+  }
 
-  options.output.appendLine(`$ ${cli} ${args.join(" ")}`);
+  options.output.appendLine(`$ ${cli} ${finalArgs.join(" ")}`);
 
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: "Vibe", cancellable: false },
     () =>
       new Promise<void>((resolve, reject) => {
-        const proc = spawn(cli, args, { cwd: options.cwd, env, shell: false });
+        const proc = spawn(cli, finalArgs, { cwd: options.cwd, env, shell: false });
 
         proc.stdout.on("data", (d) => options.output.append(d.toString()));
         proc.stderr.on("data", (d) => options.output.append(d.toString()));
@@ -67,4 +77,3 @@ export async function readCheckpointIds(workspaceRoot: string): Promise<string[]
     return [];
   }
 }
-
