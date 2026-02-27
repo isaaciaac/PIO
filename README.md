@@ -56,6 +56,12 @@ vibe checkpoint list
 - 环境变量：`VIBE_POLICY_MODE=prompt`
 - 配置文件：`.vibe/vibe.yaml` -> `policy.mode`
 
+## 默认模型分工（建议）
+
+- **DeepSeek `deepseek-reasoner`**：需求/架构/审计/安全/合规/性能/契约确认（更偏推理、把关）
+- **DashScope `qwen-plus/qwen-flash`**：路由编排、日志压缩、文案/文档整理（更偏通用与速度）
+- **DashScope `qwen3-coder-*`**：所有“写代码/写脚本/写 CI”的工种（更偏代码生成与修复）
+
 ## VS Code 扩展（最小 IDE 封装）
 
 扩展源码在 `vscode-vibe/`，提供 Dashboard + 一组 `Vibe:` 命令（调用本机 `vibe` CLI）。
