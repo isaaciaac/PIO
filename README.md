@@ -38,6 +38,7 @@ vibe checkpoint list
 - `vibe init`
 - `vibe config show`
 - `vibe task add "..."`（写入 `REQ_CREATED` 到 ledger）
+- `vibe chat "..."`（PM 自然语言对话；可用 `--json` 输出结构化结果）
 - `vibe run [--task <event_id>] [--mock]`（mock 下闭环并产出 green checkpoint）
 - `vibe checkpoint list/create/restore`
 - `vibe branch create --from <checkpoint_id> [--name <git_branch>]`

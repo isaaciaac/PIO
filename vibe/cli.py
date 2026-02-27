@@ -10,10 +10,12 @@ from uuid import uuid4
 import typer
 
 from vibe.config import VibeConfig, default_config, write_default_config
+from vibe.agents.registry import AGENT_REGISTRY
 from vibe.manifests import write_manifests
 from vibe.orchestrator import Orchestrator
 from vibe.policy import PolicyDeniedError, ToolPolicy, resolve_policy_mode
 from vibe.repo import ensure_vibe_dirs, find_repo_root
+from vibe.schemas import packs
 from vibe.storage.checkpoints import CheckpointsStore
 from vibe.schemas.events import new_event
 from vibe.storage.ledger import Ledger
@@ -103,6 +105,98 @@ def task_add(
     )
     ledger.append(event)
     typer.echo(event.id)
+
+
+def _chat_history_path(repo_root: Path, agent_id: str) -> Path:
+    return repo_root / ".vibe" / "views" / agent_id / "chat.jsonl"
+
+
+def _read_chat_history(path: Path, *, limit: int) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    items: list[dict[str, str]] = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role = str(data.get("role") or "").strip()
+        content = str(data.get("content") or "").strip()
+        if role in {"user", "assistant", "system"} and content:
+            items.append({"role": role, "content": content})
+    return items
+
+
+def _append_chat_history(path: Path, *, role: str, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "role": role,
+        "content": content,
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+@app.command()
+def chat(
+    ctx: typer.Context,
+    message: str = typer.Argument(..., help="Chat message"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
+    mock: bool = typer.Option(False, "--mock", help="Force mock mode for this chat"),
+    json_out: bool = typer.Option(False, "--json", help="Output ChatReply JSON"),
+    reset: bool = typer.Option(False, "--reset", help="Reset saved chat history for this workspace"),
+    history: int = typer.Option(16, "--history", help="How many previous messages to include"),
+) -> None:
+    if mock:
+        os.environ["VIBE_MOCK_MODE"] = "1"
+    repo_root = find_repo_root(path or Path.cwd())
+    cfg_path = repo_root / ".vibe" / "vibe.yaml"
+    if not cfg_path.exists():
+        raise typer.Exit(code=2)
+
+    cfg = VibeConfig.load(cfg_path)
+    agent_id = "pm"
+    agent_cfg = cfg.agents.get(agent_id)
+    if not agent_cfg:
+        typer.echo("Missing agent config: pm", err=True)
+        raise typer.Exit(code=2)
+    agent_cls = AGENT_REGISTRY.get(agent_id)
+    if not agent_cls:
+        typer.echo("Missing agent implementation: pm", err=True)
+        raise typer.Exit(code=2)
+
+    hist_path = _chat_history_path(repo_root, agent_id)
+    if reset:
+        hist_path.write_text("", encoding="utf-8")
+
+    past = _read_chat_history(hist_path, limit=max(0, min(history, 64)))
+    system = (
+        "你是 Vibe 系统里的产品经理（PM）代理。你要用自然语言与用户对话，帮助澄清需求、给出可执行的验收标准（AC）、"
+        "并指导用户如何在当前工作区使用 Vibe。\n\n"
+        "硬约束：你必须只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
+        "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
+        "不要在最外层包一层额外的 key。"
+    )
+    messages = [{"role": "system", "content": system}, *past, {"role": "user", "content": message}]
+
+    pm = agent_cls(agent_cfg, providers=cfg.providers)
+    reply, _meta = pm.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=0.2)
+
+    _append_chat_history(hist_path, role="user", content=message)
+    _append_chat_history(hist_path, role="assistant", content=reply.reply)
+
+    if json_out:
+        typer.echo(reply.model_dump_json(indent=2, ensure_ascii=False))
+    else:
+        typer.echo(reply.reply)
 
 
 @app.command()

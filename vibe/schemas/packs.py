@@ -63,6 +63,12 @@ class TestReport(BaseModel):
     pointers: List[str] = Field(default_factory=list)
 
 
+class ChatReply(BaseModel):
+    reply: str
+    suggested_actions: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+
 class ReviewReport(BaseModel):
     passed: bool
     blockers: List[str] = Field(default_factory=list)
@@ -148,4 +154,3 @@ class DocPack(BaseModel):
 
 class RunbookPack(BaseModel):
     sections: List[str] = Field(default_factory=list)
-

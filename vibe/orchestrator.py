@@ -142,7 +142,11 @@ class Orchestrator:
 
         req, _req_meta = pm.chat_json(
             schema=packs.RequirementPack,
-            system="You are PM. Output JSON for RequirementPack only.",
+            system=(
+                "You are PM. Return JSON only for RequirementPack with fields: "
+                "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
+                "No extra keys. No wrapping object. No markdown."
+            ),
             user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
         )
         self.ledger.append(
@@ -158,7 +162,10 @@ class Orchestrator:
 
         plan, _plan_meta = router.chat_json(
             schema=packs.Plan,
-            system="You are Router. Output JSON for Plan only.",
+            system=(
+                "You are Router. Return JSON only for Plan: {tasks:[{id,title,agent,description}]}. "
+                "No extra keys. No markdown."
+            ),
             user=f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
         )
         self.ledger.append(
@@ -173,7 +180,11 @@ class Orchestrator:
 
         change, _change_meta = coder.chat_json(
             schema=packs.CodeChange,
-            system="You are Coder. Output JSON for CodeChange only.",
+            system=(
+                "You are Coder. Return JSON only for CodeChange with fields: "
+                "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                "No extra keys. No markdown."
+            ),
             user=f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
         )
         if change.kind == "noop" or not change.patch_pointer:
@@ -248,7 +259,11 @@ class Orchestrator:
                 blocker = (report.blockers or ["tests failed"])[0]
                 change, _ = coder.chat_json(
                     schema=packs.CodeChange,
-                    system="You are Coder. Fix exactly one blocker. Output JSON for CodeChange only.",
+                    system=(
+                        "You are Coder. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
+                        "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                        "No extra keys. No markdown."
+                    ),
                     user=f"Blocker:\n{blocker}\n\nRequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
                 )
                 patch_ptr = self.artifacts.put_text(

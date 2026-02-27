@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -49,6 +49,33 @@ def _extract_json(text: str) -> Any:
         raise
 
 
+def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
+    if not isinstance(data, dict):
+        return data
+
+    schema_name = schema.__name__
+    # Common model behavior: wrap the payload under the schema name.
+    if schema_name in data and isinstance(data[schema_name], dict):
+        return data[schema_name]
+
+    # Case-insensitive match.
+    for k, v in data.items():
+        if isinstance(k, str) and k.lower() == schema_name.lower() and isinstance(v, dict):
+            return v
+
+    # Another common wrapper key.
+    if "data" in data and isinstance(data["data"], dict) and len(data) == 1:
+        return data["data"]
+
+    return data
+
+
+def _parse_json_to_schema(text: str, *, schema: Type[T]) -> T:
+    data = _extract_json(text)
+    data = _unwrap_schema_envelope(data, schema=schema)
+    return schema.model_validate(data)
+
+
 class OpenAICompatProvider:
     def __init__(self, *, provider_id: str, base_url: str, api_key_env: Optional[str]) -> None:
         self.provider_id = provider_id
@@ -80,8 +107,30 @@ class OpenAICompatProvider:
         msgs = self.normalize_messages(messages, model=model)
         resp = client.chat.completions.create(model=model, messages=msgs, temperature=temperature)
         content = resp.choices[0].message.content or ""
-        data = _extract_json(content)
-        parsed = schema.model_validate(data)
+        try:
+            parsed = _parse_json_to_schema(content, schema=schema)
+        except (json.JSONDecodeError, ValidationError) as e:
+            # Best-effort single repair pass: ask the model to output valid JSON for the target schema.
+            fields = list(getattr(schema, "model_fields", {}).keys())
+            repair_system = (
+                "You are a JSON repair tool. Output JSON only. "
+                "Do not wrap the object in an extra top-level key."
+            )
+            repair_user = (
+                f"Target schema: {schema.__name__}\n"
+                f"Required fields: {fields}\n\n"
+                f"Validation/parse error:\n{e}\n\n"
+                "Fix the following model output to valid JSON that matches the schema exactly.\n\n"
+                f"Bad output:\n{content}"
+            )
+            repair_msgs = self.normalize_messages(
+                [{"role": "system", "content": repair_system}, {"role": "user", "content": repair_user}],
+                model=model,
+            )
+            repair_resp = client.chat.completions.create(model=model, messages=repair_msgs, temperature=0.0)
+            repaired = repair_resp.choices[0].message.content or ""
+            parsed = _parse_json_to_schema(repaired, schema=schema)
+            content = repaired
         usage = getattr(resp, "usage", None)
         usage_dict = usage.model_dump() if usage is not None else {}
         return parsed, ProviderResult(raw_text=content, meta=ProviderMeta(provider=self.provider_id, model=model, usage=usage_dict))
