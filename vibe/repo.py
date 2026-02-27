@@ -5,8 +5,21 @@ from pathlib import Path
 
 from vibe.storage.checkpoints import CheckpointsFile
 
+
 def find_repo_root(start: Path) -> Path:
-    return start.resolve()
+    path = start.resolve()
+    if path.is_file():
+        path = path.parent
+    cur = path
+    while True:
+        if (cur / ".git").exists():
+            return cur
+        if (cur / ".vibe").exists():
+            return cur
+        parent = cur.parent
+        if parent == cur:
+            return path
+        cur = parent
 
 
 def ensure_vibe_dirs(repo_root: Path, *, agent_ids: list[str] | None = None) -> None:

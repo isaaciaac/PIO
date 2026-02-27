@@ -6,6 +6,7 @@ from typing import Optional
 import typer
 
 from vibe.config import VibeConfig, default_config, write_default_config
+from vibe.manifests import write_manifests
 from vibe.repo import ensure_vibe_dirs, find_repo_root
 from vibe.schemas.events import new_event
 from vibe.storage.ledger import Ledger
@@ -24,6 +25,7 @@ def init(path: Optional[Path] = typer.Option(None, "--path", help="Repo path (de
     cfg = default_config()
     ensure_vibe_dirs(repo_root, agent_ids=list(cfg.agents.keys()))
     write_default_config(repo_root, cfg)
+    write_manifests(repo_root)
     typer.echo(f"Initialized .vibe in {repo_root}")
 
 
