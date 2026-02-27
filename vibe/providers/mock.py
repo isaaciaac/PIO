@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Type, TypeVar
+
+from pydantic import BaseModel
+
+from vibe.providers.base import ProviderMeta, ProviderResult
+from vibe.schemas import packs as schemas
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class MockProvider:
+    provider_id: str = "mock"
+
+    def chat_json(self, *, model: str, messages: List[Dict[str, str]], schema: Type[T], temperature: float = 0.0) -> tuple[T, ProviderResult]:
+        _ = (model, temperature)
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = m.get("content") or ""
+                break
+
+        if schema is schemas.RequirementPack:
+            out: Any = schemas.RequirementPack(
+                summary=last_user.strip().splitlines()[0][:120] or "Mock requirement",
+                acceptance=["mock: workflow completes", "mock: green checkpoint created"],
+                non_goals=["mock: no real code changes"],
+                constraints=["VIBE_MOCK_MODE=1"],
+            )
+        elif schema is schemas.Plan:
+            out = schemas.Plan(
+                tasks=[
+                    schemas.PlanTask(id="t1", title="Spec", agent="pm", description="Produce RequirementPack"),
+                    schemas.PlanTask(id="t2", title="Implement", agent="coder_backend", description="Produce CodeChange"),
+                    schemas.PlanTask(id="t3", title="Test", agent="qa", description="Run tests and report"),
+                ]
+            )
+        elif schema is schemas.CodeChange:
+            out = schemas.CodeChange(kind="noop", summary="mock: no changes", files_changed=[])
+        elif schema is schemas.TestReport:
+            out = schemas.TestReport(
+                commands=["mock"],
+                results=[schemas.TestResult(command="mock", returncode=0, passed=True, stdout="", stderr="")],
+                passed=True,
+                blockers=[],
+            )
+        elif schema is schemas.ContextPacket:
+            out = schemas.ContextPacket(repo_pointers=[], log_pointers=[], constraints=[], acceptance=[], recent_events=[])
+        elif schema is schemas.LogIndex:
+            out = schemas.LogIndex(items=[])
+        elif schema is schemas.ReferenceItem:
+            out = schemas.ReferenceItem(id="ref_mock", title="mock ref", tags=["mock"], content="mock content", source="mock")
+        elif schema is schemas.UseCasePack:
+            out = schemas.UseCasePack(positive=["mock ok"], negative=["mock fail"], edge_cases=["mock edge"])
+        elif schema is schemas.UXCopyPack:
+            out = schemas.UXCopyPack(strings={})
+        elif schema is schemas.DecisionPack:
+            out = schemas.DecisionPack(adrs=[])
+        elif schema is schemas.ContractPack:
+            out = schemas.ContractPack(contracts=[])
+        elif schema is schemas.MigrationPlan:
+            out = schemas.MigrationPlan(steps=[], rollback_steps=[])
+        elif schema is schemas.EnvSpec:
+            out = schemas.EnvSpec(commands=[])
+        elif schema is schemas.CIPack:
+            out = schemas.CIPack(notes=[])
+        elif schema is schemas.ReleasePack:
+            out = schemas.ReleasePack(version="0.0.0", changelog=[])
+        elif schema is schemas.ReviewReport:
+            out = schemas.ReviewReport(passed=True, blockers=[], nits=[], pointers=[])
+        elif schema is schemas.RiskRegister:
+            out = schemas.RiskRegister(passed=True, blockers=[], highs=[])
+        elif schema is schemas.PerfReport:
+            out = schemas.PerfReport(notes=[])
+        elif schema is schemas.ComplianceReport:
+            out = schemas.ComplianceReport(passed=True, notes=[])
+        elif schema is schemas.DocPack:
+            out = schemas.DocPack(files=[])
+        elif schema is schemas.RunbookPack:
+            out = schemas.RunbookPack(sections=[])
+        else:
+            out = schema.model_validate({})
+
+        meta = ProviderMeta(provider=self.provider_id, model="mock", usage={})
+        return out, ProviderResult(raw_text=out.model_dump_json(), meta=meta)
