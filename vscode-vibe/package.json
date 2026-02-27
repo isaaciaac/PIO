@@ -58,11 +58,16 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -p . -w",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "package:vsix": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "2.15.0",
     "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "cheerio": "1.0.0-rc.12"
   }
 }

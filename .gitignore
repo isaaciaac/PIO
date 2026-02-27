@@ -13,3 +13,4 @@ node_modules/
 vscode-vibe/dist/
 vscode-vibe/node_modules/
 vscode-vibe/.vscode-test/
+vscode-vibe/*.vsix

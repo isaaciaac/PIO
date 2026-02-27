@@ -56,6 +56,24 @@ npm run compile
 
 > 你也可以只打开 `vscode-vibe/` 目录再按 `F5`；但通常建议直接打开仓库根目录，便于扩展在真实工作区里跑。
 
+## 打包成 VSIX（离线安装）
+
+本项目已在 `devDependencies` 中固定了可在 Node 18 下工作的 `vsce` 版本，避免你直接 `npx @vscode/vsce ...` 时出现 `ReferenceError: File is not defined`。
+
+```bash
+cd vscode-vibe
+npm install
+npm run compile
+npm run package:vsix
+```
+
+会生成：`vscode-vibe/vibe-coding-0.1.0.vsix`
+
+安装：
+
+- VS Code → Extensions → `...` → `Install from VSIX...`
+- 或命令行：`code --install-extension vibe-coding-0.1.0.vsix`
+
 ## 使用
 
 - 打开 Command Palette（`Ctrl+Shift+P`），搜索 `Vibe:` 命令
