@@ -7,16 +7,15 @@ from typing import List, Optional
 from uuid import uuid4
 
 from vibe.agents.registry import AGENT_REGISTRY
-from vibe.branching import detect_branch_id
 from vibe.config import VibeConfig
+from vibe.policy import ToolPolicy, resolve_policy_mode
 from vibe.schemas import packs
 from vibe.schemas.events import LedgerEvent, new_event
 from vibe.storage.artifacts import ArtifactsStore
 from vibe.storage.checkpoints import CheckpointsStore
 from vibe.storage.ledger import Ledger
-from vibe.tools.cmd import CmdTool
-from vibe.tools.fs import FsTool
-from vibe.tools.git import GitTool
+from vibe.storage.ledger import ledger_path
+from vibe.toolbox import Toolbox
 
 
 @dataclass(frozen=True)
@@ -26,21 +25,36 @@ class RunResult:
 
 
 class Orchestrator:
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path, *, policy_mode: Optional[str] = None) -> None:
         self.repo_root = repo_root
         cfg_path = repo_root / ".vibe" / "vibe.yaml"
         if not cfg_path.exists():
             raise FileNotFoundError("Missing .vibe/vibe.yaml. Run `vibe init` first.")
         self.config = VibeConfig.load(cfg_path)
 
-        self.cmd = CmdTool(repo_root)
-        self.git = GitTool(repo_root, cmd=self.cmd)
-        self.branch_id = detect_branch_id(repo_root, git=self.git)
+        self.policy = ToolPolicy(mode=resolve_policy_mode(self.config.policy.mode, override=policy_mode))
+        self.toolbox = Toolbox(repo_root, config=self.config, policy=self.policy)
+
+        self.branch_id = self._detect_branch_id()
         self.ledger = Ledger(repo_root, branch_id=self.branch_id)
         self.main_ledger = Ledger(repo_root, branch_id="main")
-        self.fs = FsTool(repo_root)
         self.artifacts = ArtifactsStore(repo_root)
         self.checkpoints = CheckpointsStore(repo_root)
+
+    def _detect_branch_id(self) -> str:
+        if self.policy.mode == "chat_only":
+            return "main"
+        try:
+            branch = self.toolbox.git_current_branch(agent_id="router")
+        except Exception:
+            return "main"
+        if branch in {"main", "master"}:
+            return "main"
+        if branch == "HEAD":
+            return "main"
+        if ledger_path(self.repo_root, branch).exists():
+            return branch
+        return "main"
 
     def _agent(self, agent_id: str):
         cls = AGENT_REGISTRY.get(agent_id)
@@ -70,7 +84,7 @@ class Orchestrator:
         for rel in [".vibe/manifests/project_manifest.md", ".vibe/manifests/run_manifest.md"]:
             path = self.repo_root / rel
             if path.exists():
-                pointers.append(self.fs.read_file(rel, start_line=1, end_line=200).pointer)
+                pointers.append(self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=200).pointer)
         recent = []
         for evt in self.ledger.iter_events(limit=20, reverse=True):
             recent.append(packs.ContextEventRef(id=evt.id, summary=evt.summary, pointers=evt.pointers))
@@ -98,7 +112,7 @@ class Orchestrator:
         blockers: List[str] = []
         pointers: List[str] = []
         for cmd in commands:
-            r = self.cmd.run(cmd, cwd=self.repo_root, timeout_s=1800)
+            r = self.toolbox.run_cmd(agent_id="qa", cmd=cmd, cwd=self.repo_root, timeout_s=1800)
             passed = r.returncode == 0
             results.append(packs.TestResult(command=cmd, returncode=r.returncode, passed=passed, stdout=r.stdout, stderr=r.stderr, meta=r.meta))
             pointers.extend([r.stdout, r.stderr, r.meta])
@@ -176,6 +190,33 @@ class Orchestrator:
                 meta={"files_changed": change.files_changed},
             )
         )
+
+        if self.policy.mode == "chat_only":
+            checkpoint_id = f"ckpt_{uuid4().hex[:12]}"
+            artifacts: List[str] = []
+            if change.patch_pointer:
+                artifacts.append(change.patch_pointer)
+            cp = self.checkpoints.create(
+                checkpoint_id=checkpoint_id,
+                label=req.summary,
+                repo_ref="no-git",
+                ledger_offset=self.ledger.count_lines(),
+                artifacts=artifacts,
+                green=False,
+                restore_steps=["policy(chat_only): no restore steps recorded"],
+                meta={"reason": "chat_only"},
+            )
+            self.ledger.append(
+                new_event(
+                    agent="router",
+                    type="CHECKPOINT_CREATED",
+                    summary=f"Created checkpoint {cp.id} (non-green, chat_only)",
+                    branch_id=self.branch_id,
+                    pointers=artifacts,
+                    meta={"green": False, "repo_ref": "no-git"},
+                )
+            )
+            return RunResult(checkpoint_id=cp.id, green=False)
 
         # QA
         self.ledger.append(
@@ -257,9 +298,9 @@ class Orchestrator:
         artifacts.extend(report.pointers)
 
         repo_ref = "no-git"
-        if self.git.is_repo():
-            repo_ref = self.git.head_sha()
-        else:
+        try:
+            repo_ref = self.toolbox.git_head_sha(agent_id="router")
+        except Exception:
             snap = self.checkpoints.snapshot_repo()
             artifacts.append(snap.to_pointer())
 

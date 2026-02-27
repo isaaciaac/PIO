@@ -42,6 +42,20 @@ vibe checkpoint list
 - `vibe checkpoint list/create/restore`
 - `vibe branch create --from <checkpoint_id> [--name <git_branch>]`
 
+## 权限模式（允许 / 每次提示 / 仅聊天）
+
+你可以用三种权限模式控制本地工具（`run_cmd/git/read_file/write_file/search`）：
+
+- `allow_all`：全部允许（默认）
+- `prompt`：每次工具动作都会提示是否允许
+- `chat_only`：禁止本地工具动作（不会跑命令/改代码）
+
+设置方式三选一（优先级：命令行 > 环境变量 > 配置文件）：
+
+- 命令行：`vibe --policy prompt run`
+- 环境变量：`VIBE_POLICY_MODE=prompt`
+- 配置文件：`.vibe/vibe.yaml` -> `policy.mode`
+
 ## VS Code 扩展（最小 IDE 封装）
 
 扩展源码在 `vscode-vibe/`，提供 Dashboard + 一组 `Vibe:` 命令（调用本机 `vibe` CLI）。

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -34,8 +34,13 @@ class AgentConfig(BaseModel):
     prompt_template: str = ""
 
 
+class PolicyConfig(BaseModel):
+    mode: Literal["allow_all", "prompt", "chat_only"] = "allow_all"
+
+
 class VibeConfig(BaseModel):
     version: str = "0.1"
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
     providers: Dict[str, ProviderConfig]
     agents: Dict[str, AgentConfig]
 
@@ -327,4 +332,3 @@ def write_default_config(repo_root: Path, cfg: VibeConfig) -> None:
     cfg_path = repo_root / ".vibe" / "vibe.yaml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg.model_dump(), sort_keys=False, allow_unicode=True), encoding="utf-8")
-
