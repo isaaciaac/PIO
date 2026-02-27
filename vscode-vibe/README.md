@@ -67,12 +67,12 @@ npm run compile
 npm run package:vsix
 ```
 
-会生成：`vscode-vibe/vibe-coding-0.1.1.vsix`
+会生成：`vscode-vibe/vibe-coding-<版本号>.vsix`（每次打包会自动把版本号 +1）
 
 安装：
 
 - VS Code → Extensions → `...` → `Install from VSIX...`
-- 或命令行：`code --install-extension vibe-coding-0.1.1.vsix`
+- 或命令行：`code --install-extension vibe-coding-<版本号>.vsix`
 
 ## 使用
 
@@ -86,6 +86,7 @@ npm run package:vsix
   - `聊天（PM）`：自然语言对话（调用 `vibe chat`，不会运行工作流/改代码）
   - `确认权限（写项目）`：执行工作流（`task add + run`），每次工具动作都会弹窗询问是否允许
   - `完全授权（写项目）`：执行工作流（`task add + run`），不弹窗，全部允许
+- 聊天模式下可选择“角色”，会将对话历史分别保存在 `.vibe/views/<agent_id>/chat.jsonl`
 - 勾选 `Mock` 可无 key 运行闭环
 - 点击 `发送`（或 `Ctrl+Enter` 发送）
 

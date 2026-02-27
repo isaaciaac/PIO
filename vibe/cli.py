@@ -149,6 +149,7 @@ def _append_chat_history(path: Path, *, role: str, content: str) -> None:
 def chat(
     ctx: typer.Context,
     message: str = typer.Argument(..., help="Chat message"),
+    agent: str = typer.Option("pm", "--agent", help="Agent id to chat with (default: pm)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
     mock: bool = typer.Option(False, "--mock", help="Force mock mode for this chat"),
     json_out: bool = typer.Option(False, "--json", help="Output ChatReply JSON"),
@@ -163,14 +164,14 @@ def chat(
         raise typer.Exit(code=2)
 
     cfg = VibeConfig.load(cfg_path)
-    agent_id = "pm"
+    agent_id = agent.strip()
     agent_cfg = cfg.agents.get(agent_id)
     if not agent_cfg:
-        typer.echo("Missing agent config: pm", err=True)
+        typer.echo(f"Missing agent config: {agent_id}", err=True)
         raise typer.Exit(code=2)
     agent_cls = AGENT_REGISTRY.get(agent_id)
     if not agent_cls:
-        typer.echo("Missing agent implementation: pm", err=True)
+        typer.echo(f"Missing agent implementation: {agent_id}", err=True)
         raise typer.Exit(code=2)
 
     hist_path = _chat_history_path(repo_root, agent_id)
@@ -178,17 +179,19 @@ def chat(
         hist_path.write_text("", encoding="utf-8")
 
     past = _read_chat_history(hist_path, limit=max(0, min(history, 64)))
+    purpose = (agent_cfg.purpose or "").strip()
+    role_hint = f"你的工种ID是 {agent_id}。" + (f" 你的职责是：{purpose}。" if purpose else "")
     system = (
-        "你是 Vibe 系统里的产品经理（PM）代理。你要用自然语言与用户对话，帮助澄清需求、给出可执行的验收标准（AC）、"
-        "并指导用户如何在当前工作区使用 Vibe。\n\n"
+        f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
+        "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
         "硬约束：你必须只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
         "不要在最外层包一层额外的 key。"
     )
     messages = [{"role": "system", "content": system}, *past, {"role": "user", "content": message}]
 
-    pm = agent_cls(agent_cfg, providers=cfg.providers)
-    reply, _meta = pm.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=0.2)
+    a = agent_cls(agent_cfg, providers=cfg.providers)
+    reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=0.2)
 
     _append_chat_history(hist_path, role="user", content=message)
     _append_chat_history(hist_path, role="assistant", content=reply.reply)

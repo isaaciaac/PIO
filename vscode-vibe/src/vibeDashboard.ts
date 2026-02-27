@@ -149,15 +149,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const text = String(msg?.text || "").trim();
           const mock = Boolean(msg?.mock);
           const mode = String(msg?.mode || "chat").trim();
+          const agent = String(msg?.agent || "pm").trim();
           if (!text) return;
           if (mode === "chat") {
-            await this.handlePmChat(root, text, mock);
+            await this.handlePmChat(root, text, mock, agent);
           } else if (mode === "prompt") {
             await this.handleChatSend(root, text, mock, "prompt");
           } else if (mode === "allow_all") {
             await this.handleChatSend(root, text, mock, "allow_all");
           } else {
-            await this.handlePmChat(root, text, mock);
+            await this.handlePmChat(root, text, mock, agent);
           }
           return;
         }
@@ -209,7 +210,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.addMessage("assistant", "Initialized .vibe", "init");
   }
 
-  private async handlePmChat(root: string, text: string, mock: boolean): Promise<void> {
+  private async handlePmChat(root: string, text: string, mock: boolean, agent: string): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.addMessage("user", text);
@@ -219,7 +220,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const envOverrides = await this.getEnvOverrides?.();
       await this.ensureInit(root, envOverrides);
 
-      const args = ["chat", text, "--path", root, "--json"];
+      const args = ["chat", text, "--path", root, "--json", "--agent", agent || "pm"];
       if (mock) args.push("--mock");
       const res = await runVibeCapture(args, {
         cwd: root,
@@ -244,7 +245,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}`
         : replyText || "（无回复）";
 
-      this.addMessage("assistant", assistantText, "产品经理");
+      const title = agent === "pm" ? "产品经理" : `角色：${agent}`;
+      this.addMessage("assistant", assistantText, title);
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
@@ -439,6 +441,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       .leftMeta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
+      .agentWrap { display: inline-flex; align-items: center; gap: 6px; }
+      .agentWrap label { color: var(--vscode-descriptionForeground); }
+
       select {
         background: var(--vscode-dropdown-background, var(--vscode-input-background));
         color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
@@ -508,6 +513,18 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               <option value="prompt">确认权限（写项目）</option>
               <option value="allow_all">完全授权（写项目）</option>
             </select>
+            <span class="agentWrap" id="agentWrap" title="选择要对话的角色（仅聊天模式生效）">
+              <label for="agent">角色</label>
+              <select id="agent">
+                <option value="pm" selected>产品经理（PM）</option>
+                <option value="architect">架构师</option>
+                <option value="security">安全</option>
+                <option value="qa">测试（QA）</option>
+                <option value="coder_backend">后端开发</option>
+                <option value="code_reviewer">代码审查</option>
+                <option value="router">调度器（Router）</option>
+              </select>
+            </span>
           </div>
           <span>设置：<code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
@@ -531,6 +548,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elStatus = document.getElementById('status');
       const elMock = document.getElementById('mock');
       const elMode = document.getElementById('mode');
+      const elAgent = document.getElementById('agent');
+      const elAgentWrap = document.getElementById('agentWrap');
 
       function escapeHtml(s) {
         return s.replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c] || c));
@@ -567,7 +586,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const text = (elInput.value || '').trim();
         if (!text) return;
         const mode = (elMode && elMode.value) ? elMode.value : 'chat';
-        vscode.postMessage({ type: 'chatSend', mode, text, mock: !!elMock.checked });
+        const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
+        vscode.postMessage({ type: 'chatSend', mode, agent, text, mock: !!elMock.checked });
         elInput.value = '';
       }
 
@@ -578,6 +598,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           sendChat();
         }
       });
+
+      function syncMode() {
+        const mode = (elMode && elMode.value) ? elMode.value : 'chat';
+        if (elAgentWrap) elAgentWrap.style.display = (mode === 'chat') ? 'inline-flex' : 'none';
+      }
+      if (elMode) elMode.addEventListener('change', syncMode);
+      syncMode();
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));
       document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearChat'}));

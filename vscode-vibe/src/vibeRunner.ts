@@ -45,6 +45,10 @@ export async function runVibeCapture(args: string[], options: RunVibeCaptureOpti
   const permissionMode = (options.policyOverride ?? getPermissionMode()).trim();
   const finalArgs = permissionMode !== "config" ? ["--policy", permissionMode, ...args] : args;
   const env: NodeJS.ProcessEnv = { ...process.env, ...(options.envOverrides || {}) };
+  // Fix Chinese mojibake on Windows when the Python process writes using a non-UTF8 codepage.
+  // Force UTF-8 for stdout/stderr so the VS Code Output + webview can decode consistently.
+  if (!env.PYTHONUTF8) env.PYTHONUTF8 = "1";
+  if (!env.PYTHONIOENCODING) env.PYTHONIOENCODING = "utf-8";
   if (options.mock) {
     env.VIBE_MOCK_MODE = "1";
   }

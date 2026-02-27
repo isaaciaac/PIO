@@ -29,3 +29,19 @@ def test_cli_chat_mock_returns_chatreply_and_persists_history(tmp_path: Path, mo
     # user + assistant
     assert len(lines) >= 2
 
+
+def test_cli_chat_mock_supports_agent_selection(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    os.environ["VIBE_MOCK_MODE"] = "1"
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = runner.invoke(app, ["chat", "hello", "--agent", "security", "--json"])
+    assert r2.exit_code == 0, r2.output
+    payload = json.loads(r2.output)
+    assert payload.get("reply")
+
+    hist = tmp_path / ".vibe" / "views" / "security" / "chat.jsonl"
+    assert hist.exists()
