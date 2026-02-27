@@ -18,6 +18,10 @@
     "onCommand:vibe.checkpointList",
     "onCommand:vibe.checkpointRestore",
     "onCommand:vibe.branchCreateFromCheckpoint",
+    "onCommand:vibe.setDeepSeekApiKey",
+    "onCommand:vibe.setDashScopeApiKey",
+    "onCommand:vibe.clearStoredApiKeys",
+    "onCommand:vibe.showApiKeyStatus",
     "onView:vibe.dashboard"
   ],
   "main": "./dist/extension.js",
@@ -31,7 +35,11 @@
       { "command": "vibe.openLedger", "title": "Vibe: Open Ledger (ledger.jsonl)" },
       { "command": "vibe.checkpointList", "title": "Vibe: Checkpoint List" },
       { "command": "vibe.checkpointRestore", "title": "Vibe: Checkpoint Restore" },
-      { "command": "vibe.branchCreateFromCheckpoint", "title": "Vibe: Branch Create From Checkpoint" }
+      { "command": "vibe.branchCreateFromCheckpoint", "title": "Vibe: Branch Create From Checkpoint" },
+      { "command": "vibe.setDeepSeekApiKey", "title": "Vibe: Set DeepSeek API Key" },
+      { "command": "vibe.setDashScopeApiKey", "title": "Vibe: Set DashScope API Key" },
+      { "command": "vibe.showApiKeyStatus", "title": "Vibe: Show API Key Status" },
+      { "command": "vibe.clearStoredApiKeys", "title": "Vibe: Clear Stored API Keys" }
     ],
     "views": {
       "explorer": [

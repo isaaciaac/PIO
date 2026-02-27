@@ -11,6 +11,8 @@ type ChatMessage = {
   ts: number;
 };
 
+type EnvOverridesProvider = () => Promise<NodeJS.ProcessEnv>;
+
 function newId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
@@ -116,7 +118,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     },
   ];
 
-  constructor(private readonly output: vscode.OutputChannel) {}
+  constructor(
+    private readonly output: vscode.OutputChannel,
+    private readonly getEnvOverrides?: EnvOverridesProvider
+  ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void | Thenable<void> {
     this.view = webviewView;
@@ -130,6 +135,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       try {
+        const envOverrides = await this.getEnvOverrides?.();
         if (msg?.type === "ready") {
           this.postState();
           return;
@@ -147,15 +153,15 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         if (msg?.type === "init") {
-          await runVibe(["init", "--path", root], { cwd: root, mock: false, output: this.output });
+          await runVibe(["init", "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
         } else if (msg?.type === "addTask") {
           const text = await vscode.window.showInputBox({ title: "Vibe: Add Task", prompt: "Task description" });
           if (!text) return;
-          await runVibe(["task", "add", text, "--path", root], { cwd: root, mock: false, output: this.output });
+          await runVibe(["task", "add", text, "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
         } else if (msg?.type === "runMock") {
-          await runVibe(["run", "--mock", "--path", root], { cwd: root, mock: true, output: this.output });
+          await runVibe(["run", "--mock", "--path", root], { cwd: root, mock: true, output: this.output, envOverrides });
         } else if (msg?.type === "run") {
-          await runVibe(["run", "--path", root], { cwd: root, mock: false, output: this.output });
+          await runVibe(["run", "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
         } else if (msg?.type === "openConfig") {
           await vscode.commands.executeCommand("vibe.openConfig");
           return;
@@ -163,7 +169,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           await vscode.commands.executeCommand("vibe.openLedger");
           return;
         } else if (msg?.type === "checkpoints") {
-          await runVibe(["checkpoint", "list", "--path", root], { cwd: root, mock: false, output: this.output });
+          await runVibe(["checkpoint", "list", "--path", root], { cwd: root, mock: false, output: this.output, envOverrides });
         }
         this.refresh();
       } catch (e) {
@@ -188,11 +194,17 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage({ type: "state", running: this.running, messages: this.messages, ts: Date.now() });
   }
 
-  private async ensureInit(root: string): Promise<void> {
+  private async ensureInit(root: string, envOverrides?: NodeJS.ProcessEnv): Promise<void> {
     const cfgPath = vscode.Uri.file(path.join(root, ".vibe", "vibe.yaml"));
     if (await exists(cfgPath)) return;
     this.addMessage("assistant", "Initializing .vibe ...", "init");
-    await runVibeCapture(["init", "--path", root], { cwd: root, mock: false, output: this.output, title: "Vibe: Init" });
+    await runVibeCapture(["init", "--path", root], {
+      cwd: root,
+      mock: false,
+      output: this.output,
+      title: "Vibe: Init",
+      envOverrides,
+    });
     this.addMessage("assistant", "Initialized .vibe", "init");
   }
 
@@ -203,7 +215,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.postState();
 
     try {
-      await this.ensureInit(root);
+      const envOverrides = await this.getEnvOverrides?.();
+
+      await this.ensureInit(root, envOverrides);
 
       const before = await countLedgerLines(root);
 
@@ -212,20 +226,31 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         mock: false,
         output: this.output,
         title: "Vibe: Add Task",
+        envOverrides,
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
       this.addMessage("assistant", `task: ${taskId}`, "task");
 
       const runArgs = ["run", "--task", taskId, "--path", root];
       if (mock) runArgs.push("--mock");
-      const runRes = await runVibeCapture(runArgs, { cwd: root, mock, output: this.output, title: mock ? "Vibe: Run (Mock)" : "Vibe: Run" });
+      const runRes = await runVibeCapture(runArgs, {
+        cwd: root,
+        mock,
+        output: this.output,
+        title: mock ? "Vibe: Run (Mock)" : "Vibe: Run",
+        envOverrides,
+      });
       const checkpointId = lastNonEmptyLine(runRes.stdout) || "(unknown_checkpoint_id)";
       const cp = await readCheckpoint(root, checkpointId);
       const events = await readLedgerEventsSince(root, before);
       this.addMessage("assistant", formatRunSummary(checkpointId, cp?.green, events), "run");
     } catch (e) {
       if (e instanceof VibeRunError) {
-        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}`, "error");
+        const hint =
+          (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
+            ? "\n\nHint: set keys via Command Palette → 'Vibe: Set DeepSeek API Key' / 'Vibe: Set DashScope API Key'."
+            : "";
+        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "error");
       } else {
         const message = e instanceof Error ? e.message : String(e);
         this.addMessage("assistant", message, "error");

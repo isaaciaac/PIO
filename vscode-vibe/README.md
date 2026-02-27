@@ -142,9 +142,18 @@ npm run package:vsix
 
 ## 使用真实模型（DeepSeek / DashScope）
 
-扩展不直接保存 key；仍由 `vibe` CLI 从环境变量读取：
+扩展支持把 key 存到 VS Code SecretStorage（推荐），并在每次调用 `vibe` CLI 时自动注入到子进程环境变量里；无需 PowerShell/终端里反复 `set`。
+
+用 Command Palette（`Ctrl+Shift+P`）执行：
+
+- `Vibe: Set DeepSeek API Key`
+- `Vibe: Set DashScope API Key`
+- `Vibe: Show API Key Status`
+- `Vibe: Clear Stored API Keys`
+
+注入的环境变量名仍是：
 
 - DeepSeek：`DEEPSEEK_API_KEY`
 - DashScope：`DASHSCOPE_API_KEY`
 
-建议在“启动 Extension Development Host 之前”的终端里设置环境变量，再启动 VS Code，这样扩展运行时能继承到。
+你也可以继续用系统环境变量方式设置它们（不通过扩展保存）。但注意：扩展进程只会继承“启动 VS Code 时”的环境变量；在集成终端里后设置的变量，通常不会自动同步到扩展进程。

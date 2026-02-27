@@ -4,12 +4,51 @@ import { registerApprovalWatcher } from "./approvals";
 import { VibeDashboardViewProvider } from "./vibeDashboard";
 import { readCheckpointIds, runVibe } from "./vibeRunner";
 
+const SECRET_DEEPSEEK_API_KEY = "DEEPSEEK_API_KEY";
+const SECRET_DASHSCOPE_API_KEY = "DASHSCOPE_API_KEY";
+
 function requireWorkspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) {
     throw new Error("No workspace folder open.");
   }
   return folder.uri.fsPath;
+}
+
+async function setSecretKey(
+  context: vscode.ExtensionContext,
+  label: string,
+  secretKey: string
+): Promise<void> {
+  const value = await vscode.window.showInputBox({
+    title: `Vibe: Set ${label} API Key`,
+    prompt: `${label} API Key (stored in VS Code SecretStorage)`,
+    password: true,
+    ignoreFocusOut: true,
+    validateInput: (v) => (v.trim().length === 0 ? "API key cannot be empty." : undefined),
+  });
+  if (!value) return;
+  await context.secrets.store(secretKey, value.trim());
+  vscode.window.showInformationMessage(`${label} API key stored securely (SecretStorage).`);
+}
+
+async function showApiKeyStatus(context: vscode.ExtensionContext): Promise<void> {
+  const ds = (await context.secrets.get(SECRET_DEEPSEEK_API_KEY)) ? "stored" : "not set";
+  const qs = (await context.secrets.get(SECRET_DASHSCOPE_API_KEY)) ? "stored" : "not set";
+  vscode.window.showInformationMessage(`Vibe API keys — DeepSeek: ${ds}; DashScope: ${qs}.`);
+}
+
+async function clearStoredApiKeys(context: vscode.ExtensionContext): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    "Clear stored API keys from VS Code SecretStorage?",
+    { modal: true, detail: "This only removes keys saved by the Vibe extension. It does not change your shell environment variables." },
+    "Clear",
+    "Cancel"
+  );
+  if (choice !== "Clear") return;
+  await context.secrets.delete(SECRET_DEEPSEEK_API_KEY);
+  await context.secrets.delete(SECRET_DASHSCOPE_API_KEY);
+  vscode.window.showInformationMessage("Stored Vibe API keys cleared.");
 }
 
 async function openFileIfExists(absPath: string): Promise<void> {
@@ -50,7 +89,16 @@ export function activate(context: vscode.ExtensionContext) {
 
   registerApprovalWatcher(context, output);
 
-  const dashboard = new VibeDashboardViewProvider(output);
+  async function getEnvOverrides(): Promise<NodeJS.ProcessEnv> {
+    const env: NodeJS.ProcessEnv = {};
+    const deepseek = await context.secrets.get(SECRET_DEEPSEEK_API_KEY);
+    const dashscope = await context.secrets.get(SECRET_DASHSCOPE_API_KEY);
+    if (deepseek) env[SECRET_DEEPSEEK_API_KEY] = deepseek;
+    if (dashscope) env[SECRET_DASHSCOPE_API_KEY] = dashscope;
+    return env;
+  }
+
+  const dashboard = new VibeDashboardViewProvider(output, getEnvOverrides);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("vibe.dashboard", dashboard, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -60,7 +108,8 @@ export function activate(context: vscode.ExtensionContext) {
   async function exec(args: string[], opts?: { mock?: boolean }) {
     const root = requireWorkspaceRoot();
     output.show(true);
-    await runVibe(args, { cwd: root, mock: opts?.mock ?? false, output });
+    const envOverrides = await getEnvOverrides();
+    await runVibe(args, { cwd: root, mock: opts?.mock ?? false, output, envOverrides });
     dashboard.refresh();
   }
 
@@ -157,6 +206,30 @@ export function activate(context: vscode.ExtensionContext) {
       }
       await exec(args);
       vscode.window.showInformationMessage(`Branch created from ${checkpointId}.`);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vibe.setDeepSeekApiKey", async () => {
+      await setSecretKey(context, "DeepSeek", SECRET_DEEPSEEK_API_KEY);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vibe.setDashScopeApiKey", async () => {
+      await setSecretKey(context, "DashScope", SECRET_DASHSCOPE_API_KEY);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vibe.showApiKeyStatus", async () => {
+      await showApiKeyStatus(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vibe.clearStoredApiKeys", async () => {
+      await clearStoredApiKeys(context);
     })
   );
 }

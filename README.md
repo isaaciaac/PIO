@@ -65,6 +65,7 @@ vibe checkpoint list
 ## VS Code 扩展（最小 IDE 封装）
 
 扩展源码在 `vscode-vibe/`，提供 Dashboard + 一组 `Vibe:` 命令（调用本机 `vibe` CLI）。
+扩展支持把 DeepSeek/DashScope key 存到 VS Code SecretStorage，并在运行时自动注入给 CLI（详见 `vscode-vibe/README.md`）。
 
 ```bash
 cd vscode-vibe
