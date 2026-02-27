@@ -4,7 +4,7 @@
 
 ## 你将得到什么
 
-- Explorer 面板的 `Vibe` 视图（Dashboard）：一键 `init / add task / run / run mock / 打开配置与 ledger / checkpoint list`
+- Explorer 面板的 `Vibe` 视图（侧边栏 Chat UI）：像“助手”一样对话，发送消息会自动 `task add + run`
 - Command Palette 的 `Vibe:` 命令：和 Dashboard 同功能
 - 输出统一写到 `Output -> Vibe`，便于复制/排障
 
@@ -60,6 +60,20 @@ npm run compile
 
 - 打开 Command Palette（`Ctrl+Shift+P`），搜索 `Vibe:` 命令
 - 或在 Explorer 面板底部找到 `Vibe` 视图（Dashboard）直接点按钮
+
+### 侧边栏 Chat UI（推荐）
+
+- 在输入框里描述你的任务
+- 勾选 `Mock` 可无 key 运行闭环
+- 点击 `Send`（或 `Ctrl+Enter` 发送）
+
+每次发送会执行：
+
+1. 若未初始化则自动 `vibe init`
+2. `vibe task add "<你的输入>"`
+3. `vibe run --task <task_id>`（Mock 勾选时会追加 `--mock`）
+
+运行结果会显示 checkpoint id、green 状态，以及本次新增的 ledger events 摘要。
 
 ## 权限模式（像“工具审批”一样）
 

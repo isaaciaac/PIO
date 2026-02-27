@@ -8,6 +8,19 @@ export interface RunVibeOptions {
   output: vscode.OutputChannel;
 }
 
+export class VibeRunError extends Error {
+  public readonly code: number;
+  public readonly stdout: string;
+  public readonly stderr: string;
+
+  constructor(message: string, code: number, stdout: string, stderr: string) {
+    super(message);
+    this.code = code;
+    this.stdout = stdout;
+    this.stderr = stderr;
+  }
+}
+
 function getCliPath(): string {
   const cfg = vscode.workspace.getConfiguration("vibe");
   const cliPath = cfg.get<string>("cliPath") || "vibe";
@@ -19,7 +32,13 @@ function getPermissionMode(): string {
   return (cfg.get<string>("permissionMode") || "config").trim();
 }
 
-export async function runVibe(args: string[], options: RunVibeOptions): Promise<void> {
+export interface RunVibeCaptureOptions extends RunVibeOptions {
+  title?: string;
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
+}
+
+export async function runVibeCapture(args: string[], options: RunVibeCaptureOptions): Promise<{ stdout: string; stderr: string }> {
   const cli = getCliPath();
   const permissionMode = getPermissionMode();
   const finalArgs = permissionMode !== "config" ? ["--policy", permissionMode, ...args] : args;
@@ -32,14 +51,27 @@ export async function runVibe(args: string[], options: RunVibeOptions): Promise<
 
   options.output.appendLine(`$ ${cli} ${finalArgs.join(" ")}`);
 
-  await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: "Vibe", cancellable: false },
+  return await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: options.title || "Vibe", cancellable: false },
     () =>
-      new Promise<void>((resolve, reject) => {
+      new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
         const proc = spawn(cli, finalArgs, { cwd: options.cwd, env, shell: false });
 
-        proc.stdout.on("data", (d) => options.output.append(d.toString()));
-        proc.stderr.on("data", (d) => options.output.append(d.toString()));
+        let stdout = "";
+        let stderr = "";
+
+        proc.stdout.on("data", (d) => {
+          const s = d.toString();
+          stdout += s;
+          options.output.append(s);
+          options.onStdout?.(s);
+        });
+        proc.stderr.on("data", (d) => {
+          const s = d.toString();
+          stderr += s;
+          options.output.append(s);
+          options.onStderr?.(s);
+        });
 
         proc.on("error", (err: any) => {
           if (err?.code === "ENOENT") {
@@ -55,13 +87,17 @@ export async function runVibe(args: string[], options: RunVibeOptions): Promise<
 
         proc.on("close", (code) => {
           if (code === 0) {
-            resolve();
+            resolve({ stdout, stderr });
           } else {
-            reject(new Error(`vibe exited with code ${code}`));
+            reject(new VibeRunError(`vibe exited with code ${code}`, code ?? -1, stdout, stderr));
           }
         });
       })
   );
+}
+
+export async function runVibe(args: string[], options: RunVibeOptions): Promise<void> {
+  await runVibeCapture(args, options);
 }
 
 export async function readCheckpointIds(workspaceRoot: string): Promise<string[]> {
