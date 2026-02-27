@@ -23,6 +23,27 @@ async function openFileIfExists(absPath: string): Promise<void> {
   }
 }
 
+async function ensureVibeInit(root: string, output: vscode.OutputChannel): Promise<void> {
+  const cfg = vscode.Uri.file(path.join(root, ".vibe", "vibe.yaml"));
+  try {
+    await vscode.workspace.fs.stat(cfg);
+    return;
+  } catch {
+    // continue
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    "No .vibe config found in this workspace. Run Vibe: Init now?",
+    "Init",
+    "Cancel"
+  );
+  if (choice !== "Init") {
+    throw new Error("Missing .vibe. Run 'Vibe: Init' first.");
+  }
+  output.show(true);
+  await runVibe(["init", "--path", root], { cwd: root, mock: false, output });
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Vibe");
   context.subscriptions.push(output);
@@ -80,6 +101,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.openConfig", async () => {
       const root = requireWorkspaceRoot();
+      await ensureVibeInit(root, output);
       await openFileIfExists(path.join(root, ".vibe", "vibe.yaml"));
     })
   );
@@ -87,6 +109,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("vibe.openLedger", async () => {
       const root = requireWorkspaceRoot();
+      await ensureVibeInit(root, output);
       await openFileIfExists(path.join(root, ".vibe", "ledger.jsonl"));
     })
   );
