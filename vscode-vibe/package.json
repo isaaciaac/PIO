@@ -1,0 +1,63 @@
+{
+  "name": "vibe-coding",
+  "displayName": "Vibe Coding",
+  "description": "Run the vibe multi-agent workflow from VS Code.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:vibe.init",
+    "onCommand:vibe.addTask",
+    "onCommand:vibe.run",
+    "onCommand:vibe.runMock",
+    "onCommand:vibe.openConfig",
+    "onCommand:vibe.openLedger",
+    "onCommand:vibe.checkpointList",
+    "onCommand:vibe.checkpointRestore",
+    "onCommand:vibe.branchCreateFromCheckpoint",
+    "onView:vibe.dashboard"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "vibe.init", "title": "Vibe: Init" },
+      { "command": "vibe.addTask", "title": "Vibe: Add Task" },
+      { "command": "vibe.run", "title": "Vibe: Run" },
+      { "command": "vibe.runMock", "title": "Vibe: Run (Mock)" },
+      { "command": "vibe.openConfig", "title": "Vibe: Open Config (vibe.yaml)" },
+      { "command": "vibe.openLedger", "title": "Vibe: Open Ledger (ledger.jsonl)" },
+      { "command": "vibe.checkpointList", "title": "Vibe: Checkpoint List" },
+      { "command": "vibe.checkpointRestore", "title": "Vibe: Checkpoint Restore" },
+      { "command": "vibe.branchCreateFromCheckpoint", "title": "Vibe: Branch Create From Checkpoint" }
+    ],
+    "views": {
+      "explorer": [
+        { "id": "vibe.dashboard", "name": "Vibe" }
+      ]
+    },
+    "configuration": {
+      "title": "Vibe",
+      "properties": {
+        "vibe.cliPath": {
+          "type": "string",
+          "default": "vibe",
+          "description": "Path to the vibe CLI (must be available in PATH or absolute path)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.5"
+  }
+}
+
