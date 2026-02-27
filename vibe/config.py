@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+from pydantic import BaseModel, Field
+
+
+class ProviderConfig(BaseModel):
+    id: str
+    base_url: str
+    api_key_env: Optional[str] = None
+
+
+class AgentMemoryScope(BaseModel):
+    view_dir: str
+    ledger_read_filter: List[str] = Field(default_factory=list)
+    ledger_write_types: List[str] = Field(default_factory=list)
+    artifact_read: bool = True
+    artifact_write: bool = True
+
+
+class AgentConfig(BaseModel):
+    id: str
+    enabled: bool = False
+    provider: str
+    model: str
+    purpose: str
+    io_schema: str
+    memory_scope: AgentMemoryScope
+    tools_allowed: List[str] = Field(default_factory=list)
+    rollback_strategy: str = ""
+    prompt_template: str = ""
+
+
+class VibeConfig(BaseModel):
+    version: str = "0.1"
+    providers: Dict[str, ProviderConfig]
+    agents: Dict[str, AgentConfig]
+
+    @staticmethod
+    def load(path: Path) -> "VibeConfig":
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return VibeConfig.model_validate(data)
+
+    def redacted(self) -> "VibeConfig":
+        # Keys are always in env vars; nothing to redact besides repeating env var name.
+        return self
+
+
+def default_config() -> VibeConfig:
+    providers = {
+        "deepseek": ProviderConfig(id="deepseek", base_url="https://api.deepseek.com/v1", api_key_env="DEEPSEEK_API_KEY"),
+        "dashscope": ProviderConfig(
+            id="dashscope",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key_env="DASHSCOPE_API_KEY",
+        ),
+        "mock": ProviderConfig(id="mock", base_url="mock://", api_key_env=None),
+    }
+
+    def agent(
+        agent_id: str,
+        *,
+        enabled: bool,
+        provider: str,
+        model: str,
+        purpose: str,
+        io_schema: str,
+        ledger_write_types: List[str],
+        tools_allowed: List[str],
+    ) -> AgentConfig:
+        return AgentConfig(
+            id=agent_id,
+            enabled=enabled,
+            provider=provider,
+            model=model,
+            purpose=purpose,
+            io_schema=io_schema,
+            memory_scope=AgentMemoryScope(
+                view_dir=f".vibe/views/{agent_id}/",
+                ledger_read_filter=[],
+                ledger_write_types=ledger_write_types,
+                artifact_read=True,
+                artifact_write=True,
+            ),
+            tools_allowed=tools_allowed,
+            rollback_strategy="",
+            prompt_template="",
+        )
+
+    agents: Dict[str, AgentConfig] = {
+        # Orchestration / routing
+        "router": agent(
+            "router",
+            enabled=True,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Orchestrate workflow and state transitions",
+            io_schema="vibe.schemas.packs.Plan",
+            ledger_write_types=["PLAN_CREATED", "CONTEXT_PACKET_BUILT", "STATE_TRANSITION", "CHECKPOINT_CREATED", "BRANCH_CREATED"],
+            tools_allowed=["read_file", "run_cmd", "git", "search", "write_file"],
+        ),
+        "log_compressor": agent(
+            "log_compressor",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-flash",
+            purpose="Index and compress long logs",
+            io_schema="vibe.schemas.packs.LogIndex",
+            ledger_write_types=["LOG_INDEX_BUILT"],
+            tools_allowed=["read_artifact"],
+        ),
+        "researcher": agent(
+            "researcher",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Collect external references into refstore",
+            io_schema="vibe.schemas.packs.ReferenceItem",
+            ledger_write_types=["REF_ADDED", "REF_UPDATED"],
+            tools_allowed=["search", "write_refstore"],
+        ),
+        # Requirements / product
+        "pm": agent(
+            "pm",
+            enabled=True,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Define scope and acceptance criteria",
+            io_schema="vibe.schemas.packs.RequirementPack",
+            ledger_write_types=["REQ_CREATED", "REQ_UPDATED", "AC_DEFINED"],
+            tools_allowed=["read_file", "search"],
+        ),
+        "requirements_analyst": agent(
+            "requirements_analyst",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Define use cases and edge cases",
+            io_schema="vibe.schemas.packs.UseCasePack",
+            ledger_write_types=["USECASES_DEFINED"],
+            tools_allowed=["read_file"],
+        ),
+        "ux_writer": agent(
+            "ux_writer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Write UX copy and messages",
+            io_schema="vibe.schemas.packs.UXCopyPack",
+            ledger_write_types=["UX_COPY_UPDATED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+        # Architecture / contracts
+        "architect": agent(
+            "architect",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Produce ADRs and architecture decisions",
+            io_schema="vibe.schemas.packs.DecisionPack",
+            ledger_write_types=["ADR_ADDED", "ARCH_UPDATED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+        "api_confirm": agent(
+            "api_confirm",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Confirm API contracts and schemas",
+            io_schema="vibe.schemas.packs.ContractPack",
+            ledger_write_types=["CONTRACT_CONFIRMED", "CONTRACT_CHANGED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+        "data_engineer": agent(
+            "data_engineer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Plan and apply DB migrations",
+            io_schema="vibe.schemas.packs.MigrationPlan",
+            ledger_write_types=["DB_MIGRATION_PLANNED", "DB_MIGRATION_APPLIED"],
+            tools_allowed=["read_file", "write_file", "run_cmd"],
+        ),
+        # Environment / delivery
+        "env_engineer": agent(
+            "env_engineer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-turbo",
+            purpose="Probe and update environment/run instructions",
+            io_schema="vibe.schemas.packs.EnvSpec",
+            ledger_write_types=["ENV_PROBED", "ENV_UPDATED"],
+            tools_allowed=["run_cmd", "read_file", "write_file"],
+        ),
+        "devops": agent(
+            "devops",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Maintain CI/CD",
+            io_schema="vibe.schemas.packs.CIPack",
+            ledger_write_types=["CI_UPDATED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+        "release_manager": agent(
+            "release_manager",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Tag releases and changelog",
+            io_schema="vibe.schemas.packs.ReleasePack",
+            ledger_write_types=["RELEASE_TAGGED", "CHANGELOG_UPDATED"],
+            tools_allowed=["git", "write_file"],
+        ),
+        # Implementation
+        "coder_backend": agent(
+            "coder_backend",
+            enabled=True,
+            provider="dashscope",
+            model="qwen3-coder-next",
+            purpose="Implement backend code changes",
+            io_schema="vibe.schemas.packs.CodeChange",
+            ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN", "CODE_REFACTOR"],
+            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+        ),
+        "coder_frontend": agent(
+            "coder_frontend",
+            enabled=False,
+            provider="dashscope",
+            model="qwen3-coder-next",
+            purpose="Implement frontend code changes",
+            io_schema="vibe.schemas.packs.CodeChange",
+            ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN", "CODE_REFACTOR"],
+            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+        ),
+        "integration_engineer": agent(
+            "integration_engineer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen3-coder-next",
+            purpose="Integrate modules and align interfaces",
+            io_schema="vibe.schemas.packs.CodeChange",
+            ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN"],
+            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+        ),
+        "code_reviewer": agent(
+            "code_reviewer",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Review diffs and test results",
+            io_schema="vibe.schemas.packs.ReviewReport",
+            ledger_write_types=["REVIEW_PASSED", "REVIEW_BLOCKED"],
+            tools_allowed=["read_file", "read_artifact", "git"],
+        ),
+        # Quality / risk
+        "qa": agent(
+            "qa",
+            enabled=True,
+            provider="dashscope",
+            model="qwen3-coder-flash",
+            purpose="Run tests and report blockers",
+            io_schema="vibe.schemas.packs.TestReport",
+            ledger_write_types=["TEST_PLAN_CREATED", "TEST_RUN", "TEST_PASSED", "TEST_FAILED"],
+            tools_allowed=["run_cmd", "read_artifact", "read_file"],
+        ),
+        "security": agent(
+            "security",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Threat model and security review",
+            io_schema="vibe.schemas.packs.RiskRegister",
+            ledger_write_types=["SEC_REVIEW_PASSED", "SEC_REVIEW_BLOCKED", "SEC_FINDING"],
+            tools_allowed=["read_file", "read_artifact", "search"],
+        ),
+        "performance": agent(
+            "performance",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Performance analysis and benchmarks",
+            io_schema="vibe.schemas.packs.PerfReport",
+            ledger_write_types=["PERF_BENCH_RUN", "PERF_REGRESSION"],
+            tools_allowed=["run_cmd", "read_artifact", "read_file"],
+        ),
+        "compliance": agent(
+            "compliance",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Privacy/compliance review",
+            io_schema="vibe.schemas.packs.ComplianceReport",
+            ledger_write_types=["COMPLIANCE_BLOCKED", "COMPLIANCE_PASSED"],
+            tools_allowed=["read_file"],
+        ),
+        # Docs / handoff
+        "doc_writer": agent(
+            "doc_writer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Update docs and README",
+            io_schema="vibe.schemas.packs.DocPack",
+            ledger_write_types=["DOC_UPDATED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+        "support_engineer": agent(
+            "support_engineer",
+            enabled=False,
+            provider="dashscope",
+            model="qwen-plus",
+            purpose="Create runbooks and support playbooks",
+            io_schema="vibe.schemas.packs.RunbookPack",
+            ledger_write_types=["RUNBOOK_UPDATED"],
+            tools_allowed=["read_file", "write_file"],
+        ),
+    }
+
+    return VibeConfig(providers=providers, agents=agents)
+
+
+def write_default_config(repo_root: Path, cfg: VibeConfig) -> None:
+    cfg_path = repo_root / ".vibe" / "vibe.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(yaml.safe_dump(cfg.model_dump(), sort_keys=False, allow_unicode=True), encoding="utf-8")
+
