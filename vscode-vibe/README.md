@@ -4,7 +4,7 @@
 
 ## 你将得到什么
 
-- Explorer 面板的 `Vibe` 视图（侧边栏 Chat UI）：像“助手”一样对话，发送消息会自动 `task add + run`
+- 左侧 Activity Bar 的 `Vibe` 视图（侧边栏 Chat UI）：像“助手”一样对话（Chat/Workflow 两种模式）
 - Command Palette 的 `Vibe:` 命令：和 Dashboard 同功能
 - 输出统一写到 `Output -> Vibe`，便于复制/排障
 
@@ -77,21 +77,29 @@ npm run package:vsix
 ## 使用
 
 - 打开 Command Palette（`Ctrl+Shift+P`），搜索 `Vibe:` 命令
-- 或在 Explorer 面板底部找到 `Vibe` 视图（Dashboard）直接点按钮
+- 或点击左侧 Activity Bar 的 `Vibe` 图标打开面板
 
 ### 侧边栏 Chat UI（推荐）
 
-- 在输入框里描述你的任务
+- 在输入框里输入内容
+- 选择模式：
+  - `Chat (PM)`：自然语言对话（会调用 `vibe chat`）
+  - `Workflow`：把输入写成任务并运行工作流（会调用 `vibe task add + vibe run`）
 - 勾选 `Mock` 可无 key 运行闭环
 - 点击 `Send`（或 `Ctrl+Enter` 发送）
 
-每次发送会执行：
+当模式为 `Workflow` 时，每次发送会执行：
 
 1. 若未初始化则自动 `vibe init`
 2. `vibe task add "<你的输入>"`
 3. `vibe run --task <task_id>`（Mock 勾选时会追加 `--mock`）
 
-运行结果会显示 checkpoint id、green 状态，以及本次新增的 ledger events 摘要。
+当模式为 `Chat (PM)` 时，每次发送会执行：
+
+1. 若未初始化则自动 `vibe init`
+2. `vibe chat "<你的输入>" --json`（Mock 勾选时会追加 `--mock`）
+
+Chat 模式会在面板中显示 PM 的自然语言回复；Workflow 模式会显示 checkpoint id、green 状态，以及本次新增的 ledger events 摘要。
 
 ## 权限模式（像“工具审批”一样）
 

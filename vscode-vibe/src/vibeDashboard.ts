@@ -113,7 +113,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "Send a message to create a task and run the workflow. Use Mock for a key-less dry run.",
+      text: "Chat 模式：由 PM 代理用自然语言回答；Workflow 模式：把输入写入任务并运行工作流。Mock 可无 key 运行闭环。",
       ts: Date.now(),
     },
   ];
@@ -148,8 +148,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         if (msg?.type === "chatSend") {
           const text = String(msg?.text || "").trim();
           const mock = Boolean(msg?.mock);
+          const mode = String(msg?.mode || "chat").trim();
           if (!text) return;
-          await this.handleChatSend(root, text, mock);
+          if (mode === "workflow") {
+            await this.handleChatSend(root, text, mock);
+          } else {
+            await this.handlePmChat(root, text, mock);
+          }
           return;
         }
         if (msg?.type === "init") {
@@ -206,6 +211,59 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       envOverrides,
     });
     this.addMessage("assistant", "Initialized .vibe", "init");
+  }
+
+  private async handlePmChat(root: string, text: string, mock: boolean): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    this.addMessage("user", text);
+    this.postState();
+
+    try {
+      const envOverrides = await this.getEnvOverrides?.();
+      await this.ensureInit(root, envOverrides);
+
+      const args = ["chat", text, "--path", root, "--json"];
+      if (mock) args.push("--mock");
+      const res = await runVibeCapture(args, {
+        cwd: root,
+        mock,
+        output: this.output,
+        title: mock ? "Vibe: Chat (Mock)" : "Vibe: Chat",
+        envOverrides,
+      });
+
+      let payload: any = undefined;
+      try {
+        payload = JSON.parse(res.stdout);
+      } catch {
+        payload = undefined;
+      }
+      const replyText = (payload?.reply ? String(payload.reply) : res.stdout).trim();
+      const actions = Array.isArray(payload?.suggested_actions)
+        ? payload.suggested_actions.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+        : [];
+
+      const assistantText = actions.length
+        ? `${replyText}\n\nNext:\n- ${actions.join("\n- ")}`
+        : replyText || "(no reply)";
+
+      this.addMessage("assistant", assistantText, "pm");
+    } catch (e) {
+      if (e instanceof VibeRunError) {
+        const hint =
+          (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
+            ? "\n\nHint: set keys via Command Palette → 'Vibe: Set DeepSeek API Key' / 'Vibe: Set DashScope API Key'."
+            : "";
+        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "error");
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        this.addMessage("assistant", message, "error");
+      }
+    } finally {
+      this.running = false;
+      this.postState();
+    }
   }
 
   private async handleChatSend(root: string, text: string, mock: boolean): Promise<void> {
@@ -381,6 +439,17 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         font-size: 12px;
       }
 
+      .leftMeta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+      select {
+        background: var(--vscode-dropdown-background, var(--vscode-input-background));
+        color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+        border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+        border-radius: 8px;
+        padding: 4px 8px;
+        font: inherit;
+      }
+
       textarea {
         width: 100%;
         box-sizing: border-box;
@@ -434,7 +503,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       <div class="composer">
         <div class="metaRow">
-          <label><input type="checkbox" id="mock" /> Mock</label>
+          <div class="leftMeta">
+            <label><input type="checkbox" id="mock" /> Mock</label>
+            <select id="mode" title="Chat: PM 对话；Workflow: 写入任务并运行工作流">
+              <option value="chat" selected>Chat (PM)</option>
+              <option value="workflow">Workflow</option>
+            </select>
+          </div>
           <span>Settings: <code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
 
@@ -458,6 +533,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elSend = document.getElementById('send');
       const elStatus = document.getElementById('status');
       const elMock = document.getElementById('mock');
+      const elMode = document.getElementById('mode');
 
       function escapeHtml(s) {
         return s.replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c] || c));
@@ -493,7 +569,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       function sendChat() {
         const text = (elInput.value || '').trim();
         if (!text) return;
-        vscode.postMessage({ type: 'chatSend', text, mock: !!elMock.checked });
+        const mode = (elMode && elMode.value) ? elMode.value : 'chat';
+        vscode.postMessage({ type: 'chatSend', mode, text, mock: !!elMock.checked });
         elInput.value = '';
       }
 
