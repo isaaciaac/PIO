@@ -229,6 +229,47 @@ class Orchestrator:
             return f'cd /d "{d}" && {cmd}'
         return f'cd "{d}" && {cmd}'
 
+    def _artifact_tail_text(self, pointer: str, *, max_bytes: int = 16000) -> str:
+        """
+        Read the tail of an artifact text file so LLM prompts can include
+        concrete failure details without blowing up context windows.
+        """
+        try:
+            rel = str(pointer or "").split("@sha256:", 1)[0].strip()
+            if not rel:
+                return ""
+            abs_path = (self.repo_root / rel).resolve()
+            if not abs_path.exists() or not abs_path.is_file():
+                return ""
+            size = abs_path.stat().st_size
+            with abs_path.open("rb") as f:
+                if size > max_bytes:
+                    f.seek(max(0, size - max_bytes))
+                data = f.read(max_bytes)
+            text = data.decode("utf-8", errors="replace")
+            if size > max_bytes:
+                return "…（已截断，仅显示末尾）…\n" + text
+            return text
+        except Exception:
+            return ""
+
+    def _test_failure_excerpt(self, report: packs.TestReport) -> str:
+        try:
+            for r in report.results:
+                if not r.passed:
+                    stdout_text = self._artifact_tail_text(r.stdout, max_bytes=12000) if r.stdout else ""
+                    stderr_text = self._artifact_tail_text(r.stderr, max_bytes=12000) if r.stderr else ""
+                    parts: list[str] = []
+                    parts.append(f"FailedCommand: {r.command}")
+                    if stdout_text.strip():
+                        parts.append("\nSTDOUT:\n" + stdout_text.strip())
+                    if stderr_text.strip():
+                        parts.append("\nSTDERR:\n" + stderr_text.strip())
+                    return "\n".join(parts).strip()
+        except Exception:
+            return ""
+        return ""
+
     def _materialize_code_change(self, change: packs.CodeChange) -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
         if change.writes:
@@ -909,7 +950,10 @@ class Orchestrator:
                     blocker = ((review.blockers or []) if review is not None else [])[:1] or ["review blocked"]
                     blocker_text = blocker[0]
                 else:
+                    excerpt = self._test_failure_excerpt(report)
                     blocker_text = (report.blockers or ["tests failed"])[0]
+                    if excerpt:
+                        blocker_text = f"{blocker_text}\n\n{excerpt}"
 
                 fix_user = (
                     f"BlockerSource: {blocker_source}\n"
