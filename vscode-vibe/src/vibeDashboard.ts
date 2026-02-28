@@ -47,6 +47,17 @@ function formatRunError(e: VibeRunError): string {
   return `${e.message}\n\n${label}：\n${excerpt}\n\n${hint}`;
 }
 
+function compactMultiline(text: string, opts: { maxLines: number; maxChars: number }): string {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  const lines = raw.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim().length > 0);
+  if (!lines.length) return "";
+  let out = lines.slice(0, Math.max(1, opts.maxLines)).join("\n").trim();
+  if (lines.length > opts.maxLines) out = out + "\n…（已省略）…";
+  if (out.length > opts.maxChars) out = out.slice(0, opts.maxChars).trim() + "…";
+  return out;
+}
+
 async function readTextFile(uri: vscode.Uri): Promise<string> {
   const buf = await vscode.workspace.fs.readFile(uri);
   return Buffer.from(buf).toString("utf-8");
@@ -142,6 +153,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private running = false;
   private statusText = "";
+  private abort?: AbortController;
   private draftParts: string[] = [];
   private draftHinted = false;
   private messages: ChatMessage[] = [
@@ -174,6 +186,15 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const envOverrides = await this.getEnvOverrides?.();
         if (msg?.type === "ready") {
           this.postState();
+          return;
+        }
+        if (msg?.type === "stop") {
+          if (this.running) {
+            this.setStatus("正在停止…");
+            try {
+              this.abort?.abort();
+            } catch {}
+          }
           return;
         }
         if (msg?.type === "clearChat") {
@@ -738,13 +759,17 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const cmdHint = qaCommands.slice(0, 3).join("；") + (qaCommands.length > 3 ? "…" : "");
         lines.push(`测试：${passed ? "通过" : "失败"}${qaProfile ? `（${qaProfile}）` : ""}；命令：${cmdHint}`);
       }
-      if (!passed && qaBlockers.length) lines.push(`测试阻塞：${qaBlockers[0]}`);
+      if (!passed && qaBlockers.length) {
+        lines.push(`测试阻塞（摘要）：${compactMultiline(qaBlockers[0], { maxLines: 6, maxChars: 600 })}`);
+      }
     }
 
     if (reviewEvt) {
       const passed = String(reviewEvt.type || "").trim() === "REVIEW_PASSED";
       lines.push(`代码审查：${passed ? "通过" : "阻塞"}`);
-      if (!passed && reviewBlockers.length) lines.push(`审查阻塞：${reviewBlockers[0]}`);
+      if (!passed && reviewBlockers.length) {
+        lines.push(`审查阻塞（摘要）：${compactMultiline(reviewBlockers[0], { maxLines: 6, maxChars: 600 })}`);
+      }
     }
 
     if (green === false && reasonText) lines.push(`未绿灯说明：${reasonText}`);
@@ -787,7 +812,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     return lines.join("\n").trim();
   }
 
-  private async ensureInit(root: string, envOverrides?: NodeJS.ProcessEnv): Promise<void> {
+  private async ensureInit(root: string, envOverrides?: NodeJS.ProcessEnv, abortSignal?: AbortSignal): Promise<void> {
     const cfgPath = vscode.Uri.file(path.join(root, ".vibe", "vibe.yaml"));
     if (await exists(cfgPath)) return;
     this.addMessage("assistant", "Initializing .vibe ...", "init");
@@ -797,6 +822,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       output: this.output,
       title: "Vibe: Init",
       envOverrides,
+      abortSignal,
     });
     this.addMessage("assistant", "Initialized .vibe", "init");
   }
@@ -811,12 +837,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     if (this.running) return;
     this.running = true;
+    const abort = new AbortController();
+    this.abort = abort;
     this.addMessage("user", text);
     this.postState();
 
     try {
       const envOverrides = await this.getEnvOverrides?.();
-      await this.ensureInit(root, envOverrides);
+      await this.ensureInit(root, envOverrides, abort.signal);
 
       const args = ["chat", text, "--path", root, "--json", "--agent", agentId || "pm"];
       if (mock) args.push("--mock");
@@ -828,6 +856,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         title: mock ? "Vibe：聊天（模拟）" : "Vibe：聊天",
         envOverrides,
         policyOverride,
+        abortSignal: abort.signal,
       });
 
       let payload: any = undefined;
@@ -848,6 +877,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       this.addMessage("assistant", assistantText, this.agentTitle(agentId));
     } catch (e) {
       if (e instanceof VibeRunError) {
+        if (e.code === 130 || /cancelled/i.test(e.message || "")) {
+          this.addMessage("assistant", "已停止当前运行。", "系统");
+          return;
+        }
         const hint =
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
             ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
@@ -859,6 +892,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       this.running = false;
+      this.abort = undefined;
       this.postState();
     }
   }
@@ -866,6 +900,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private async handleWorkflowRun(root: string, taskText: string, mock: boolean, policyOverride: string, route: string, style: string): Promise<void> {
     if (this.running) return;
     this.running = true;
+    const abort = new AbortController();
+    this.abort = abort;
     this.setStatus("准备执行…");
     this.postState();
 
@@ -873,7 +909,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     try {
       const envOverrides = await this.getEnvOverrides?.();
 
-      await this.ensureInit(root, envOverrides);
+      await this.ensureInit(root, envOverrides, abort.signal);
 
       const before = await countLedgerLines(root);
 
@@ -885,6 +921,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         title: "Vibe：创建任务",
         envOverrides,
         policyOverride,
+        abortSignal: abort.signal,
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
 
@@ -899,6 +936,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       let routeToUse = (route || "auto").trim() || "auto";
 
       while (attempt < maxAttempts) {
+        if (abort.signal.aborted) break;
         attempt += 1;
         this.setStatus(attempt === 1 ? "正在运行工作流…" : `修复中（第 ${attempt} 轮/${maxAttempts}）…`);
 
@@ -920,6 +958,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           title,
           envOverrides,
           policyOverride,
+          abortSignal: abort.signal,
         });
 
         checkpointId = lastNonEmptyLine(runRes.stdout) || checkpointId;
@@ -948,6 +987,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       this.addMessage("assistant", narrative, "工作流");
     } catch (e) {
       if (e instanceof VibeRunError) {
+        if (e.code === 130 || /cancelled/i.test(e.message || "")) {
+          this.addMessage("assistant", "已停止当前运行。", "系统");
+          return;
+        }
         const hint =
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
             ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
@@ -961,6 +1004,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       stopWatcher?.();
       stopWatcher = undefined;
       this.running = false;
+      this.abort = undefined;
       this.setStatus("");
       this.postState();
     }
@@ -1232,6 +1276,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           <button class="secondary" id="config" title="打开 .vibe/vibe.yaml">配置</button>
           <button class="secondary" id="ledger" title="打开 .vibe/ledger.jsonl">账本</button>
           <button class="secondary" id="checkpoints" title="在「输出」中打印检查点列表">检查点</button>
+          <button class="secondary" id="stop" title="停止当前运行（会中止 vibe 子进程）" disabled>停止</button>
           <button class="secondary" id="clear" title="清空聊天记录">清空</button>
         </div>
       </div>
@@ -1308,6 +1353,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elInput = document.getElementById('input');
       const elSend = document.getElementById('send');
       const elStatus = document.getElementById('status');
+      const elStop = document.getElementById('stop');
       const elMock = document.getElementById('mock');
       const elMode = document.getElementById('mode');
       const elAgent = document.getElementById('agent');
@@ -1334,6 +1380,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         elStatus.textContent = state.running ? (st || '运行中…（详情见「输出」→ Vibe）') : '';
         elSend.disabled = !!state.running;
         elInput.disabled = !!state.running;
+        if (elStop) elStop.disabled = !state.running;
         if (!state.running) {
           setTimeout(() => elInput.focus(), 10);
         }
@@ -1404,6 +1451,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       syncMode();
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));
+      document.getElementById('stop').addEventListener('click', () => vscode.postMessage({type:'stop'}));
       document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearChat'}));
       document.getElementById('config').addEventListener('click', () => vscode.postMessage({type:'openConfig'}));
       document.getElementById('ledger').addEventListener('click', () => vscode.postMessage({type:'openLedger'}));

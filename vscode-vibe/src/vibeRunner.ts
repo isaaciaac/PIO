@@ -38,6 +38,7 @@ export interface RunVibeCaptureOptions extends RunVibeOptions {
   title?: string;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  abortSignal?: AbortSignal;
 }
 
 export async function runVibeCapture(args: string[], options: RunVibeCaptureOptions): Promise<{ stdout: string; stderr: string }> {
@@ -60,13 +61,48 @@ export async function runVibeCapture(args: string[], options: RunVibeCaptureOpti
   options.output.appendLine(`$ ${cli} ${finalArgs.join(" ")}`);
 
   return await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: options.title || "Vibe", cancellable: false },
-    () =>
+    { location: vscode.ProgressLocation.Notification, title: options.title || "Vibe", cancellable: true },
+    (_progress, token) =>
       new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
         const proc = spawn(cli, finalArgs, { cwd: options.cwd, env, shell: false });
 
         let stdout = "";
         let stderr = "";
+        let finished = false;
+        let tokenCancellation: vscode.Disposable | undefined = undefined;
+
+        const cleanup = () => {
+          try {
+            tokenCancellation?.dispose();
+          } catch {}
+          try {
+            options.abortSignal?.removeEventListener("abort", onAbort);
+          } catch {}
+        };
+
+        const finish = (fn: () => void) => {
+          if (finished) return;
+          finished = true;
+          cleanup();
+          fn();
+        };
+
+        const onAbort = () => {
+          try {
+            proc.kill();
+          } catch {}
+          finish(() => reject(new VibeRunError("vibe cancelled", 130, stdout, stderr)));
+        };
+
+        if (options.abortSignal) {
+          if (options.abortSignal.aborted) {
+            onAbort();
+            return;
+          }
+          options.abortSignal.addEventListener("abort", onAbort);
+        }
+
+        tokenCancellation = token.onCancellationRequested(() => onAbort());
 
         proc.stdout.on("data", (d) => {
           const s = d.toString();
@@ -83,21 +119,23 @@ export async function runVibeCapture(args: string[], options: RunVibeCaptureOpti
 
         proc.on("error", (err: any) => {
           if (err?.code === "ENOENT") {
-            reject(
-              new Error(
-                `Cannot find vibe CLI. Install it (e.g. pip install -e .) or set VS Code setting 'vibe.cliPath'.`
+            finish(() =>
+              reject(
+                new Error(
+                  `Cannot find vibe CLI. Install it (e.g. pip install -e .) or set VS Code setting 'vibe.cliPath'.`
+                )
               )
             );
             return;
           }
-          reject(err instanceof Error ? err : new Error(String(err)));
+          finish(() => reject(err instanceof Error ? err : new Error(String(err))));
         });
 
         proc.on("close", (code) => {
           if (code === 0) {
-            resolve({ stdout, stderr });
+            finish(() => resolve({ stdout, stderr }));
           } else {
-            reject(new VibeRunError(`vibe exited with code ${code}`, code ?? -1, stdout, stderr));
+            finish(() => reject(new VibeRunError(`vibe exited with code ${code}`, code ?? -1, stdout, stderr)));
           }
         });
       })
