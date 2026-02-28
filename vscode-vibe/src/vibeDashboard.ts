@@ -124,7 +124,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式：发送即执行工作流（会自动创建任务并运行）。清空草稿：取消（或 /cancel）。",
+      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式（确认权限/完全授权）：默认先对话梳理需求，必要时才会执行工作流（自动创建任务并运行）。想强制执行：发送「执行：你的需求」或在末尾加「执行」。清空草稿：取消（或 /cancel）。",
       ts: Date.now(),
     },
   ];
@@ -205,6 +205,66 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private isCancelCommand(text: string): boolean {
     const t = text.trim().toLowerCase();
     return t === "取消" || t === "清空" || t === "/cancel" || t === "cancel";
+  }
+
+  private shouldAutoRunWorkflow(text: string): boolean {
+    const raw = String(text || "").trim();
+    if (!raw) return false;
+
+    // Explicit questions / inspections: do not auto-run.
+    if (/[?？]$/.test(raw)) return false;
+    const chatHints = [
+      "读一下",
+      "看看",
+      "总结",
+      "解释",
+      "分析",
+      "进度",
+      "状态",
+      "是什么",
+      "为什么",
+      "为啥",
+      "怎么",
+      "如何",
+      "能不能",
+      "是否",
+      "有没有",
+      "对不对",
+      "行不行",
+    ];
+    if (chatHints.some((h) => raw.includes(h))) return false;
+
+    // Actionable requests: likely should run.
+    const runHints = [
+      "帮我",
+      "实现",
+      "修复",
+      "创建",
+      "生成",
+      "搭建",
+      "编写",
+      "写一个",
+      "做一个",
+      "新增",
+      "添加",
+      "更新",
+      "改造",
+      "重构",
+      "优化",
+      "迁移",
+      "升级",
+      "集成",
+      "发布",
+    ];
+    if (runHints.some((h) => raw.includes(h))) return true;
+
+    // Multi-line specs are usually tasks.
+    if (raw.split(/\r?\n/).length >= 3) return true;
+
+    // Long statements are usually tasks.
+    if (raw.length >= 60) return true;
+
+    return false;
   }
 
   private parseInlineRun(text: string): { isRun: boolean; taskText?: string } {
@@ -686,6 +746,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // In authorized modes, default to PM chat unless this looks like an execution request.
+    if (!this.shouldAutoRunWorkflow(text)) {
+      await this.handleAgentChat(root, "pm", text, mock, policyOverride, style);
+      this.draftParts.push(text);
+      return;
+    }
+
     this.addMessage("user", text);
     await this.handleWorkflowRun(root, text, mock, policyOverride, route, style);
     this.draftParts = [];
@@ -881,12 +948,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         <div class="metaRow">
           <div class="leftMeta">
             <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
-            <select id="mode" title="聊天模式：只对话；写项目模式：发送即执行工作流（自动创建任务并运行）。权限只决定本地工具是否逐项确认。">
+            <select id="mode" title="聊天模式：只对话（禁用本地工具）；写项目模式：允许本地工具（确认权限会逐项询问、完全授权不询问）。默认先对话梳理需求，需要执行时请发送「执行：...」或在末尾加「执行」。">
               <option value="chat_only" selected>仅聊天（禁用工具）</option>
               <option value="prompt">确认权限（逐项询问）</option>
               <option value="allow_all">完全授权（不询问）</option>
             </select>
-            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；写项目模式不在这里对话，会直接跑工作流（PM/Router/Coder/QA）。">
+            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；写项目模式默认与 PM 对话梳理需求（需要执行时再触发工作流）。">
               <label for="agent">角色</label>
               <select id="agent">
                 <option value="pm" selected>产品经理（PM）</option>

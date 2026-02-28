@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import importlib.util
 from dataclasses import dataclass
@@ -83,16 +84,26 @@ class Orchestrator:
             return evt
         raise RuntimeError("No tasks found. Use `vibe task add \"...\"` first.")
 
-    def _build_context_packet(self) -> packs.ContextPacket:
+    def _build_context_packet(self) -> tuple[packs.ContextPacket, str]:
         pointers: List[str] = []
-        for rel in [".vibe/manifests/project_manifest.md", ".vibe/manifests/run_manifest.md"]:
+        excerpts: List[str] = []
+        for rel in [".vibe/manifests/project_manifest.md", ".vibe/manifests/run_manifest.md", "README.md"]:
             path = self.repo_root / rel
-            if path.exists():
-                pointers.append(self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=200).pointer)
+            if not path.exists():
+                continue
+            try:
+                rr = self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=200)
+                pointers.append(rr.pointer)
+                excerpts.append(f"<<< {rr.pointer} >>>\n{rr.content}\n")
+            except Exception:
+                # best-effort; context snippets are helpful but should not block the workflow
+                continue
+
         recent = []
         for evt in self.ledger.iter_events(limit=20, reverse=True):
             recent.append(packs.ContextEventRef(id=evt.id, summary=evt.summary, pointers=evt.pointers))
-        return packs.ContextPacket(repo_pointers=pointers, recent_events=recent)
+        ctx = packs.ContextPacket(repo_pointers=pointers, recent_events=recent)
+        return ctx, ("\n".join(excerpts).strip() if excerpts else "")
 
     def _recent_test_fail_count(self, *, lookback_events: int = 50) -> int:
         count = 0
@@ -174,6 +185,44 @@ class Orchestrator:
             return importlib.util.find_spec(name) is not None
         except Exception:
             return False
+
+    def _find_node_project_dir(self) -> Optional[Path]:
+        """Return relative directory that contains a package.json, if any."""
+        root_pkg = self.repo_root / "package.json"
+        if root_pkg.exists():
+            return Path(".")
+
+        for rel in ["client", "frontend", "web", "app", "backend", "server"]:
+            if (self.repo_root / rel / "package.json").exists():
+                return Path(rel)
+
+        # Best-effort shallow search (avoid scanning large repos).
+        try:
+            for p in self.repo_root.rglob("package.json"):
+                rel = p.relative_to(self.repo_root)
+                if rel.parts and rel.parts[0] in {".git", ".vibe", "node_modules", "dist", "build"}:
+                    continue
+                if len(rel.parts) <= 2:
+                    return rel.parent
+        except Exception:
+            return None
+        return None
+
+    def _package_manager(self, node_dir: Path) -> str:
+        root = self.repo_root
+        if (root / node_dir / "pnpm-lock.yaml").exists() or (root / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        if (root / node_dir / "yarn.lock").exists() or (root / "yarn.lock").exists():
+            return "yarn"
+        return "npm"
+
+    def _shell_cmd_in_dir(self, *, rel_dir: Path, cmd: str) -> str:
+        d = rel_dir.as_posix().strip()
+        if not d or d == ".":
+            return cmd
+        if os.name == "nt":
+            return f'cd /d "{d}" && {cmd}'
+        return f'cd "{d}" && {cmd}'
 
     def _materialize_code_change(self, change: packs.CodeChange) -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
@@ -276,7 +325,8 @@ class Orchestrator:
             return ["mock"]
 
         is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
-        is_node = (self.repo_root / "package.json").exists()
+        node_dir = self._find_node_project_dir()
+        is_node = node_dir is not None
         tests_dir = self.repo_root / "tests"
         has_py_tests = False
         if tests_dir.exists():
@@ -289,8 +339,22 @@ class Orchestrator:
         if p == "smoke":
             if is_py:
                 return ["python -m compileall ."]
-            if is_node:
-                return ["npm test"]
+            if is_node and node_dir is not None:
+                pm = self._package_manager(node_dir)
+                scripts: dict[str, str] = {}
+                try:
+                    pkg = json.loads((self.repo_root / node_dir / "package.json").read_text(encoding="utf-8", errors="replace"))
+                    scripts = dict(pkg.get("scripts") or {})
+                except Exception:
+                    scripts = {}
+
+                if "build" in scripts:
+                    return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build")]
+                if "lint" in scripts:
+                    return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint")]
+                if "test" in scripts:
+                    return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test")]
+                return []
             return []
 
         if is_py:
@@ -298,8 +362,23 @@ class Orchestrator:
             if has_py_tests and self._python_has_module("pytest"):
                 return ["python -m compileall .", "pytest -q"]
             return ["python -m compileall .", "python -m unittest -q"]
-        if is_node:
-            return ["npm test"]
+        if is_node and node_dir is not None:
+            pm = self._package_manager(node_dir)
+            scripts: dict[str, str] = {}
+            try:
+                pkg = json.loads((self.repo_root / node_dir / "package.json").read_text(encoding="utf-8", errors="replace"))
+                scripts = dict(pkg.get("scripts") or {})
+            except Exception:
+                scripts = {}
+
+            cmds: list[str] = []
+            if "test" in scripts:
+                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test"))
+            if "lint" in scripts:
+                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint"))
+            if not cmds and "build" in scripts:
+                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build"))
+            return cmds
         return []
 
     def _run_tests(self, *, profile: str, commands: Optional[List[str]] = None) -> packs.TestReport:
@@ -397,7 +476,7 @@ class Orchestrator:
         coder = self._agent("coder_backend")
         reviewer = self._agent("code_reviewer") if "code_reviewer" in activated_agents else None
 
-        ctx = self._build_context_packet()
+        ctx, ctx_excerpts = self._build_context_packet()
         self._append_guarded(
             event=new_event(
                 agent="router",
@@ -420,6 +499,9 @@ class Orchestrator:
         if route_level != "L0":
             if not pm:
                 raise RuntimeError("pm must be activated for L1+ routes")
+            pm_user = f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            if ctx_excerpts:
+                pm_user = f"{pm_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
             pm_msgs = self._messages_with_memory(
                 agent_id="pm",
                 system=(
@@ -428,7 +510,7 @@ class Orchestrator:
                     "No extra keys. No wrapping object. No markdown.\n\n"
                     f"{workflow_hint}"
                 ),
-                user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
+                user=pm_user,
             )
             req, _req_meta = pm.chat_json(
                 schema=packs.RequirementPack,
@@ -450,6 +532,8 @@ class Orchestrator:
         if route_level == "L2":
             if req_analyst:
                 ua_user = f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
+                if ctx_excerpts:
+                    ua_user = f"{ua_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 ua_msgs = self._messages_with_memory(
                     agent_id="requirements_analyst",
                     system=(
@@ -479,6 +563,8 @@ class Orchestrator:
                     f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                     f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
                 )
+                if ctx_excerpts:
+                    adr_user = f"{adr_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 adr_msgs = self._messages_with_memory(
                     agent_id="architect",
                     system=(
@@ -508,6 +594,8 @@ class Orchestrator:
                     f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                     f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
                 )
+                if ctx_excerpts:
+                    contract_user = f"{contract_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 contract_msgs = self._messages_with_memory(
                     agent_id="api_confirm",
                     system=(
@@ -537,6 +625,8 @@ class Orchestrator:
             if req is not None
             else f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
         )
+        if ctx_excerpts:
+            plan_user = f"{plan_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
         if usecases is not None:
             plan_user = f"{plan_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
         if decisions is not None:
@@ -574,6 +664,8 @@ class Orchestrator:
             if req is not None
             else f"Task:\n{task_text}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
         )
+        if ctx_excerpts:
+            coder_user = f"{coder_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
         if usecases is not None:
             coder_user = f"{coder_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
         if decisions is not None:
@@ -761,6 +853,8 @@ class Orchestrator:
                 f"TestReport:\n{report.model_dump_json()}\n\n"
                 f"ContextPacket:\n{ctx.model_dump_json()}"
             )
+            if ctx_excerpts:
+                review_user = f"{review_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
             review_msgs = self._messages_with_memory(
                 agent_id="code_reviewer",
                 system=(
@@ -815,6 +909,8 @@ class Orchestrator:
                     f"TestReport:\n{report.model_dump_json()}\n\n"
                     f"ContextPacket:\n{ctx.model_dump_json()}"
                 )
+                if ctx_excerpts:
+                    fix_user = f"{fix_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 fix_msgs = self._messages_with_memory(
                     agent_id="coder_backend",
                     system=(

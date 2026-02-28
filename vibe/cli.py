@@ -239,6 +239,36 @@ def chat(
     role_hint = f"你的工种ID是 {agent_id}。" + (f" 你的职责是：{purpose}。" if purpose else "")
     resolved_style = normalize_style(style or os.getenv("VIBE_STYLE") or getattr(cfg.behavior, "style", "balanced"))
     style_text = style_prompt(resolved_style)
+
+    # Ground chat with a small set of repo facts when policy allows (read-only).
+    repo_chunks: list[str] = []
+    repo_pointers: list[str] = []
+    try:
+        tools = _make_toolbox(repo_root, policy_override=(ctx.obj or {}).get("policy"))
+    except Exception:
+        tools = None
+    if tools is not None:
+        for rel in ["README.md", ".vibe/manifests/run_manifest.md", ".vibe/manifests/project_manifest.md", "package.json", "pyproject.toml"]:
+            try:
+                rr = tools.read_file(agent_id=agent_id, path=rel, start_line=1, end_line=200)
+                repo_pointers.append(rr.pointer)
+                repo_chunks.append(f"<<< {rr.pointer} >>>\n{rr.content}\n")
+            except PolicyDeniedError:
+                continue
+            except Exception:
+                continue
+
+    ledger_lines: list[str] = []
+    try:
+        # Main ledger is always present; this gives the agent a sense of "what happened recently".
+        led = Ledger(repo_root, branch_id="main")
+        for e in led.iter_events(limit=20, reverse=True):
+            ledger_lines.append(f"- {e.ts} {e.agent} {e.type}: {e.summary}")
+    except Exception:
+        ledger_lines = []
+
+    repo_context_text = "\n".join(repo_chunks).strip()
+    ledger_context_text = "\n".join(ledger_lines).strip()
     system = (
         f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
         "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
@@ -249,6 +279,14 @@ def chat(
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
         "不要在最外层包一层额外的 key。"
     )
+
+    if repo_context_text or ledger_context_text:
+        system = (
+            f"{system}\n\n"
+            "以下是来自本地仓库的可追溯事实片段（你可以据此回答；不要编造；引用这些内容时，尽量把相关指针写入输出的 pointers 字段）：\n\n"
+            f"{(repo_context_text + '\\n\\n') if repo_context_text else ''}"
+            f"{('<<< 最近账本事件（新→旧） >>>\\n' + ledger_context_text) if ledger_context_text else ''}"
+        )
     ctx_cfg = effective_context_config(cfg, agent_id=agent_id)
     mem = read_memory_records(mem_path, limit=max(0, min(ctx_cfg.keep_last_digests, 10)))
     mem_text = ""
