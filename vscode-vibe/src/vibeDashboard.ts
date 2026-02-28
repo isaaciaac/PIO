@@ -546,8 +546,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
             const e: LedgerEvent = JSON.parse(line);
             last = e;
             const t = String(e.type || "").trim();
-            if (t) seenTypes.add(t);
-            if (t === "ROUTE_SELECTED") routeLevel = String(e.meta?.route_level || routeLevel || "").trim();
+            if (t === "ROUTE_SELECTED") {
+              // Each workflow run emits a new ROUTE_SELECTED; reset progress for multi-run auto-fix.
+              routeLevel = String(e.meta?.route_level || routeLevel || "").trim();
+              seenTypes.clear();
+              seenTypes.add(t);
+            } else if (t) {
+              seenTypes.add(t);
+            }
             if (t === "AGENTS_ACTIVATED" && Array.isArray(e.meta?.agents)) {
               agents = e.meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0);
             }
@@ -588,9 +594,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private formatWorkflowNarrative(taskId: string, checkpointId: string, cp: any | undefined, events: LedgerEvent[]): string {
+  private formatWorkflowNarrative(
+    taskId: string,
+    checkpointId: string,
+    cp: any | undefined,
+    events: LedgerEvent[],
+    extra?: { attempts?: number }
+  ): string {
     const green: boolean | undefined = typeof cp?.green === "boolean" ? Boolean(cp.green) : undefined;
     const meta = (cp && typeof cp === "object" ? cp.meta : undefined) || {};
+    const attempts = Math.max(1, Number(extra?.attempts || 1));
 
     const styleRaw = String(meta?.style || "").trim();
     const styleLabel =
@@ -620,6 +633,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       ? meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
       : [];
     const agentsText = agentIds.length ? agentIds.map((id) => this.agentTitle(id)).join("、") : "";
+
+    const hadTestFailed = events.some((e) => String(e.type || "").trim() === "TEST_FAILED");
+    const hadReviewBlocked = events.some((e) => String(e.type || "").trim() === "REVIEW_BLOCKED");
 
     const lastByType = (types: string[]): LedgerEvent | undefined => {
       for (let i = events.length - 1; i >= 0; i--) {
@@ -664,10 +680,22 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               : "";
 
     const lines: string[] = [];
-    lines.push(`已完成工作流：任务 ${taskId}。`);
+    if (green === true && attempts > 1) {
+      lines.push(`已自动修复并交付（共 ${attempts} 轮）。`);
+    } else if (green === false && attempts > 1) {
+      lines.push(`已自动尝试修复（共 ${attempts} 轮），但仍未通过。`);
+    } else {
+      lines.push(`已完成工作流：任务 ${taskId}。`);
+    }
     lines.push(`检查点：${checkpointId}（绿灯：${green === undefined ? "未知" : green ? "是" : "否"}）。`);
     lines.push(`路由：${routeLabel}${styleLabel ? `；风格：${styleLabel}` : ""}`);
     if (agentsText) lines.push(`启用角色：${agentsText}`);
+    if (green === true && (hadTestFailed || hadReviewBlocked) && attempts <= 1) {
+      const parts: string[] = [];
+      if (hadTestFailed) parts.push("测试失败");
+      if (hadReviewBlocked) parts.push("审查阻塞");
+      lines.push(`说明：过程中遇到${parts.join("和")}，已自动修复并通过。`);
+    }
 
     if (coderEvt) {
       const s = String(coderEvt.summary || "").trim();
@@ -718,10 +746,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         suggestions.push("当前项目未识别到可运行的测试/校验命令：如果是 Python/Node，请确保存在 `pyproject.toml`/`package.json` 或 `tests/`；否则请先补一个最小 smoke 命令后再跑。");
       }
       if (reviewEvt && String(reviewEvt.type || "").trim() === "REVIEW_BLOCKED") {
-        suggestions.push("存在审查阻塞：查看阻塞点后，继续发送“修复上述 blocker 并执行”。");
+        suggestions.push("存在审查阻塞：我可以继续自动修复（再多尝试几轮 / 升级路由），直到通过或找到需要你确认的点。");
       }
       if (qaEvt && String(qaEvt.type || "").trim() === "TEST_FAILED") {
-        suggestions.push("存在测试阻塞：查看失败命令日志后，继续发送“修复测试并执行”。");
+        suggestions.push("存在测试阻塞：我会继续尝试自动修复；如果反复失败，优先打开失败命令的 artifacts 日志确认具体报错，再继续修。");
       }
     }
 
@@ -835,27 +863,63 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
 
+      const maxAttempts = policyOverride === "allow_all" ? 3 : policyOverride === "prompt" ? 2 : 1;
+      let attempt = 0;
+      let checkpointId = "(unknown_checkpoint_id)";
+      let cp: any | undefined = undefined;
+
       const runStart = await countLedgerLines(root);
       stopWatcher = this.startLedgerProgressWatcher(root, runStart);
-      this.setStatus("正在运行工作流…");
-      const runArgs = ["run", "--task", taskId, "--path", root, "--route", route || "auto"];
-      if (mock) runArgs.push("--mock");
-      if (style) runArgs.push("--style", style);
-      const runRes = await runVibeCapture(
-        runArgs,
-        {
+
+      let routeToUse = (route || "auto").trim() || "auto";
+
+      while (attempt < maxAttempts) {
+        attempt += 1;
+        this.setStatus(attempt === 1 ? "正在运行工作流…" : `修复中（第 ${attempt} 轮/${maxAttempts}）…`);
+
+        const runArgs = ["run", "--task", taskId, "--path", root, "--route", routeToUse];
+        if (mock) runArgs.push("--mock");
+        if (style) runArgs.push("--style", style);
+
+        const title =
+          attempt === 1
+            ? mock
+              ? "Vibe：运行（模拟）"
+              : "Vibe：运行"
+            : `Vibe：继续修复（第 ${attempt} 轮）`;
+
+        const runRes = await runVibeCapture(runArgs, {
           cwd: root,
           mock,
           output: this.output,
-          title: mock ? "Vibe：运行（模拟）" : "Vibe：运行",
+          title,
           envOverrides,
           policyOverride,
+        });
+
+        checkpointId = lastNonEmptyLine(runRes.stdout) || checkpointId;
+        cp = await readCheckpoint(root, checkpointId);
+
+        const green = typeof cp?.green === "boolean" ? Boolean(cp.green) : undefined;
+        const reason = String(cp?.meta?.reason || "").trim();
+
+        if (green === true) break;
+        if (attempt >= maxAttempts) break;
+
+        // If we exhausted the workflow's internal fix-loop, keep going automatically (budget-limited).
+        if (reason === "fix_loop_blockers") {
+          // If user left route=auto, allow one escalation after a failed round.
+          if (routeToUse === "auto" && attempt >= 1) {
+            routeToUse = "L2";
+          }
+          continue;
         }
-      );
-      const checkpointId = lastNonEmptyLine(runRes.stdout) || "(unknown_checkpoint_id)";
-      const cp = await readCheckpoint(root, checkpointId);
+
+        break;
+      }
+
       const events = await readLedgerEventsSince(root, before);
-      const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events);
+      const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events, { attempts: attempt });
       this.addMessage("assistant", narrative, "工作流");
     } catch (e) {
       if (e instanceof VibeRunError) {
