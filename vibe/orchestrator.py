@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import importlib.util
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
@@ -255,15 +256,21 @@ class Orchestrator:
         except Exception:
             return False
 
-    def _find_node_project_dir(self) -> Optional[Path]:
-        """Return relative directory that contains a package.json, if any."""
+    def _find_node_project_dirs(self) -> list[Path]:
+        """
+        Return relative directories that contain a package.json.
+        Ordered by common full-stack conventions (backend/server before client/frontend).
+        """
+        found: list[Path] = []
+
         root_pkg = self.repo_root / "package.json"
         if root_pkg.exists():
-            return Path(".")
+            found.append(Path("."))
 
-        for rel in ["client", "frontend", "web", "app", "backend", "server"]:
+        # Common layouts (prefer backend-ish first so API compiles before UI).
+        for rel in ["backend", "server", "api", "client", "frontend", "web", "app"]:
             if (self.repo_root / rel / "package.json").exists():
-                return Path(rel)
+                found.append(Path(rel))
 
         # Best-effort shallow search (avoid scanning large repos).
         try:
@@ -272,10 +279,108 @@ class Orchestrator:
                 if rel.parts and rel.parts[0] in {".git", ".vibe", "node_modules", "dist", "build"}:
                     continue
                 if len(rel.parts) <= 2:
-                    return rel.parent
+                    found.append(rel.parent)
         except Exception:
-            return None
-        return None
+            pass
+
+        out: list[Path] = []
+        seen: set[str] = set()
+        for d in found:
+            key = d.as_posix()
+            if not key:
+                key = "."
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(d)
+        return out
+
+    def _find_node_project_dir(self) -> Optional[Path]:
+        """Backward compatible: return the first Node project dir, if any."""
+        dirs = self._find_node_project_dirs()
+        return dirs[0] if dirs else None
+
+    def _node_has_tests(self, node_dir: Path) -> bool:
+        root = self.repo_root / node_dir
+        for d in ["test", "tests", "__tests__"]:
+            if (root / d).exists():
+                return True
+        try:
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root)
+                if rel.parts and rel.parts[0] in {"node_modules", "dist", "build"}:
+                    continue
+                name = p.name.lower()
+                if name.endswith(
+                    (
+                        ".test.ts",
+                        ".test.tsx",
+                        ".test.js",
+                        ".test.jsx",
+                        ".spec.ts",
+                        ".spec.tsx",
+                        ".spec.js",
+                        ".spec.jsx",
+                    )
+                ):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _shell_cd_dir(self, cmd: str) -> Path:
+        c = cmd or ""
+        # Our own helper always uses quotes; handle both Windows and POSIX variants.
+        m = re.match(r'^\s*cd\s+(?:/d\s+)?\"(?P<dir>[^\"]+)\"\s*&&', c, flags=re.IGNORECASE)
+        if m:
+            return Path(m.group("dir"))
+        return Path(".")
+
+    def _node_lockfile(self, node_dir: Path, pm: str) -> Path:
+        root = self.repo_root / node_dir
+        if pm == "pnpm":
+            return root / "pnpm-lock.yaml"
+        if pm == "yarn":
+            return root / "yarn.lock"
+        return root / "package-lock.json"
+
+    def _node_install_needed(self, node_dir: Path) -> tuple[bool, str]:
+        root = self.repo_root / node_dir
+        pkg_path = root / "package.json"
+        if not pkg_path.exists():
+            return False, ""
+        pm = self._package_manager(node_dir)
+        lock = self._node_lockfile(node_dir, pm)
+        node_modules = root / "node_modules"
+        if not node_modules.exists():
+            return True, "node_modules_missing"
+        if not lock.exists():
+            return True, "lockfile_missing"
+        try:
+            if pkg_path.stat().st_mtime > lock.stat().st_mtime:
+                return True, "package_json_newer_than_lockfile"
+        except Exception:
+            # If stat fails, fall back to dependency probing.
+            pass
+
+        try:
+            pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+            deps: dict[str, str] = {}
+            for k in ["dependencies", "devDependencies", "optionalDependencies"]:
+                deps.update(dict(pkg.get(k) or {}))
+            for dep in deps.keys():
+                parts = [p for p in str(dep).split("/") if p]
+                if not parts:
+                    continue
+                if not (node_modules.joinpath(*parts)).exists():
+                    return True, f"missing_dep:{dep}"
+        except Exception:
+            # Can't parse package.json; assume install not needed.
+            return False, ""
+
+        return False, ""
 
     def _package_manager(self, node_dir: Path) -> str:
         root = self.repo_root
@@ -333,6 +438,82 @@ class Orchestrator:
         except Exception:
             return ""
         return ""
+
+    def _repo_excerpts_for_test_failure(
+        self, report: packs.TestReport, *, max_error_files: int = 4, max_chars: int = 9000
+    ) -> str:
+        """
+        Best-effort: extract relevant repo snippets around compiler/test errors so fix-loop
+        coders have concrete file context (with pointers) instead of only logs.
+        """
+        failed: Optional[packs.TestResult] = None
+        for r in report.results:
+            if not r.passed:
+                failed = r
+                break
+        if not failed:
+            return ""
+
+        workdir = self._shell_cd_dir(failed.command or "")
+        stdout_text = self._artifact_tail_text(failed.stdout, max_bytes=16000) if failed.stdout else ""
+        stderr_text = self._artifact_tail_text(failed.stderr, max_bytes=16000) if failed.stderr else ""
+        text = (stdout_text + "\n" + stderr_text).strip()
+
+        out: list[str] = []
+        included: set[str] = set()
+
+        def add_excerpt(path: Path, *, start: int = 1, end: int = 200) -> bool:
+            nonlocal out
+            rel = path.as_posix().strip() or "."
+            if rel in included:
+                return False
+            try:
+                rr = self.toolbox.read_file(agent_id="router", path=rel, start_line=start, end_line=end)
+            except Exception:
+                return False
+            included.add(rel)
+            block = f"<<< {rr.pointer} >>>\n{rr.content}".strip()
+            if not block:
+                return False
+            out.append(block)
+            return True
+
+        # Include project config (helps missing-module / script issues).
+        add_excerpt(workdir / "package.json", start=1, end=200)
+        add_excerpt(workdir / "tsconfig.json", start=1, end=200)
+
+        # TypeScript compiler error lines: path(line,col): error TSxxxx: message
+        ts_pat = re.compile(
+            r"^(?P<file>[^\(\s]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+TS\d+:\s+(?P<msg>.*)$",
+            re.MULTILINE,
+        )
+        files: list[tuple[str, int]] = []
+        for m in ts_pat.finditer(text):
+            f = (m.group("file") or "").replace("\\", "/").strip()
+            try:
+                line = int(m.group("line"))
+            except Exception:
+                line = 1
+            if f:
+                files.append((f, max(1, line)))
+
+        # If types are involved, include a likely shared types file when present.
+        if "on type 'user'" in text.lower() or "on type 'post'" in text.lower() or "on type 'comment'" in text.lower():
+            add_excerpt(workdir / "src" / "types.ts", start=1, end=220)
+
+        error_added = 0
+        for f, line in files:
+            if error_added >= max_error_files:
+                break
+            if add_excerpt(workdir / f, start=max(1, line - 25), end=line + 25):
+                error_added += 1
+            if sum(len(x) for x in out) > max_chars:
+                break
+
+        blob = "\n\n".join(out).strip()
+        if len(blob) > max_chars:
+            blob = blob[:max_chars] + "\n…（摘录过长，已截断）…"
+        return blob
 
     def _compact_error_excerpt(self, text: str, *, max_lines: int = 60, max_chars: int = 1600) -> str:
         t = (text or "").strip()
@@ -448,8 +629,8 @@ class Orchestrator:
             return ["mock"]
 
         is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
-        node_dir = self._find_node_project_dir()
-        is_node = node_dir is not None
+        node_dirs = self._find_node_project_dirs()
+        is_node = bool(node_dirs)
         tests_dir = self.repo_root / "tests"
         has_py_tests = False
         if tests_dir.exists():
@@ -462,7 +643,8 @@ class Orchestrator:
         if p == "smoke":
             if is_py:
                 return ["python -m compileall ."]
-            if is_node and node_dir is not None:
+            if is_node:
+                node_dir = node_dirs[0]
                 pm = self._package_manager(node_dir)
                 scripts: dict[str, str] = {}
                 try:
@@ -475,7 +657,7 @@ class Orchestrator:
                     return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build")]
                 if "lint" in scripts:
                     return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint")]
-                if "test" in scripts:
+                if "test" in scripts and self._node_has_tests(node_dir):
                     return [self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test")]
                 return []
             return []
@@ -485,22 +667,36 @@ class Orchestrator:
             if has_py_tests and self._python_has_module("pytest"):
                 return ["python -m compileall .", "pytest -q"]
             return ["python -m compileall .", "python -m unittest -q"]
-        if is_node and node_dir is not None:
-            pm = self._package_manager(node_dir)
-            scripts: dict[str, str] = {}
-            try:
-                pkg = json.loads((self.repo_root / node_dir / "package.json").read_text(encoding="utf-8", errors="replace"))
-                scripts = dict(pkg.get("scripts") or {})
-            except Exception:
-                scripts = {}
-
+        if is_node:
             cmds: list[str] = []
-            if "test" in scripts:
-                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test"))
-            if "lint" in scripts:
-                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint"))
-            if not cmds and "build" in scripts:
-                cmds.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build"))
+            for node_dir in node_dirs:
+                pm = self._package_manager(node_dir)
+                scripts: dict[str, str] = {}
+                try:
+                    pkg = json.loads((self.repo_root / node_dir / "package.json").read_text(encoding="utf-8", errors="replace"))
+                    scripts = dict(pkg.get("scripts") or {})
+                except Exception:
+                    scripts = {}
+
+                has_node_tests = self._node_has_tests(node_dir)
+
+                local: list[str] = []
+                if p == "full":
+                    if "build" in scripts:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build"))
+                    if "lint" in scripts:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint"))
+                    if "test" in scripts and has_node_tests:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test"))
+                else:
+                    if "lint" in scripts:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run lint"))
+                    if "test" in scripts and has_node_tests:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} test"))
+                    if not local and "build" in scripts:
+                        local.append(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} run build"))
+
+                cmds.extend(local)
             return cmds
         return []
 
@@ -527,36 +723,57 @@ class Orchestrator:
         # Best-effort: for Node projects, ensure deps exist before running build/lint/test.
         # This avoids failures like "cannot find module" on fresh checkouts.
         try:
-            node_dir = self._find_node_project_dir()
-            if node_dir is not None:
-                wants_node = any(any(x in c for x in ("npm", "pnpm", "yarn")) for c in report_cmds)
-                node_modules = (self.repo_root / node_dir / "node_modules") if wants_node else None
-                if wants_node and node_modules is not None and not node_modules.exists():
-                    pm = self._package_manager(node_dir)
-                    install_cmd = self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} install")
-                    r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
-                    passed = r.returncode == 0
-                    results.append(
-                        packs.TestResult(
-                            command=install_cmd,
-                            returncode=r.returncode,
-                            passed=passed,
-                            stdout=r.stdout,
-                            stderr=r.stderr,
-                            meta=r.meta,
-                        )
+            node_dirs: list[Path] = []
+            for c in report_cmds:
+                if not isinstance(c, str):
+                    continue
+                lower = c.lower()
+                if not re.search(r"\b(?:npm|pnpm|yarn)\b", lower):
+                    continue
+                node_dirs.append(self._shell_cd_dir(c))
+
+            pre_cmds: list[str] = []
+            seen: set[str] = set()
+            for node_dir in node_dirs:
+                key = node_dir.as_posix() or "."
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                needs, _reason = self._node_install_needed(node_dir)
+                if not needs:
+                    continue
+
+                pm = self._package_manager(node_dir)
+                install_cmd = self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} install")
+                pre_cmds.append(install_cmd)
+
+                r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
+                passed = r.returncode == 0
+                results.append(
+                    packs.TestResult(
+                        command=install_cmd,
+                        returncode=r.returncode,
+                        passed=passed,
+                        stdout=r.stdout,
+                        stderr=r.stderr,
+                        meta=r.meta,
                     )
-                    pointers.extend([r.stdout, r.stderr, r.meta])
-                    report_cmds.insert(0, install_cmd)
-                    if not passed:
-                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
-                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
-                        excerpt = stderr_tail or stdout_tail
-                        if excerpt:
-                            blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}")
-                        else:
-                            blockers.append(f"Command failed: {install_cmd}")
-                        return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+                )
+                pointers.extend([r.stdout, r.stderr, r.meta])
+                if not passed:
+                    stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                    stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                    excerpt = stderr_tail or stdout_tail
+                    if excerpt:
+                        blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}")
+                    else:
+                        blockers.append(f"Command failed: {install_cmd}")
+                    report_cmds = pre_cmds + report_cmds
+                    return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+
+            if pre_cmds:
+                report_cmds = pre_cmds + report_cmds
         except Exception:
             pass
 
@@ -1154,6 +1371,10 @@ class Orchestrator:
                 )
                 if ctx_excerpts:
                     fix_user = f"{fix_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                if blocker_source == "tests":
+                    failure_excerpts = self._repo_excerpts_for_test_failure(report)
+                    if failure_excerpts:
+                        fix_user = f"{fix_user}\n\nFailureRepoExcerpts:\n{failure_excerpts}"
 
                 fix_role = "Coder"
                 if fix_coder_id == "coder_frontend":
