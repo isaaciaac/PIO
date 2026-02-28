@@ -6,7 +6,7 @@ import importlib.util
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from vibe.agents.registry import AGENT_REGISTRY
@@ -662,6 +662,71 @@ class Orchestrator:
 
         return change, write_pointers
 
+    def _materialize_code_change_with_repair(
+        self,
+        *,
+        change: packs.CodeChange,
+        actor_agent_id: str,
+        actor: Any,
+        actor_role: str,
+        workflow_hint: str,
+        max_repairs: int = 2,
+    ) -> Tuple[packs.CodeChange, List[str]]:
+        """
+        Models can return valid CodeChange JSON that still can't be applied locally (e.g. tries to write into `.vibe/`).
+        Repair by re-prompting the same agent with the materialization error, so the workflow doesn't crash
+        before QA/fix-loop can run.
+        """
+        max_repairs = max(0, min(int(max_repairs), 6))
+        last_err: Optional[Exception] = None
+        current = change
+        for attempt in range(max_repairs + 1):
+            try:
+                return self._materialize_code_change(current, actor_agent_id=actor_agent_id)
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                repairable = any(
+                    k in msg
+                    for k in [
+                        "Refusing to write internal path",
+                        "Refusing to apply patch touching internal path",
+                        "Refusing to apply patch with unsafe path",
+                        "Failed to apply patch via git apply",
+                        "is not in the subpath of",
+                    ]
+                )
+                if not repairable or attempt >= max_repairs:
+                    raise
+
+                prev = current.model_dump_json()
+                repair_user = (
+                    "你的上一个 CodeChange 无法在本地落地（被系统安全规则拒绝）。\n\n"
+                    f"错误：{msg}\n\n"
+                    "修复要求：\n"
+                    "- 所有写入路径必须是仓库根目录的相对路径。\n"
+                    "- 严禁写入 `.vibe/` 或 `.git/`（这是系统内部目录）。\n"
+                    "- 如果你要写文档，请写到 `docs/...` 或 `README.md`，不要写到 `.vibe/docs/...`。\n"
+                    "- 优先使用 `writes` 给出完整文件内容；不要依赖 patch 指针。\n"
+                    "- 保持原意不变：只修复路径/可落地性问题，不要引入大重构。\n\n"
+                    "请只输出符合 CodeChange schema 的 JSON（不要 markdown，不要包裹对象）。\n\n"
+                    f"上一个 CodeChange（供参考）：\n{prev}\n"
+                )
+                repair_system = (
+                    f"You are {actor_role}. Return JSON only for CodeChange with fields: "
+                    "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                    "No extra keys. No markdown.\n\n"
+                    "Hard rules:\n"
+                    "- Do not write under `.vibe/` or `.git/`.\n"
+                    "- Use only repo-root relative paths.\n"
+                    "- Prefer `writes` over `patch_pointer`.\n\n"
+                    f"{workflow_hint}"
+                )
+                repair_msgs = self._messages_with_memory(agent_id=actor_agent_id, system=repair_system, user=repair_user)
+                current, _ = actor.chat_json(schema=packs.CodeChange, messages=repair_msgs, user=repair_user)
+
+        raise RuntimeError(f"Failed to materialize CodeChange after repair attempts. Last error: {last_err}")
+
     def _determine_test_commands(self, *, profile: str) -> List[str]:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
             return ["mock"]
@@ -1134,6 +1199,8 @@ class Orchestrator:
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
                 "Each writes item must include the full file content. No extra keys. No markdown.\n\n"
                 "Hard rules:\n"
+                "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                 "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
@@ -1144,7 +1211,13 @@ class Orchestrator:
             user=coder_user,
         )
         change, _change_meta = primary_coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
-        change, write_pointers = self._materialize_code_change(change, actor_agent_id=primary_coder_id)
+        change, write_pointers = self._materialize_code_change_with_repair(
+            change=change,
+            actor_agent_id=primary_coder_id,
+            actor=primary_coder,
+            actor_role=coder_role,
+            workflow_hint=workflow_hint,
+        )
 
         self._append_guarded(
             event=new_event(
@@ -1433,6 +1506,8 @@ class Orchestrator:
                         "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                         "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
                         "Hard rules:\n"
+                        "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                        "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                         "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
                         "- Do not do architecture refactors during fix-loop.\n"
                         "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
@@ -1441,7 +1516,13 @@ class Orchestrator:
                     user=fix_user,
                 )
                 change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
-                change, write_pointers = self._materialize_code_change(change, actor_agent_id=fix_coder_id)
+                change, write_pointers = self._materialize_code_change_with_repair(
+                    change=change,
+                    actor_agent_id=fix_coder_id,
+                    actor=fix_coder,
+                    actor_role=fix_role,
+                    workflow_hint=workflow_hint,
+                )
                 self._append_guarded(
                     event=new_event(
                         agent=fix_coder_id,
