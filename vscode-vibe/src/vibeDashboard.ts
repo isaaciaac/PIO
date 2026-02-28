@@ -196,6 +196,15 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     return t === "取消" || t === "清空" || t === "/cancel" || t === "cancel";
   }
 
+  private parseInlineRun(text: string): { isRun: boolean; taskText?: string } {
+    const raw = text.trim();
+    if (!raw) return { isRun: false };
+    const m = raw.match(/^(执行|开始执行|\/run|run)\s*[:：]?\s*(.*)$/i);
+    if (!m) return { isRun: false };
+    const rest = String(m[2] || "").trim();
+    return rest ? { isRun: true, taskText: rest } : { isRun: true };
+  }
+
   private postState(): void {
     this.view?.webview.postMessage({ type: "state", running: this.running, messages: this.messages, ts: Date.now() });
   }
@@ -331,9 +340,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    if (this.isRunCommand(text)) {
+    const inline = this.parseInlineRun(text);
+    if (inline.isRun) {
       this.addMessage("user", text);
-      const taskText = this.draftParts.join("\n\n").trim();
+      const taskText = (inline.taskText ?? this.draftParts.join("\n\n")).trim();
       if (!taskText) {
         this.addMessage("assistant", "当前没有可执行的草稿。请先描述你要做的改动，然后再发送：执行", "系统");
         return;
