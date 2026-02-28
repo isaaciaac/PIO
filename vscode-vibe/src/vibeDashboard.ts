@@ -22,6 +22,31 @@ function lastNonEmptyLine(text: string): string | undefined {
   return lines.length ? lines[lines.length - 1] : undefined;
 }
 
+function tailText(text: string, opts: { maxLines: number; maxChars: number }): string {
+  const raw = String(text || "");
+  if (!raw.trim()) return "";
+  const lines = raw.split(/\r?\n/);
+  const tailLines = lines.slice(Math.max(0, lines.length - Math.max(1, opts.maxLines)));
+  let tail = tailLines.join("\n").trim();
+  if (tail.length > opts.maxChars) {
+    tail = "…（已截断，仅显示末尾）…\n" + tail.slice(Math.max(0, tail.length - opts.maxChars)).trim();
+  }
+  return tail;
+}
+
+function formatRunError(e: VibeRunError): string {
+  const stderrTail = tailText(e.stderr || "", { maxLines: 60, maxChars: 2400 });
+  const stdoutTail = tailText(e.stdout || "", { maxLines: 40, maxChars: 1200 });
+
+  // Prefer stderr; fall back to stdout.
+  const excerpt = stderrTail || stdoutTail;
+  const label = stderrTail ? "stderr（末尾）" : "stdout（末尾）";
+  const hint = "详细日志请查看：`View -> Output` → 选择 `Vibe`。";
+
+  if (!excerpt) return `${e.message}\n\n${hint}`;
+  return `${e.message}\n\n${label}：\n${excerpt}\n\n${hint}`;
+}
+
 async function readTextFile(uri: vscode.Uri): Promise<string> {
   const buf = await vscode.workspace.fs.readFile(uri);
   return Buffer.from(buf).toString("utf-8");
@@ -827,7 +852,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
             ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
             : "";
-        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "错误");
+        this.addMessage("assistant", `${formatRunError(e)}${hint}`, "错误");
       } else {
         const message = e instanceof Error ? e.message : String(e);
         this.addMessage("assistant", message, "错误");
@@ -927,7 +952,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
             ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
             : "";
-        this.addMessage("assistant", `${e.message}\n\nstdout:\n${e.stdout}\n\nstderr:\n${e.stderr}${hint}`, "错误");
+        this.addMessage("assistant", `${formatRunError(e)}${hint}`, "错误");
       } else {
         const message = e instanceof Error ? e.message : String(e);
         this.addMessage("assistant", message, "错误");
