@@ -128,7 +128,7 @@ def generate_vibe_system_manifest(repo_root: Path) -> str:
         "- `L3`：发布路径（加 env/security/doc/release 等交付门禁）\n"
         "- `L4`：全路径（含 perf/compliance/runbook 等高风险门禁）\n\n"
         "## VS Code / 终端如何触发执行\n\n"
-        "- VS Code（写项目模式）：先对话梳理需求；需要执行时直接回复「执行/执行吧/开始执行」。系统会自动：\n"
+        "- VS Code（写项目模式）：先对话梳理需求；信息足够时会自动触发工作流并落地到代码。系统会自动：\n"
         "  1) `vibe task add ...` 写入任务；2) `vibe run` 运行工作流；3) 产出 checkpoint + ledger 事件。\n"
         "- 终端：\n"
         "  - 初始化：`vibe init`\n"
