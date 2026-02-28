@@ -167,6 +167,82 @@ def _append_chat_history(path: Path, *, role: str, content: str) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _force_scan_for_chat(message: str) -> bool:
+    """
+    Heuristic: force a repo re-scan when the user is explicitly asking for
+    repo-level facts (structure/how to run/deps) or asks to refresh/re-scan.
+
+    Normal messages still run a stale-check scan, which is cheaper.
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+
+    explicit = [
+        "/scan",
+        "vibe scan",
+        "scan",
+        "rescan",
+        "refresh",
+        "重新扫描",
+        "再扫描",
+        "重新索引",
+        "索引一下",
+        "更新索引",
+        "更新扫描",
+        "再查一遍",
+        "重新查",
+        "重读",
+        "再读一遍",
+        "reload",
+    ]
+    if any(k in low or k in text for k in explicit):
+        return True
+
+    repo_facts = [
+        "这个项目",
+        "当前项目",
+        "仓库",
+        "目录",
+        "目录结构",
+        "文件结构",
+        "文件列表",
+        "有哪些文件",
+        "有哪些目录",
+        "项目结构",
+        "怎么运行",
+        "如何运行",
+        "怎么启动",
+        "如何启动",
+        "怎么测试",
+        "如何测试",
+        "依赖",
+        "脚本",
+        "启动命令",
+        "测试命令",
+        "构建",
+        "build",
+        "install",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "makefile",
+        "dockerfile",
+        "compose",
+        "devcontainer",
+        "进度",
+        "当前状态",
+    ]
+    if any(k in text or k in low for k in repo_facts):
+        # Narrow "项目" questions to avoid over-triggering on generic tasks.
+        if "项目" in text and not any(w in text for w in ["是什么", "做什么", "结构", "目录", "文件", "怎么", "如何", "运行", "启动", "测试", "依赖"]):
+            return False
+        return True
+
+    return False
+
+
 @app.command()
 def chat(
     ctx: typer.Context,
@@ -269,7 +345,7 @@ def chat(
     if tools is not None:
         # Auto scan on first question / when stale, so the agent can ground in repo facts.
         try:
-            tools.scan_repo(agent_id="router", reason="chat")
+            tools.scan_repo(agent_id="router", reason="chat", force=_force_scan_for_chat(message))
         except PolicyDeniedError:
             pass
         except Exception:

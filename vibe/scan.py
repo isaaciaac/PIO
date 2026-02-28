@@ -50,16 +50,19 @@ def _is_sensitive_path(rel: str) -> bool:
 
 
 def _walk_files(repo_root: Path) -> Iterable[Path]:
-    for path in repo_root.rglob("*"):
-        if path.is_dir():
-            continue
-        rel = _safe_relpath(repo_root, path)
-        if not rel:
-            continue
-        parts = rel.split("/")
-        if parts and parts[0] in _IGNORE_DIRS:
-            continue
-        yield path
+    ignore = {d.lower() for d in _IGNORE_DIRS}
+    for root, dirs, files in os.walk(repo_root):
+        # Prune ignored dirs anywhere in the tree (e.g. client/node_modules).
+        dirs[:] = [d for d in dirs if d.lower() not in ignore]
+        for name in files:
+            path = Path(root) / name
+            rel = _safe_relpath(repo_root, path)
+            if not rel:
+                continue
+            parts = rel.split("/")
+            if any(p.lower() in ignore for p in parts[:-1]):
+                continue
+            yield path
 
 
 def _looks_binary(sample: bytes) -> bool:
@@ -122,6 +125,95 @@ def _collect_node_projects(repo_root: Path, file_rels: List[str]) -> List[Dict[s
     return out
 
 
+def _git_dir(repo_root: Path) -> Optional[Path]:
+    git_path = repo_root / ".git"
+    if git_path.is_dir():
+        return git_path
+    if git_path.is_file():
+        try:
+            text = git_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+        if not text.lower().startswith("gitdir:"):
+            return None
+        raw = text.split(":", 1)[1].strip()
+        gd = Path(raw)
+        if not gd.is_absolute():
+            gd = (repo_root / gd).resolve()
+        return gd if gd.exists() else None
+    return None
+
+
+def _read_git_ref(git_dir: Path, ref: str) -> Optional[str]:
+    ref = ref.strip().lstrip("/")
+    p = (git_dir / ref).resolve()
+    try:
+        if p.exists():
+            v = p.read_text(encoding="utf-8", errors="replace").strip()
+            if len(v) >= 40 and all(c in "0123456789abcdef" for c in v[:40].lower()):
+                return v[:40]
+    except OSError:
+        return None
+
+    # Fallback to packed-refs
+    packed = git_dir / "packed-refs"
+    try:
+        if not packed.exists():
+            return None
+        for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("^"):
+                continue
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == ref:
+                sha = parts[0].strip()
+                if len(sha) >= 40 and all(c in "0123456789abcdef" for c in sha[:40].lower()):
+                    return sha[:40]
+    except OSError:
+        return None
+    return None
+
+
+def git_head_commit(repo_root: Path) -> Optional[str]:
+    gd = _git_dir(repo_root)
+    if not gd:
+        return None
+    head = gd / "HEAD"
+    try:
+        text = head.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if text.lower().startswith("ref:"):
+        ref = text.split(":", 1)[1].strip()
+        return _read_git_ref(gd, ref)
+    if len(text) >= 40 and all(c in "0123456789abcdef" for c in text[:40].lower()):
+        return text[:40]
+    return None
+
+
+def _top_level_snapshot(repo_root: Path) -> Tuple[List[str], Dict[str, int]]:
+    entries: List[str] = []
+    mtimes_ms: Dict[str, int] = {}
+    try:
+        for child in sorted(repo_root.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))[:200]:
+            if child.name in _IGNORE_DIRS:
+                continue
+            key = child.name + ("/" if child.is_dir() else "")
+            entries.append(key)
+            try:
+                mtimes_ms[key] = int(child.stat().st_mtime * 1000)
+            except OSError:
+                continue
+    except Exception:
+        return [], {}
+    return entries, mtimes_ms
+
+
+def _top_level_entries(repo_root: Path) -> List[str]:
+    entries, _ = _top_level_snapshot(repo_root)
+    return entries
+
+
 def scan_repo(
     repo_root: Path,
     *,
@@ -177,21 +269,18 @@ def scan_repo(
             }
         )
 
-    top_level: List[str] = []
-    try:
-        for child in sorted(repo_root.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))[:200]:
-            if child.name in _IGNORE_DIRS:
-                continue
-            top_level.append(child.name + ("/" if child.is_dir() else ""))
-    except Exception:
-        top_level = []
+    top_level, top_level_mtimes_ms = _top_level_snapshot(repo_root)
+
+    git_head = git_head_commit(repo_root)
 
     node_projects = _collect_node_projects(repo_root, rels)
+    rels_sorted = sorted(set(rels))
 
     out: Dict[str, Any] = {
         "version": 1,
         "scanned_at": _now_iso(),
         "repo_root": str(repo_root),
+        "git_head": git_head,
         "limits": {
             "max_files": max_files,
             "max_file_bytes": max_file_bytes,
@@ -200,8 +289,10 @@ def scan_repo(
         "truncated": truncated,
         "file_count": len(files),
         "top_level": top_level,
+        "top_level_mtimes_ms": top_level_mtimes_ms,
         "ext_counts": ext_counts,
         "node_projects": node_projects,
+        "paths_sample": rels_sorted[:400],
     }
     return out
 
@@ -230,6 +321,27 @@ def scan_is_stale(repo_root: Path, *, max_age_s: int) -> bool:
 
     now_ts = datetime.now(timezone.utc).timestamp()
     if now_ts - scanned_ts > max(0, int(max_age_s)):
+        return True
+
+    stored_top = payload.get("top_level")
+    stored_mtimes = payload.get("top_level_mtimes_ms")
+    if isinstance(stored_top, list) and isinstance(stored_mtimes, dict):
+        stored = [str(x) for x in stored_top]
+        stored_m = {str(k): int(v) for k, v in stored_mtimes.items() if str(k)}
+        current, current_m = _top_level_snapshot(repo_root)
+        if stored and current and stored != current:
+            return True
+        # Directory mtimes help catch added/removed files inside stable top-level dirs.
+        for k, v in current_m.items():
+            if stored_m.get(k) != v:
+                return True
+    else:
+        # Missing new fields: trigger a one-time refresh after upgrade.
+        return True
+
+    stored_head = str(payload.get("git_head") or "").strip()
+    current_head = git_head_commit(repo_root) or ""
+    if stored_head and current_head and stored_head != current_head:
         return True
 
     # Key files changed since last scan? (Fast check)
@@ -310,8 +422,11 @@ def write_scan_outputs(repo_root: Path) -> Tuple[Path, Path, Path]:
             {
                 "version": 1,
                 "scanned_at": scan.get("scanned_at"),
+                "git_head": scan.get("git_head"),
                 "file_count": scan.get("file_count"),
                 "truncated": bool(scan.get("truncated")),
+                "top_level": scan.get("top_level") or [],
+                "top_level_mtimes_ms": scan.get("top_level_mtimes_ms") or {},
                 "node_projects": scan.get("node_projects") or [],
             },
             ensure_ascii=False,
@@ -322,4 +437,3 @@ def write_scan_outputs(repo_root: Path) -> Tuple[Path, Path, Path]:
     )
 
     return repo_index, repo_overview, scan_state
-
