@@ -124,7 +124,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式（确认权限/完全授权）：默认先对话梳理需求，必要时才会执行工作流（自动创建任务并运行）。想强制执行：发送「执行：你的需求」或在末尾加「执行」。清空草稿：取消（或 /cancel）。",
+      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式（确认权限/完全授权）：先对话梳理需求，合适时再执行工作流（自动创建任务并运行）。想立即执行：发送「执行：你的需求」，或直接回复「执行/执行吧/开始执行」来运行当前草稿。清空草稿：取消（或 /cancel）。",
       ts: Date.now(),
     },
   ];
@@ -270,18 +270,89 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private parseInlineRun(text: string): { isRun: boolean; taskText?: string } {
     const raw = text.trim();
     if (!raw) return { isRun: false };
-    const m = raw.match(/^(执行|开始执行|\/run|run)\s*[:：]?\s*(.*)$/i);
-    if (m) {
-      const rest = String(m[2] || "").trim();
-      return rest ? { isRun: true, taskText: rest } : { isRun: true };
+    const fillerPrefix = raw.replace(/^(好的|好|可以|行|ok|OK|嗯|那就|麻烦|请|请你|直接)\s*[，,。.;；!！]?\s*/i, "");
+    const candidates = [raw, fillerPrefix].filter((x) => x && x.length > 0);
+
+    const particleRe = /^(?:吧|呀|呢|啦|哈|呗|嘛|哦|噢|一下|下|就|现在|立刻|马上|走起)+$/;
+    const particleStarts = ["一下", "吧", "呀", "呢", "啦", "哈", "呗", "嘛", "哦", "噢", "下", "就", "现在", "立刻", "马上", "走起"];
+    const stripLeadingJunk = (s: string) => s.replace(/^[\s:：，,。.;；!！]+/, "").trim();
+
+    const tokens = ["开始执行", "执行", "/run", "run", "开干", "开工", "动手", "跑起来"];
+
+    const matchPrefix = (s: string): { token: string; rest: string } | undefined => {
+      const low = s.toLowerCase();
+      for (const t of tokens) {
+        const tl = t.toLowerCase();
+        if (!low.startsWith(tl)) continue;
+        return { token: s.slice(0, t.length), rest: s.slice(t.length) };
+      }
+      return undefined;
+    };
+
+    for (const cand of candidates) {
+      const m = matchPrefix(cand);
+      if (!m) continue;
+
+      const restRaw = m.rest || "";
+      if (!restRaw.trim()) return { isRun: true };
+
+      // Require either separators or common particles; avoid false positives like "执行过程…".
+      const first = restRaw[0];
+      const hasSeparator = Boolean(first && /[\s:：，,。.;；!！]/.test(first));
+      const restStripped = stripLeadingJunk(restRaw);
+      const restCompact = restStripped.replace(/[，,。.;；!！?？\s]+/g, "");
+      const restIsParticles = restCompact.length > 0 && particleRe.test(restCompact);
+      const restStartsWithParticle = particleStarts.some((p) => restStripped.startsWith(p));
+
+      if (!hasSeparator && !restIsParticles && !restStartsWithParticle) {
+        // No separator and not a particle => treat as normal chat.
+        return { isRun: false };
+      }
+
+      if (!restStripped) return { isRun: true };
+      if (particleRe.test(restCompact)) return { isRun: true };
+
+      // Support "执行一下 修复…" by stripping leading particles.
+      let rest2 = restStripped;
+      while (true) {
+        const c = rest2.replace(/^[\s，,。.;；!！]+/, "").trim();
+        if (!c) break;
+        const compact = c.replace(/[，,。.;；!！?？\s]+/g, "");
+        if (!compact) break;
+        if (compact.startsWith("一下")) {
+          rest2 = c.slice(c.indexOf("一下") + 2).trim();
+          continue;
+        }
+        const singles = ["吧", "呀", "呢", "啦", "哈", "呗", "嘛", "哦", "噢", "下", "就"];
+        const words = ["现在", "立刻", "马上", "走起"];
+        const single = singles.find((p) => c.startsWith(p));
+        if (single) {
+          rest2 = c.slice(single.length).trim();
+          continue;
+        }
+        const word = words.find((p) => c.startsWith(p));
+        if (word) {
+          rest2 = c.slice(word.length).trim();
+          continue;
+        }
+        break;
+      }
+
+      const final = rest2.trim();
+      return final ? { isRun: true, taskText: final } : { isRun: true };
     }
 
     // Also support trailing commands like: "<task>。执行"
-    const m2 = raw.match(/^(.*?)(?:\s*[，,。.;；！!？?]\s*)?(执行|开始执行|\/run|run)\s*$/i);
+    const m2 = raw.match(
+      /^(.*?)(?:\s*[，,。.;；！!？?]\s*)?(执行|开始执行|\/run|run|开干|开工|动手|跑起来)(?:\s*(?:一下|下|吧|呀|呢|啦|哈|呗|嘛|哦|噢|就|现在|立刻|马上|走起)*)\s*$/i
+    );
     if (!m2) return { isRun: false };
     let rest = String(m2[1] || "").trim();
     rest = rest.replace(/[，,。.;；！!？?]+$/g, "").trim();
-    return rest ? { isRun: true, taskText: rest } : { isRun: true };
+    const compact = rest.replace(/[，,。.;；！!？?\s]+/g, "");
+    if (!compact) return { isRun: true };
+    if (/^(好的|好|可以|行|ok|OK|嗯|那就|麻烦|请|请你|直接)$/.test(compact)) return { isRun: true };
+    return { isRun: true, taskText: rest };
   }
 
   private agentTitle(agentId: string): string {
