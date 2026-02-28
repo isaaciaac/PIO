@@ -118,11 +118,50 @@ async function ensureVibeInit(root: string, output: vscode.OutputChannel): Promi
   await runVibe(["init", "--path", root], { cwd: root, mock: false, output });
 }
 
+async function syncSecretsToWorkspaceIfEnabled(context: vscode.ExtensionContext): Promise<void> {
+  const syncEnabled = vscode.workspace.getConfiguration("vibe").get<boolean>("syncSecretsToWorkspace", true);
+  if (!syncEnabled) return;
+
+  let root: string;
+  try {
+    root = requireWorkspaceRoot();
+  } catch {
+    return;
+  }
+
+  const vibeDir = vscode.Uri.file(path.join(root, ".vibe"));
+  try {
+    await vscode.workspace.fs.stat(vibeDir);
+  } catch {
+    return;
+  }
+
+  const deepseek = await context.secrets.get(SECRET_DEEPSEEK_API_KEY);
+  const dashscope = await context.secrets.get(SECRET_DASHSCOPE_API_KEY);
+  if (!deepseek && !dashscope) return;
+
+  const secretsPath = vscode.Uri.file(path.join(root, ".vibe", "secrets.json"));
+  let current: any = {};
+  try {
+    const raw = await vscode.workspace.fs.readFile(secretsPath);
+    current = JSON.parse(Buffer.from(raw).toString("utf8"));
+  } catch {
+    current = {};
+  }
+  if (typeof current !== "object" || current === null || Array.isArray(current)) current = {};
+  if (deepseek) current[SECRET_DEEPSEEK_API_KEY] = deepseek;
+  if (dashscope) current[SECRET_DASHSCOPE_API_KEY] = dashscope;
+  const data = Buffer.from(JSON.stringify(current, null, 2) + "\n", "utf8");
+  await vscode.workspace.fs.writeFile(secretsPath, data);
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Vibe");
   context.subscriptions.push(output);
 
   registerApprovalWatcher(context, output);
+  // Best-effort: make terminal `vibe` runs work even when keys were saved earlier.
+  syncSecretsToWorkspaceIfEnabled(context).catch(() => undefined);
 
   async function getEnvOverrides(): Promise<NodeJS.ProcessEnv> {
     const env: NodeJS.ProcessEnv = {};
