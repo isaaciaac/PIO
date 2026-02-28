@@ -202,8 +202,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const raw = text.trim();
     if (!raw) return { isRun: false };
     const m = raw.match(/^(执行|开始执行|\/run|run)\s*[:：]?\s*(.*)$/i);
-    if (!m) return { isRun: false };
-    const rest = String(m[2] || "").trim();
+    if (m) {
+      const rest = String(m[2] || "").trim();
+      return rest ? { isRun: true, taskText: rest } : { isRun: true };
+    }
+
+    // Also support trailing commands like: "<task>。执行"
+    const m2 = raw.match(/^(.*?)(?:\s*[，,。.;；！!？?]\s*)?(执行|开始执行|\/run|run)\s*$/i);
+    if (!m2) return { isRun: false };
+    let rest = String(m2[1] || "").trim();
+    rest = rest.replace(/[，,。.;；！!？?]+$/g, "").trim();
     return rest ? { isRun: true, taskText: rest } : { isRun: true };
   }
 

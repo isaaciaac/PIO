@@ -242,6 +242,8 @@ def chat(
     system = (
         f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
         "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
+        "重要：你现在只是在“对话”模式下回答问题，不能真的运行命令、修改文件、创建分支或提交代码。"
+        "不要声称“已经生成/已经创建/已经运行/已经修改”。如果需要执行，请指导用户运行工作流（例如 `vibe run` 或 VS Code 的写项目模式）。\n\n"
         f"{style_text}\n\n"
         "硬约束：你必须只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
