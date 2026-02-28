@@ -19,6 +19,7 @@ from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route
 from vibe.context import effective_context_config, read_memory_records
+from vibe.style import normalize_style, style_workflow_hint
 
 
 @dataclass(frozen=True)
@@ -278,9 +279,12 @@ class Orchestrator:
 
         return packs.TestReport(commands=commands, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
-    def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None) -> RunResult:
+    def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None, style: Optional[str] = None) -> RunResult:
         task_evt = self._find_task(task_id)
         task_text = str(task_evt.meta.get("text") or task_evt.summary)
+
+        resolved_style = normalize_style(style or os.getenv("VIBE_STYLE") or getattr(self.config.behavior, "style", "balanced"))
+        workflow_hint = style_workflow_hint(resolved_style)
 
         diff = self._git_diff_stats_best_effort()
         decision = decide_route(
@@ -305,6 +309,7 @@ class Orchestrator:
                 meta={
                     "route_level": route_level,
                     "reasons": decision.reasons,
+                    "style": resolved_style,
                     "diff": {
                         "files": diff.file_count,
                         "loc_added": diff.loc_added,
@@ -322,7 +327,7 @@ class Orchestrator:
                 summary=f"Activated {len(activated_agents_list)} agents",
                 branch_id=self.branch_id,
                 pointers=[],
-                meta={"route_level": route_level, "agents": activated_agents_list},
+                meta={"route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -342,7 +347,7 @@ class Orchestrator:
                 summary="Built ContextPacket",
                 branch_id=self.branch_id,
                 pointers=ctx.repo_pointers,
-                meta={"route_level": route_level},
+                meta={"route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -356,7 +361,8 @@ class Orchestrator:
                 system=(
                     "You are PM. Return JSON only for RequirementPack with fields: "
                     "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
-                    "No extra keys. No wrapping object. No markdown."
+                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    f"{workflow_hint}"
                 ),
                 user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
             )
@@ -372,7 +378,7 @@ class Orchestrator:
                     summary="Acceptance criteria defined",
                     branch_id=self.branch_id,
                     pointers=[],
-                    meta={"acceptance": req.acceptance, "route_level": route_level},
+                    meta={"acceptance": req.acceptance, "route_level": route_level, "style": resolved_style},
                 ),
                 activated_agents=activated_agents,
             )
@@ -386,7 +392,8 @@ class Orchestrator:
             agent_id="router",
             system=(
                 "You are Router. Return JSON only for Plan: {tasks:[{id,title,agent,description}]}. "
-                "No extra keys. No markdown."
+                "Keep tasks <= 5. No extra keys. No markdown.\n\n"
+                f"{workflow_hint}"
             ),
             user=plan_user,
         )
@@ -402,7 +409,7 @@ class Orchestrator:
                 summary=f"Planned {len(plan.tasks)} tasks",
                 branch_id=self.branch_id,
                 pointers=[],
-                meta={"route_level": route_level},
+                meta={"route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -419,6 +426,8 @@ class Orchestrator:
                 "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
                 "Each writes item must include the full file content. No extra keys. No markdown."
+                "\n\n"
+                f"{workflow_hint}"
             ),
             user=coder_user,
         )
@@ -432,7 +441,7 @@ class Orchestrator:
                 summary=change.summary,
                 branch_id=self.branch_id,
                 pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
-                meta={"files_changed": change.files_changed, "route_level": route_level},
+                meta={"files_changed": change.files_changed, "route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -450,7 +459,7 @@ class Orchestrator:
                 artifacts=artifacts,
                 green=False,
                 restore_steps=["policy(chat_only): no restore steps recorded"],
-                meta={"reason": "chat_only", "route_level": route_level, "agents": activated_agents_list},
+                meta={"reason": "chat_only", "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
             )
             self._append_guarded(
                 event=new_event(
@@ -459,7 +468,7 @@ class Orchestrator:
                     summary=f"Created checkpoint {cp.id} (non-green, chat_only)",
                     branch_id=self.branch_id,
                     pointers=artifacts,
-                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list},
+                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
                 ),
                 activated_agents=activated_agents,
             )
@@ -474,7 +483,7 @@ class Orchestrator:
                 summary="mock: tests skipped" if os.getenv("VIBE_MOCK_MODE", "").strip() == "1" else f"Running tests ({qa_profile})",
                 branch_id=self.branch_id,
                 pointers=[],
-                meta={"profile": qa_profile, "route_level": route_level},
+                meta={"profile": qa_profile, "route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -486,7 +495,7 @@ class Orchestrator:
                 summary="Tests passed" if report.passed else "Tests failed",
                 branch_id=self.branch_id,
                 pointers=report.pointers,
-                meta={"blockers": report.blockers, "profile": qa_profile, "route_level": route_level},
+                meta={"blockers": report.blockers, "profile": qa_profile, "route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
@@ -536,7 +545,13 @@ class Orchestrator:
                 artifacts=artifacts,
                 green=False,
                 restore_steps=["QA: no test commands detected; configure tests/lint then re-run"],
-                meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile, "reason": "qa_no_commands"},
+                meta={
+                    "route_level": route_level,
+                    "agents": activated_agents_list,
+                    "qa_profile": qa_profile,
+                    "reason": "qa_no_commands",
+                    "style": resolved_style,
+                },
             )
             self._append_guarded(
                 event=new_event(
@@ -545,7 +560,7 @@ class Orchestrator:
                     summary=f"Created checkpoint {cp.id} (non-green, no QA commands)",
                     branch_id=self.branch_id,
                     pointers=artifacts,
-                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list},
+                    meta={"green": False, "repo_ref": "no-git", "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
                 ),
                 activated_agents=activated_agents,
             )
@@ -563,7 +578,8 @@ class Orchestrator:
                     system=(
                         "You are Coder. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
                         "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
-                        "Prefer 'writes' for file changes. No extra keys. No markdown."
+                        "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
+                        f"{workflow_hint}"
                     ),
                     user=fix_user,
                 )
@@ -576,7 +592,7 @@ class Orchestrator:
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
                         pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
-                        meta={"blocker": blocker, "route_level": route_level},
+                        meta={"blocker": blocker, "route_level": route_level, "style": resolved_style},
                     ),
                     activated_agents=activated_agents,
                 )
@@ -587,7 +603,7 @@ class Orchestrator:
                         summary=f"Fix-loop {loop}: re-running tests",
                         branch_id=self.branch_id,
                         pointers=[],
-                        meta={"profile": qa_profile, "route_level": route_level},
+                        meta={"profile": qa_profile, "route_level": route_level, "style": resolved_style},
                     ),
                     activated_agents=activated_agents,
                 )
@@ -599,7 +615,7 @@ class Orchestrator:
                         summary="Tests passed" if report.passed else "Tests failed",
                         branch_id=self.branch_id,
                         pointers=report.pointers,
-                        meta={"blockers": report.blockers, "loop": loop, "profile": qa_profile, "route_level": route_level},
+                        meta={"blockers": report.blockers, "loop": loop, "profile": qa_profile, "route_level": route_level, "style": resolved_style},
                     ),
                     activated_agents=activated_agents,
                 )
@@ -631,7 +647,7 @@ class Orchestrator:
             artifacts=artifacts,
             green=True,
             restore_steps=restore_steps,
-            meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile},
+            meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile, "style": resolved_style},
         )
         self._append_guarded(
             event=new_event(
@@ -640,7 +656,7 @@ class Orchestrator:
                 summary=f"Created green checkpoint {cp.id}",
                 branch_id=self.branch_id,
                 pointers=artifacts,
-                meta={"green": True, "repo_ref": repo_ref, "route_level": route_level, "agents": activated_agents_list},
+                meta={"green": True, "repo_ref": repo_ref, "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )

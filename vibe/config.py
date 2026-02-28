@@ -40,6 +40,13 @@ class PolicyConfig(BaseModel):
     mode: Literal["allow_all", "prompt", "chat_only"] = "allow_all"
 
 
+class BehaviorConfig(BaseModel):
+    # free: fewer questions, more default assumptions and direct proposals
+    # balanced: default
+    # detailed: more careful, more checks/edge cases
+    style: Literal["free", "balanced", "detailed"] = "balanced"
+
+
 class AgentContextConfig(BaseModel):
     # A lightweight, provider-agnostic budget (char-based heuristic).
     max_chars: int = 16000
@@ -66,6 +73,7 @@ class RoutesConfig(BaseModel):
 class VibeConfig(BaseModel):
     version: str = "0.1"
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     routes: RoutesConfig = Field(default_factory=RoutesConfig)
     providers: Dict[str, ProviderConfig]

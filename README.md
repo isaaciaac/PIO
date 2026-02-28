@@ -109,6 +109,16 @@ vibe run --mock --mock-writes
 - 环境变量：`VIBE_POLICY_MODE=prompt`
 - 配置文件：`.vibe/vibe.yaml` -> `policy.mode`
 
+## “自由发挥 / 细致程度”调节
+
+你可以控制代理是“少追问、先给方案”，还是“更严谨、更细化验收”。
+
+- 配置文件：`.vibe/vibe.yaml` -> `behavior.style`（`free|balanced|detailed`）
+- 命令行覆盖：
+  - `vibe chat "..." --style free`
+  - `vibe run --style detailed`
+- VS Code 扩展：侧边栏有 `风格` 下拉框，会把选择作为 `--style` 传给 CLI
+
 ## 默认模型分工（建议）
 
 - **DeepSeek `deepseek-reasoner`**：需求/架构/审计/安全/合规/性能/契约确认（更偏推理、把关）

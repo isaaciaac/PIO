@@ -153,8 +153,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const permissionMode = String(msg?.mode || "chat_only").trim();
           const route = String(msg?.route || "auto").trim();
           const agent = String(msg?.agent || "pm").trim();
+          const style = String(msg?.style || "balanced").trim();
           if (!text) return;
-          await this.handleSend(root, text, mock, permissionMode, route, agent);
+          await this.handleSend(root, text, mock, permissionMode, route, agent, style);
           return;
         }
         if (msg?.type === "init") {
@@ -253,7 +254,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.addMessage("assistant", "Initialized .vibe", "init");
   }
 
-  private async handleAgentChat(root: string, agentId: string, text: string, mock: boolean, policyOverride?: string): Promise<void> {
+  private async handleAgentChat(
+    root: string,
+    agentId: string,
+    text: string,
+    mock: boolean,
+    policyOverride: string | undefined,
+    style: string
+  ): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.addMessage("user", text);
@@ -265,6 +273,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       const args = ["chat", text, "--path", root, "--json", "--agent", agentId || "pm"];
       if (mock) args.push("--mock");
+      if (style) args.push("--style", style);
       const res = await runVibeCapture(args, {
         cwd: root,
         mock,
@@ -307,7 +316,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleWorkflowRun(root: string, taskText: string, mock: boolean, policyOverride: string, route: string): Promise<void> {
+  private async handleWorkflowRun(root: string, taskText: string, mock: boolean, policyOverride: string, route: string, style: string): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.postState();
@@ -332,6 +341,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       const runArgs = ["run", "--task", taskId, "--path", root, "--route", route || "auto"];
       if (mock) runArgs.push("--mock");
+      if (style) runArgs.push("--style", style);
       const runRes = await runVibeCapture(runArgs, {
         cwd: root,
         mock,
@@ -361,7 +371,15 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleSend(root: string, text: string, mock: boolean, permissionMode: string, route: string, agent: string): Promise<void> {
+  private async handleSend(
+    root: string,
+    text: string,
+    mock: boolean,
+    permissionMode: string,
+    route: string,
+    agent: string,
+    style: string
+  ): Promise<void> {
     const policyOverride = (permissionMode || "chat_only").trim();
     if (this.isCancelCommand(text)) {
       this.draftParts = [];
@@ -378,7 +396,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         this.addMessage("assistant", "当前没有可执行的草稿。请先描述你要做的改动，然后再发送：执行", "系统");
         return;
       }
-      await this.handleWorkflowRun(root, taskText, mock, policyOverride, route);
+      await this.handleWorkflowRun(root, taskText, mock, policyOverride, route, style);
       this.draftParts = [];
       this.draftHinted = false;
       return;
@@ -386,7 +404,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
     // Authorized modes always talk to PM; chat_only can pick an agent.
     const chatAgent = policyOverride === "chat_only" ? (agent || "pm") : "pm";
-    await this.handleAgentChat(root, chatAgent, text, mock, policyOverride);
+    await this.handleAgentChat(root, chatAgent, text, mock, policyOverride, style);
 
     // Build a runnable draft in parallel with the conversation.
     this.draftParts.push(text);
@@ -633,6 +651,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               <option value="L3">路由：L3 发布</option>
               <option value="L4">路由：L4 全路径</option>
             </select>
+            <select id="style" title="对话/方案的细致程度：自由发挥会更少追问、更多默认假设；细致严谨会更全面">
+              <option value="balanced" selected>风格：平衡</option>
+              <option value="free">风格：自由发挥</option>
+              <option value="detailed">风格：细致严谨</option>
+            </select>
           </div>
           <span>设置：<code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
@@ -659,6 +682,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elAgent = document.getElementById('agent');
       const elAgentWrap = document.getElementById('agentWrap');
       const elRoute = document.getElementById('route');
+      const elStyle = document.getElementById('style');
 
       function escapeHtml(s) {
         return s.replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c] || c));
@@ -697,7 +721,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const mode = (elMode && elMode.value) ? elMode.value : 'chat_only';
         const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
         const route = (elRoute && elRoute.value) ? elRoute.value : 'auto';
-        vscode.postMessage({ type: 'chatSend', mode, route, agent, text, mock: !!elMock.checked });
+        const style = (elStyle && elStyle.value) ? elStyle.value : 'balanced';
+        vscode.postMessage({ type: 'chatSend', mode, route, agent, style, text, mock: !!elMock.checked });
         elInput.value = '';
       }
 
@@ -715,7 +740,35 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           elAgentWrap.style.display = (mode === 'chat_only') ? 'inline-flex' : 'none';
         }
       }
-      if (elMode) elMode.addEventListener('change', syncMode);
+
+      function loadUiState() {
+        const st = vscode.getState() || {};
+        try {
+          if (st && typeof st.mock === 'boolean' && elMock) elMock.checked = st.mock;
+          if (st && st.mode && elMode) elMode.value = String(st.mode);
+          if (st && st.agent && elAgent) elAgent.value = String(st.agent);
+          if (st && st.route && elRoute) elRoute.value = String(st.route);
+          if (st && st.style && elStyle) elStyle.value = String(st.style);
+        } catch {}
+      }
+
+      function saveUiState() {
+        vscode.setState({
+          mock: !!(elMock && elMock.checked),
+          mode: (elMode && elMode.value) ? elMode.value : 'chat_only',
+          agent: (elAgent && elAgent.value) ? elAgent.value : 'pm',
+          route: (elRoute && elRoute.value) ? elRoute.value : 'auto',
+          style: (elStyle && elStyle.value) ? elStyle.value : 'balanced',
+        });
+      }
+
+      if (elMode) elMode.addEventListener('change', () => { syncMode(); saveUiState(); });
+      if (elAgent) elAgent.addEventListener('change', saveUiState);
+      if (elRoute) elRoute.addEventListener('change', saveUiState);
+      if (elStyle) elStyle.addEventListener('change', saveUiState);
+      if (elMock) elMock.addEventListener('change', saveUiState);
+
+      loadUiState();
       syncMode();
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));

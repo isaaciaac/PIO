@@ -23,6 +23,7 @@ from vibe.schemas.events import new_event
 from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
+from vibe.style import normalize_style, style_prompt, style_temperature
 
 app = typer.Typer(help="vibe coding / multi-agent orchestrator (MVP)")
 config_app = typer.Typer(help="Config commands")
@@ -154,6 +155,7 @@ def chat(
     agent: str = typer.Option("pm", "--agent", help="Agent id to chat with (default: pm)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
     mock: bool = typer.Option(False, "--mock", help="Force mock mode for this chat"),
+    style: Optional[str] = typer.Option(None, "--style", help="Chat style: free|balanced|detailed (overrides vibe.yaml)"),
     json_out: bool = typer.Option(False, "--json", help="Output ChatReply JSON"),
     reset: bool = typer.Option(False, "--reset", help="Reset saved chat history for this workspace"),
     history: int = typer.Option(16, "--history", help="How many previous messages to include"),
@@ -235,9 +237,12 @@ def chat(
     past = _read_chat_history(hist_path, limit=max(0, min(history, 64)))
     purpose = (agent_cfg.purpose or "").strip()
     role_hint = f"你的工种ID是 {agent_id}。" + (f" 你的职责是：{purpose}。" if purpose else "")
+    resolved_style = normalize_style(style or os.getenv("VIBE_STYLE") or getattr(cfg.behavior, "style", "balanced"))
+    style_text = style_prompt(resolved_style)
     system = (
         f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
         "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
+        f"{style_text}\n\n"
         "硬约束：你必须只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
         "不要在最外层包一层额外的 key。"
@@ -264,7 +269,7 @@ def chat(
         messages.append({"role": "system", "content": mem_text})
     messages.extend(past)
     messages.append({"role": "user", "content": message})
-    reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=0.2)
+    reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=style_temperature(resolved_style))
 
     _append_chat_history(hist_path, role="user", content=message)
     _append_chat_history(hist_path, role="assistant", content=reply.reply)
@@ -283,6 +288,7 @@ def run(
     mock: bool = typer.Option(False, "--mock", help="Force mock mode for this run"),
     mock_writes: bool = typer.Option(False, "--mock-writes", help="In mock mode, enable deterministic file writes"),
     route: str = typer.Option("auto", "--route", help="Route level: auto|L0|L1|L2|L3|L4"),
+    style: Optional[str] = typer.Option(None, "--style", help="Workflow style: free|balanced|detailed (overrides vibe.yaml)"),
 ) -> None:
     if mock:
         os.environ["VIBE_MOCK_MODE"] = "1"
@@ -291,7 +297,7 @@ def run(
     repo_root = find_repo_root(path or Path.cwd())
     try:
         orch = Orchestrator(repo_root, policy_mode=(ctx.obj or {}).get("policy"))
-        result = orch.run(task_id=task, route=route)
+        result = orch.run(task_id=task, route=route, style=style)
         typer.echo(result.checkpoint_id)
     except PolicyDeniedError as e:
         typer.echo(str(e), err=True)
