@@ -11,6 +11,30 @@
 - `.vibe/views/<agent_id>/`：每个工种的独立记忆域（结构化文件）
 - `.vibe/refstore.sqlite`：轻量 Reference Store（SQLite）
 
+## 上下文压缩（长对话防爆）
+
+当你在 VS Code 侧边栏或命令行反复 `vibe chat`，历史对话可能会逐渐变长。当前实现提供一个**简单但可审计**的压缩策略：
+
+- 触发：当“将要发送给模型的对话尾部 + 本轮用户消息”接近预算（按字符数估算）
+- 动作：把较早的对话归档到 `.vibe/artifacts/sha256/...*.chat.txt`（可按块拆分），并把结构化摘要写入 `.vibe/views/<agent_id>/memory.jsonl`
+- 保留：chat 里会插入一条 `system` 摘要（含 pointers + pinned 要点），并仅保留最后 N 条消息
+
+你可以在 `.vibe/vibe.yaml` 里按 agent 覆盖默认预算：
+
+```yaml
+context:
+  defaults:
+    max_chars: 16000
+    compress_trigger_ratio: 0.85
+    keep_last_messages: 16
+    keep_last_digests: 3
+    pinned_max_items: 8
+    archive_chunk_chars: 20000
+  agents:
+    pm:
+      max_chars: 24000
+```
+
 ## 安装
 
 ```bash

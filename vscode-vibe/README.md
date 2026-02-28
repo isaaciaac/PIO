@@ -104,6 +104,10 @@ npm run package:vsix
 
 聊天模式会显示 PM 的自然语言回复；写项目模式会显示 checkpoint id、green 状态，以及本次新增的 ledger events 摘要。
 
+### 长对话自动压缩
+
+当对话历史过长时，CLI 会自动把较早对话归档到 `.vibe/artifacts/sha256/...*.chat.txt`，并将结构化摘要写入 `.vibe/views/pm/memory.jsonl`；后续对话会自动带上最近几条摘要，避免上下文爆炸且保留可审计 pointers。
+
 ## 权限模式（像“工具审批”一样）
 
 扩展支持三种权限模式（Settings -> 搜索 `Vibe: Permission Mode`）。  

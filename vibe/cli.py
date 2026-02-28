@@ -13,9 +13,11 @@ from vibe.config import VibeConfig, default_config, write_default_config
 from vibe.agents.registry import AGENT_REGISTRY
 from vibe.manifests import write_manifests
 from vibe.orchestrator import Orchestrator
+from vibe.context import effective_context_config, maybe_compress_chat_history, read_memory_records
 from vibe.policy import PolicyDeniedError, ToolPolicy, resolve_policy_mode
 from vibe.repo import ensure_vibe_dirs, find_repo_root
 from vibe.schemas import packs
+from vibe.schemas.memory import ChatDigest
 from vibe.storage.checkpoints import CheckpointsStore
 from vibe.schemas.events import new_event
 from vibe.storage.ledger import Ledger
@@ -175,8 +177,60 @@ def chat(
         raise typer.Exit(code=2)
 
     hist_path = _chat_history_path(repo_root, agent_id)
+    mem_path = repo_root / ".vibe" / "views" / agent_id / "memory.jsonl"
     if reset:
         hist_path.write_text("", encoding="utf-8")
+
+    a = agent_cls(agent_cfg, providers=cfg.providers)
+
+    def digest_builder(text: str) -> ChatDigest:
+        # Chunk to avoid over-long single requests.
+        chunk_chars = 6000
+        chunks = [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+        chunks = chunks[:6]
+        partials: list[ChatDigest] = []
+        system_digest = (
+            "你是 Vibe 的上下文压缩器。你必须只输出 JSON（不要 markdown），并严格匹配 ChatDigest schema："
+            "{summary: string, pinned: string[], background: string[], open_questions: string[]}。\n"
+            "规则：\n"
+            "- pinned：挑出用户的高权重要求/约束/验收（不可丢失），每条不超过 120 字\n"
+            "- background：低权重背景信息/闲聊，每条不超过 120 字\n"
+            "- open_questions：为了继续执行需要追问的问题（如果没有就留空）\n"
+            "- 不要输出任何额外 key；不要把内容包在最外层对象里。"
+        )
+        for c in chunks:
+            d, _ = a.chat_json(schema=ChatDigest, system=system_digest, user=f"对话片段：\n{c}\n")
+            partials.append(d)
+        if not partials:
+            return ChatDigest(summary="（无内容）", pinned=[], background=[], open_questions=[])
+
+        def uniq(items: list[str]) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for it in items:
+                s = str(it).strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+            return out
+
+        summary = "；".join([p.summary.strip() for p in partials if p.summary.strip()])[:240] or partials[0].summary[:240]
+        pinned = uniq([x for p in partials for x in (p.pinned or [])])[:8]
+        background = uniq([x for p in partials for x in (p.background or [])])[:12]
+        open_questions = uniq([x for p in partials for x in (p.open_questions or [])])[:8]
+        return ChatDigest(summary=summary, pinned=pinned, background=background, open_questions=open_questions)
+
+    maybe_compress_chat_history(
+        repo_root=repo_root,
+        agent_id=agent_id,
+        cfg=cfg,
+        hist_path=hist_path,
+        memory_path=mem_path,
+        incoming_user_message=message,
+        history_limit=max(0, min(history, 64)),
+        digest_builder=digest_builder,
+    )
 
     past = _read_chat_history(hist_path, limit=max(0, min(history, 64)))
     purpose = (agent_cfg.purpose or "").strip()
@@ -188,9 +242,28 @@ def chat(
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
         "不要在最外层包一层额外的 key。"
     )
-    messages = [{"role": "system", "content": system}, *past, {"role": "user", "content": message}]
+    ctx_cfg = effective_context_config(cfg, agent_id=agent_id)
+    mem = read_memory_records(mem_path, limit=max(0, min(ctx_cfg.keep_last_digests, 10)))
+    mem_text = ""
+    if mem:
+        lines: list[str] = []
+        lines.append("以下是该工种的结构化记忆摘要（已自动压缩历史对话；事实以 pointers 展开为准）：")
+        for r in mem[-max(1, ctx_cfg.keep_last_digests) :]:
+            pinned = [s for s in (r.digest.pinned or [])][:3]
+            pin = ("；".join(pinned))[:240] if pinned else ""
+            ptrs = ", ".join(list(r.pointers or [])[:2])
+            lines.append(f"- {r.digest.summary.strip()[:200]}")
+            if pin:
+                lines.append(f"  要点: {pin}")
+            if ptrs:
+                lines.append(f"  pointers: {ptrs}")
+        mem_text = "\n".join(lines).strip()
 
-    a = agent_cls(agent_cfg, providers=cfg.providers)
+    messages = [{"role": "system", "content": system}]
+    if mem_text:
+        messages.append({"role": "system", "content": mem_text})
+    messages.extend(past)
+    messages.append({"role": "user", "content": message})
     reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=0.2)
 
     _append_chat_history(hist_path, role="user", content=message)

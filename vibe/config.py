@@ -40,6 +40,21 @@ class PolicyConfig(BaseModel):
     mode: Literal["allow_all", "prompt", "chat_only"] = "allow_all"
 
 
+class AgentContextConfig(BaseModel):
+    # A lightweight, provider-agnostic budget (char-based heuristic).
+    max_chars: int = 16000
+    compress_trigger_ratio: float = 0.85
+    keep_last_messages: int = 16
+    keep_last_digests: int = 3
+    pinned_max_items: int = 8
+    archive_chunk_chars: int = 20000
+
+
+class ContextConfig(BaseModel):
+    defaults: AgentContextConfig = Field(default_factory=AgentContextConfig)
+    agents: Dict[str, AgentContextConfig] = Field(default_factory=dict)
+
+
 class RouteProfile(BaseModel):
     agents: List[str] = Field(default_factory=list)
 
@@ -51,6 +66,7 @@ class RoutesConfig(BaseModel):
 class VibeConfig(BaseModel):
     version: str = "0.1"
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
     routes: RoutesConfig = Field(default_factory=RoutesConfig)
     providers: Dict[str, ProviderConfig]
     agents: Dict[str, AgentConfig]
