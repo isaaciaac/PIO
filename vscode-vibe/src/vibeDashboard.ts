@@ -124,7 +124,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式（确认权限/完全授权）：先对话梳理需求，合适时再执行工作流（自动创建任务并运行）。想立即执行：发送「执行：你的需求」，或直接回复「执行/执行吧/开始执行」来运行当前草稿。清空草稿：取消（或 /cancel）。",
+      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式（确认权限/完全授权）：我会先对话梳理需求，信息足够就自动执行工作流（创建任务→Router/PM/Coder/QA→产出检查点）。想停止累积草稿：发送「取消」。",
       ts: Date.now(),
     },
   ];
@@ -231,23 +231,34 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     return false;
   }
 
-  private shouldAutoRunWorkflow(text: string): boolean {
+  private isInspectMessage(text: string): boolean {
     const raw = String(text || "").trim();
-    if (!raw) return false;
+    if (!raw) return true;
 
-    // Explicit questions / inspections: do not auto-run.
-    if (/[?？]$/.test(raw)) return false;
-    const chatHints = [
+    if (/[?？]$/.test(raw)) return true;
+
+    const compact = raw.replace(/[，,。.;；!！?？\s]+/g, "").toLowerCase();
+    if (!compact) return true;
+
+    // Short greetings / acknowledgements: treat as chat.
+    if (compact.length <= 6) {
+      const smallTalk = ["你好", "在吗", "嗨", "哈喽", "hello", "hi", "hey", "谢谢", "谢了", "收到", "明白", "ok", "okay"];
+      if (smallTalk.some((h) => compact.includes(h))) return true;
+    }
+
+    const hints = [
       "读一下",
+      "看一下",
       "看看",
       "总结",
       "解释",
       "分析",
       "进度",
+      "进展",
       "状态",
       "是什么",
-      "为什么",
       "为啥",
+      "为什么",
       "怎么",
       "如何",
       "能不能",
@@ -255,20 +266,28 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       "有没有",
       "对不对",
       "行不行",
+      "报错",
+      "日志",
+      "怎么跑",
+      "怎么运行",
     ];
-    if (chatHints.some((h) => raw.includes(h))) return false;
+    if (hints.some((h) => raw.includes(h))) return true;
 
-    // Actionable requests: likely should run.
-    const runHints = [
-      "帮我",
+    return false;
+  }
+
+  private shouldAutoRunWorkflow(text: string): boolean {
+    const raw = String(text || "").trim();
+    if (!raw) return false;
+
+    // Strong actionable requests should run (even if they include "看一下").
+    const strongRunHints = [
       "实现",
       "修复",
       "创建",
       "生成",
       "搭建",
       "编写",
-      "写一个",
-      "做一个",
       "新增",
       "添加",
       "更新",
@@ -279,8 +298,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       "升级",
       "集成",
       "发布",
+      "加上",
+      "加一个",
+      "支持",
+      "改成",
+      "调整",
+      "改一下",
     ];
-    if (runHints.some((h) => raw.includes(h))) return true;
+    if (strongRunHints.some((h) => raw.includes(h))) return true;
 
     // Multi-line specs are usually tasks.
     if (raw.split(/\r?\n/).length >= 3) return true;
@@ -288,13 +313,65 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     // Long statements are usually tasks.
     if (raw.length >= 60) return true;
 
+    // Explicit questions / inspections: do not auto-run.
+    if (this.isInspectMessage(raw)) return false;
+
+    // Soft actionable requests: likely should run.
+    const softRunHints = ["帮我", "麻烦", "请你", "请帮我", "帮忙"];
+    if (softRunHints.some((h) => raw.includes(h))) return true;
+
+    return false;
+  }
+
+  private shouldAutoRunWorkflowFromDraft(draftText: string, style: string): boolean {
+    const raw = String(draftText || "").trim();
+    if (!raw) return false;
+
+    const p = (style || "balanced").trim();
+    const minLen = p === "free" ? 40 : p === "detailed" ? 140 : 80;
+    const minLines = p === "free" ? 2 : 3;
+
+    // If the draft contains strong "do work" hints, execute.
+    const strongRunHints = [
+      "实现",
+      "修复",
+      "创建",
+      "生成",
+      "搭建",
+      "编写",
+      "新增",
+      "添加",
+      "更新",
+      "改造",
+      "重构",
+      "优化",
+      "迁移",
+      "升级",
+      "集成",
+      "发布",
+      "改一下",
+      "调整",
+      "改成",
+      "支持",
+      "加上",
+      "加一个",
+    ];
+    if (strongRunHints.some((h) => raw.includes(h))) return true;
+
+    // If this looks like a pure inspection/diagnosis draft, don't auto-run.
+    if (this.isInspectMessage(raw)) return false;
+
+    const nonEmptyLines = raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+    if (nonEmptyLines.length >= minLines) return true;
+    if (raw.length >= minLen) return true;
+
     return false;
   }
 
   private parseInlineRun(text: string): { isRun: boolean; taskText?: string } {
     const raw = text.trim();
     if (!raw) return { isRun: false };
-    const fillerPrefix = raw.replace(/^(好的|好|可以|行|ok|OK|嗯|那就|麻烦|请|请你|直接)\s*[，,。.;；!！]?\s*/i, "");
+    const fillerPrefix = raw.replace(/^(好的|好|可以|行|ok|OK|okay|嗯|那就|麻烦|麻烦你|请|请你|你直接|直接|你就|就)\s*[，,。.;；!！]?\s*/i, "");
     const candidates = [raw, fillerPrefix].filter((x) => x && x.length > 0);
 
     const particleRe = /^(?:吧|呀|呢|啦|哈|呗|嘛|哦|噢|一下|下|就|现在|立刻|马上|走起)+$/;
@@ -376,6 +453,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const compact = rest.replace(/[，,。.;；！!？?\s]+/g, "");
     if (!compact) return { isRun: true };
     if (/^(好的|好|可以|行|ok|OK|嗯|那就|麻烦|请|请你|直接)$/.test(compact)) return { isRun: true };
+    if (/^(?:你)?直接$/.test(compact)) return { isRun: true };
     return { isRun: true, taskText: rest };
   }
 
@@ -829,6 +907,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Always extend the draft first; in authorized modes we may run using the accumulated draft.
+    const draftCandidate = [...this.draftParts, text].join("\n\n").trim();
+
     const inline = this.parseInlineRun(text);
     if (inline.isRun) {
       this.addMessage("user", text);
@@ -859,22 +940,33 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // In authorized modes, default to PM chat unless this looks like an execution request.
-    if (!this.shouldAutoRunWorkflow(text)) {
-      await this.handleAgentChat(root, "pm", text, mock, policyOverride, style);
-      this.draftParts.push(text);
+    // If the current message looks like a task, run immediately using the accumulated draft.
+    if (this.shouldAutoRunWorkflow(text)) {
+      this.addMessage("user", text);
+      await this.handleWorkflowRun(root, draftCandidate, mock, policyOverride, route, style);
+      this.draftParts = [];
+      this.draftHinted = false;
       return;
     }
 
-    this.addMessage("user", text);
-    await this.handleWorkflowRun(root, text, mock, policyOverride, route, style);
-    this.draftParts = [];
-    this.draftHinted = false;
+    // Otherwise, keep chatting to clarify — but when the draft becomes actionable,
+    // auto-run without requiring a special "/run" command.
+    await this.handleAgentChat(root, "pm", text, mock, policyOverride, style);
+    this.draftParts.push(text);
+
+    const draftNow = this.draftParts.join("\n\n").trim();
+    if (!this.isInspectMessage(text) && this.shouldAutoRunWorkflowFromDraft(draftNow, style)) {
+      this.addMessage("assistant", "信息已足够，我开始执行工作流并落地到代码…", "系统");
+      await this.handleWorkflowRun(root, draftNow, mock, policyOverride, route, style);
+      this.draftParts = [];
+      this.draftHinted = false;
+      return;
+    }
   }
 
   private renderHtml(): string {
     return `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1061,12 +1153,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         <div class="metaRow">
           <div class="leftMeta">
             <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
-            <select id="mode" title="聊天模式：只对话（禁用本地工具）；写项目模式：允许本地工具（确认权限会逐项询问、完全授权不询问）。默认先对话梳理需求，需要执行时请发送「执行：...」或在末尾加「执行」。">
+            <select id="mode" title="聊天模式：只对话（禁用本地工具）；写项目模式：允许本地工具（确认权限会逐项询问、完全授权不询问）。写项目模式下：信息足够会自动执行并落地到代码；不足会追问。">
               <option value="chat_only" selected>仅聊天（禁用工具）</option>
               <option value="prompt">确认权限（逐项询问）</option>
               <option value="allow_all">完全授权（不询问）</option>
             </select>
-            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；写项目模式默认与 PM 对话梳理需求（需要执行时再触发工作流）。">
+            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；写项目模式默认与 PM 对话梳理需求（信息足够会自动触发工作流）。">
               <label for="agent">角色</label>
               <select id="agent">
                 <option value="pm" selected>产品经理（PM）</option>
