@@ -21,6 +21,7 @@ from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route, detect_risks
 from vibe.context import effective_context_config, read_memory_records
 from vibe.style import normalize_style, style_workflow_hint
+from vibe.text import decode_bytes
 
 
 @dataclass(frozen=True)
@@ -246,7 +247,7 @@ class Orchestrator:
                 if size > max_bytes:
                     f.seek(max(0, size - max_bytes))
                 data = f.read(max_bytes)
-            text = data.decode("utf-8", errors="replace")
+            text = decode_bytes(data)
             if size > max_bytes:
                 return "…（已截断，仅显示末尾）…\n" + text
             return text
@@ -330,7 +331,7 @@ class Orchestrator:
         # locally so the repo actually changes. This keeps the workflow auditable via
         # cmd artifacts, and avoids "said it generated code but nothing changed".
         if not write_pointers and not change.writes and change.patch_pointer and "@sha256:" in change.patch_pointer:
-            patch_text = self.artifacts.read_bytes(change.patch_pointer).decode("utf-8", errors="replace")
+            patch_text = decode_bytes(self.artifacts.read_bytes(change.patch_pointer))
             looks_like_patch = ("diff --git " in patch_text) or (patch_text.lstrip().startswith("--- ") and "\n+++ " in patch_text)
             if looks_like_patch:
                 paths: set[str] = set()
@@ -367,7 +368,7 @@ class Orchestrator:
                 )
                 write_pointers.extend([r.stdout, r.stderr, r.meta])
                 if r.returncode != 0:
-                    err = self.artifacts.read_bytes(r.stderr).decode("utf-8", errors="replace").strip()
+                    err = decode_bytes(self.artifacts.read_bytes(r.stderr)).strip()
                     raise RuntimeError(f"Failed to apply patch via git apply (code={r.returncode}). {err}")
 
                 if not change.files_changed and paths:
@@ -458,6 +459,44 @@ class Orchestrator:
         results: List[packs.TestResult] = []
         blockers: List[str] = []
         pointers: List[str] = []
+        report_cmds: List[str] = list(cmds)
+
+        # Best-effort: for Node projects, ensure deps exist before running build/lint/test.
+        # This avoids failures like "cannot find module" on fresh checkouts.
+        try:
+            node_dir = self._find_node_project_dir()
+            if node_dir is not None:
+                wants_node = any(any(x in c for x in ("npm", "pnpm", "yarn")) for c in report_cmds)
+                node_modules = (self.repo_root / node_dir / "node_modules") if wants_node else None
+                if wants_node and node_modules is not None and not node_modules.exists():
+                    pm = self._package_manager(node_dir)
+                    install_cmd = self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} install")
+                    r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
+                    passed = r.returncode == 0
+                    results.append(
+                        packs.TestResult(
+                            command=install_cmd,
+                            returncode=r.returncode,
+                            passed=passed,
+                            stdout=r.stdout,
+                            stderr=r.stderr,
+                            meta=r.meta,
+                        )
+                    )
+                    pointers.extend([r.stdout, r.stderr, r.meta])
+                    report_cmds.insert(0, install_cmd)
+                    if not passed:
+                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                        excerpt = stderr_tail or stdout_tail
+                        if excerpt:
+                            blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}")
+                        else:
+                            blockers.append(f"Command failed: {install_cmd}")
+                        return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+        except Exception:
+            pass
+
         for cmd in cmds:
             r = self.toolbox.run_cmd(agent_id="qa", cmd=cmd, cwd=self.repo_root, timeout_s=1800)
             passed = r.returncode == 0
@@ -474,7 +513,7 @@ class Orchestrator:
                 else:
                     blockers.append(f"Command failed: {cmd}")
 
-        return packs.TestReport(commands=cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
+        return packs.TestReport(commands=report_cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
     def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None, style: Optional[str] = None) -> RunResult:
         task_evt = self._find_task(task_id)
@@ -960,7 +999,8 @@ class Orchestrator:
             review_failed = (not review.passed) or bool(review.blockers)
 
         if (not report.passed) or review_failed:
-            max_loops = 3
+            max_loops = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
+            max_loops = max(1, min(max_loops, 12))
             loop = 0
             while loop < max_loops and ((not report.passed) or review_failed):
                 loop += 1

@@ -46,6 +46,11 @@ class BehaviorConfig(BaseModel):
     # detailed: more careful, more checks/edge cases
     style: Literal["free", "balanced", "detailed"] = "balanced"
 
+    # How many times the workflow may re-run the internal fix loop when blocked by
+    # tests/review failures. Keep this bounded to avoid runaway runs; VS Code UI may
+    # also do multi-round retries on top of this.
+    fix_loop_max_loops: int = 3
+
 
 class AgentContextConfig(BaseModel):
     # A lightweight, provider-agnostic budget (char-based heuristic).

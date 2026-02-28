@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from vibe.tools.cmd import CmdResult, CmdTool
+from vibe.text import decode_bytes
 
 
 class GitError(RuntimeError):
@@ -33,17 +34,17 @@ class GitTool:
     def is_repo(self) -> bool:
         try:
             r = self.cmd.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=self.repo_root, timeout_s=30)
-            return r.returncode == 0 and self.cmd.artifacts.read_bytes(r.stdout).decode("utf-8", errors="replace").strip() == "true"
+            return r.returncode == 0 and decode_bytes(self.cmd.artifacts.read_bytes(r.stdout)).strip() == "true"
         except Exception:
             return False
 
     def head_sha(self) -> str:
         r = self._run(["rev-parse", "HEAD"], timeout_s=30)
-        return self.cmd.artifacts.read_bytes(r.stdout).decode("utf-8", errors="replace").strip()
+        return decode_bytes(self.cmd.artifacts.read_bytes(r.stdout)).strip()
 
     def current_branch(self) -> str:
         r = self._run(["rev-parse", "--abbrev-ref", "HEAD"], timeout_s=30)
-        return self.cmd.artifacts.read_bytes(r.stdout).decode("utf-8", errors="replace").strip()
+        return decode_bytes(self.cmd.artifacts.read_bytes(r.stdout)).strip()
 
     def status(self) -> CmdResult:
         return self._run(["status", "--porcelain=v1"], timeout_s=60)

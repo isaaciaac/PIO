@@ -11,6 +11,7 @@ from vibe.tools.cmd import Cmd, CmdResult, CmdTool
 from vibe.tools.fs import FileReadResult, FsTool
 from vibe.tools.git import GitCommitResult, GitTool
 from vibe.tools.search import SearchTool
+from vibe.text import decode_bytes
 from vibe.scan import scan_is_stale, write_scan_outputs
 
 
@@ -132,7 +133,7 @@ class Toolbox:
         self._require_tool_allowed(agent_id=agent_id, tool="git")
         self.policy.check(agent_id=agent_id, tool="git", detail="git diff --numstat")
         r = self.git.diff_numstat()
-        raw = self.cmd.artifacts.read_bytes(r.stdout).decode("utf-8", errors="replace")
+        raw = decode_bytes(self.cmd.artifacts.read_bytes(r.stdout))
         files: list[str] = []
         added = 0
         deleted = 0
