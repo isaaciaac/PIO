@@ -270,6 +270,19 @@ class Orchestrator:
             return ""
         return ""
 
+    def _compact_error_excerpt(self, text: str, *, max_lines: int = 60, max_chars: int = 1600) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        lines = [l.rstrip() for l in t.splitlines() if l.strip()]
+        if not lines:
+            return ""
+        tail = "\n".join(lines[-max(1, int(max_lines)) :]).strip()
+        if len(tail) > max_chars:
+            tail = tail[-max_chars:]
+            tail = "…（已截断）…\n" + tail
+        return tail.strip()
+
     def _materialize_code_change(self, change: packs.CodeChange) -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
         if change.writes:
@@ -453,7 +466,13 @@ class Orchestrator:
             )
             pointers.extend([r.stdout, r.stderr, r.meta])
             if not passed:
-                blockers.append(f"Command failed: {cmd}")
+                stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                excerpt = stderr_tail or stdout_tail
+                if excerpt:
+                    blockers.append(f"Command failed: {cmd}\n\n{excerpt}")
+                else:
+                    blockers.append(f"Command failed: {cmd}")
 
         return packs.TestReport(commands=cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
@@ -991,6 +1010,7 @@ class Orchestrator:
                     ),
                     activated_agents=activated_agents,
                 )
+                qa_commands_loop = self._determine_test_commands(profile=qa_profile)
                 self._append_guarded(
                     event=new_event(
                         agent="qa",
@@ -998,11 +1018,11 @@ class Orchestrator:
                         summary=f"Fix-loop {loop}: re-running tests",
                         branch_id=self.branch_id,
                         pointers=[],
-                        meta={"profile": qa_profile, "route_level": route_level, "style": resolved_style},
+                        meta={"profile": qa_profile, "commands": qa_commands_loop, "route_level": route_level, "style": resolved_style},
                     ),
                     activated_agents=activated_agents,
                 )
-                report = self._run_tests(profile=qa_profile)
+                report = self._run_tests(profile=qa_profile, commands=qa_commands_loop)
                 self._append_guarded(
                     event=new_event(
                         agent="qa",
@@ -1010,7 +1030,14 @@ class Orchestrator:
                         summary="Tests passed" if report.passed else "Tests failed",
                         branch_id=self.branch_id,
                         pointers=report.pointers,
-                        meta={"blockers": report.blockers, "loop": loop, "profile": qa_profile, "route_level": route_level, "style": resolved_style},
+                        meta={
+                            "blockers": report.blockers,
+                            "commands": report.commands,
+                            "loop": loop,
+                            "profile": qa_profile,
+                            "route_level": route_level,
+                            "style": resolved_style,
+                        },
                     ),
                     activated_agents=activated_agents,
                 )
