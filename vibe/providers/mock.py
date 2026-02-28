@@ -37,7 +37,7 @@ class MockProvider:
             vscode_env = bool(os.getenv("VSCODE_PID") or (os.getenv("TERM_PROGRAM") or "").strip().lower() == "vscode")
             if client == "vscode" or vscode_env:
                 actions = [
-                    "如果要改代码：切到写项目模式后，直接回复「执行」即可触发工作流",
+                    "如果要改代码：切到写项目模式后，继续描述需求；信息足够时会自动执行工作流并落地到代码",
                     "如果只想咨询用法：继续在聊天模式提问即可",
                 ]
             else:

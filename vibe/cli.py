@@ -386,13 +386,13 @@ def chat(
     vscode_env = bool(os.getenv("VSCODE_PID") or (os.getenv("TERM_PROGRAM") or "").strip().lower() == "vscode")
     if client == "vscode" or vscode_env:
         exec_hint = (
-            "如果用户希望你继续动手写项目：提示用户在 VS Code 的「写项目模式」直接回复「执行/执行吧/开始执行」即可触发工作流，"
-            "不要让用户去手敲命令。"
+            "如果用户希望你继续动手写项目：不要让用户去手敲命令，也不要要求用户回复特定触发词（如「执行」或「/run」）。"
+            "你只需追问缺失信息；当信息足够时，直接说明你将开始落地实现，并给出接下来会发生什么（由系统自动触发工作流）。"
         )
     else:
         exec_hint = (
             "如果用户希望你继续动手写项目：提示用户在终端运行 `vibe task add \"...\"` 然后 `vibe run`；"
-            "或在 VS Code 写项目模式回复「执行」。"
+            "或使用 VS Code 扩展在写项目模式下继续描述需求（信息足够会自动执行）。"
         )
 
     system = (
