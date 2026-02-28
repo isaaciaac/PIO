@@ -108,12 +108,14 @@ function formatRunSummary(checkpointId: string, green: boolean | undefined, even
 export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private running = false;
+  private draftParts: string[] = [];
+  private draftHinted = false;
   private messages: ChatMessage[] = [
     {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "选择模式：聊天（PM）/ 确认权限（写项目）/ 完全授权（写项目）。勾选“模拟”可无密钥跑通闭环。",
+      text: "你随时都在和 PM 对话。下拉框只决定“是否允许工具写项目/是否逐项确认”。要开始执行工作流，请发送：执行（或 /run）。要清空当前草稿，请发送：取消（或 /cancel）。",
       ts: Date.now(),
     },
   ];
@@ -148,19 +150,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         if (msg?.type === "chatSend") {
           const text = String(msg?.text || "").trim();
           const mock = Boolean(msg?.mock);
-          const mode = String(msg?.mode || "chat").trim();
-          const agent = String(msg?.agent || "pm").trim();
+          const permissionMode = String(msg?.mode || "chat_only").trim();
           const route = String(msg?.route || "auto").trim();
           if (!text) return;
-          if (mode === "chat") {
-            await this.handlePmChat(root, text, mock, agent);
-          } else if (mode === "prompt") {
-            await this.handleChatSend(root, text, mock, "prompt", route);
-          } else if (mode === "allow_all") {
-            await this.handleChatSend(root, text, mock, "allow_all", route);
-          } else {
-            await this.handlePmChat(root, text, mock, agent);
-          }
+          await this.handleSend(root, text, mock, permissionMode, route);
           return;
         }
         if (msg?.type === "init") {
@@ -193,6 +186,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.postState();
   }
 
+  private isRunCommand(text: string): boolean {
+    const t = text.trim().toLowerCase();
+    return t === "执行" || t === "开始执行" || t === "/run" || t === "run";
+  }
+
+  private isCancelCommand(text: string): boolean {
+    const t = text.trim().toLowerCase();
+    return t === "取消" || t === "清空" || t === "/cancel" || t === "cancel";
+  }
+
   private postState(): void {
     this.view?.webview.postMessage({ type: "state", running: this.running, messages: this.messages, ts: Date.now() });
   }
@@ -211,7 +214,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.addMessage("assistant", "Initialized .vibe", "init");
   }
 
-  private async handlePmChat(root: string, text: string, mock: boolean, agent: string): Promise<void> {
+  private async handlePmChat(root: string, text: string, mock: boolean, policyOverride?: string): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.addMessage("user", text);
@@ -221,7 +224,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const envOverrides = await this.getEnvOverrides?.();
       await this.ensureInit(root, envOverrides);
 
-      const args = ["chat", text, "--path", root, "--json", "--agent", agent || "pm"];
+      const args = ["chat", text, "--path", root, "--json", "--agent", "pm"];
       if (mock) args.push("--mock");
       const res = await runVibeCapture(args, {
         cwd: root,
@@ -229,6 +232,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         output: this.output,
         title: mock ? "Vibe：聊天（模拟）" : "Vibe：聊天",
         envOverrides,
+        policyOverride,
       });
 
       let payload: any = undefined;
@@ -246,8 +250,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}`
         : replyText || "（无回复）";
 
-      const title = agent === "pm" ? "产品经理" : `角色：${agent}`;
-      this.addMessage("assistant", assistantText, title);
+      this.addMessage("assistant", assistantText, "产品经理");
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
@@ -265,10 +268,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleChatSend(root: string, text: string, mock: boolean, policyOverride: string, route: string): Promise<void> {
+  private async handleWorkflowRun(root: string, taskText: string, mock: boolean, policyOverride: string, route: string): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.addMessage("user", text);
     this.postState();
 
     try {
@@ -278,7 +280,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       const before = await countLedgerLines(root);
 
-      const taskRes = await runVibeCapture(["task", "add", text, "--path", root], {
+      const taskRes = await runVibeCapture(["task", "add", taskText, "--path", root], {
         cwd: root,
         mock: false,
         output: this.output,
@@ -317,6 +319,47 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.running = false;
       this.postState();
+    }
+  }
+
+  private async handleSend(root: string, text: string, mock: boolean, permissionMode: string, route: string): Promise<void> {
+    const policyOverride = (permissionMode || "chat_only").trim();
+    if (this.isCancelCommand(text)) {
+      this.draftParts = [];
+      this.draftHinted = false;
+      this.addMessage("assistant", "已清空当前草稿。继续描述你的需求，或发送：执行", "系统");
+      return;
+    }
+
+    if (this.isRunCommand(text)) {
+      this.addMessage("user", text);
+      const taskText = this.draftParts.join("\n\n").trim();
+      if (!taskText) {
+        this.addMessage("assistant", "当前没有可执行的草稿。请先描述你要做的改动，然后再发送：执行", "系统");
+        return;
+      }
+      await this.handleWorkflowRun(root, taskText, mock, policyOverride, route);
+      this.draftParts = [];
+      this.draftHinted = false;
+      return;
+    }
+
+    // Always talk to PM first (natural language).
+    await this.handlePmChat(root, text, mock, policyOverride);
+
+    // Build a runnable draft in parallel with the conversation.
+    this.draftParts.push(text);
+
+    // If user is in a write-capable mode, guide them to run explicitly.
+    if (policyOverride === "prompt" || policyOverride === "allow_all") {
+      if (!this.draftHinted) {
+        this.draftHinted = true;
+        this.addMessage(
+          "assistant",
+          "已进入写项目模式：你可以继续补充需求/回答追问。确认要开始执行工作流时，请发送：执行（或 /run）。清空草稿：取消（或 /cancel）。",
+          "系统"
+        );
+      }
     }
   }
 
@@ -509,10 +552,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         <div class="metaRow">
           <div class="leftMeta">
             <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
-            <select id="mode" title="选择是否写项目：聊天不会写代码；确认权限/完全授权会执行工作流">
-              <option value="chat" selected>聊天（PM）</option>
-              <option value="prompt">确认权限（写项目）</option>
-              <option value="allow_all">完全授权（写项目）</option>
+            <select id="mode" title="权限只决定是否允许本地工具动作；你随时都在和 PM 对话。写项目时发送：执行">
+              <option value="chat_only" selected>仅聊天（禁用工具）</option>
+              <option value="prompt">确认权限（逐项询问）</option>
+              <option value="allow_all">完全授权（不询问）</option>
             </select>
             <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（未实现等级会报错）">
               <option value="auto" selected>路由：自动</option>
@@ -522,18 +565,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               <option value="L3">路由：L3 发布</option>
               <option value="L4">路由：L4 全路径</option>
             </select>
-            <span class="agentWrap" id="agentWrap" title="选择要对话的角色（仅聊天模式生效）">
-              <label for="agent">角色</label>
-              <select id="agent">
-                <option value="pm" selected>产品经理（PM）</option>
-                <option value="architect">架构师</option>
-                <option value="security">安全</option>
-                <option value="qa">测试（QA）</option>
-                <option value="coder_backend">后端开发</option>
-                <option value="code_reviewer">代码审查</option>
-                <option value="router">调度器（Router）</option>
-              </select>
-            </span>
           </div>
           <span>设置：<code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
@@ -558,8 +589,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elMock = document.getElementById('mock');
       const elMode = document.getElementById('mode');
       const elRoute = document.getElementById('route');
-      const elAgent = document.getElementById('agent');
-      const elAgentWrap = document.getElementById('agentWrap');
 
       function escapeHtml(s) {
         return s.replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c] || c));
@@ -595,10 +624,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       function sendChat() {
         const text = (elInput.value || '').trim();
         if (!text) return;
-        const mode = (elMode && elMode.value) ? elMode.value : 'chat';
+        const mode = (elMode && elMode.value) ? elMode.value : 'chat_only';
         const route = (elRoute && elRoute.value) ? elRoute.value : 'auto';
-        const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
-        vscode.postMessage({ type: 'chatSend', mode, route, agent, text, mock: !!elMock.checked });
+        vscode.postMessage({ type: 'chatSend', mode, route, text, mock: !!elMock.checked });
         elInput.value = '';
       }
 
@@ -609,13 +637,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           sendChat();
         }
       });
-
-      function syncMode() {
-        const mode = (elMode && elMode.value) ? elMode.value : 'chat';
-        if (elAgentWrap) elAgentWrap.style.display = (mode === 'chat') ? 'inline-flex' : 'none';
-      }
-      if (elMode) elMode.addEventListener('change', syncMode);
-      syncMode();
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));
       document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearChat'}));
