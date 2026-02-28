@@ -979,7 +979,72 @@ class Orchestrator:
                     review_failed = (not review.passed) or bool(review.blockers)
 
             if (not report.passed) or review_failed:
-                raise RuntimeError("Blockers remain after fix-loop.")
+                # Do not crash the CLI/UI: record a non-green checkpoint with the remaining blockers.
+                blockers: list[str] = []
+                if not report.passed:
+                    blockers.extend([str(b) for b in (report.blockers or []) if str(b).strip()])
+                if review_failed and review is not None:
+                    blockers.extend([str(b) for b in (review.blockers or []) if str(b).strip()])
+
+                artifacts_blocked: List[str] = []
+                artifacts_blocked.extend([p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr] if p])
+                if change.patch_pointer:
+                    artifacts_blocked.append(change.patch_pointer)
+                artifacts_blocked.extend(report.pointers)
+
+                repo_ref = "no-git"
+                try:
+                    repo_ref = self.toolbox.git_head_sha(agent_id="router")
+                except Exception:
+                    snap = self.checkpoints.snapshot_repo()
+                    artifacts_blocked.append(snap.to_pointer())
+
+                checkpoint_id = f"ckpt_{uuid4().hex[:12]}"
+                restore_steps = (
+                    [f"git checkout --detach {repo_ref}"]
+                    if repo_ref != "no-git"
+                    else [f"vibe checkpoint restore {checkpoint_id}"]
+                )
+                if change.patch_pointer:
+                    restore_steps.append(f"（如需恢复未提交的变更）应用补丁：{change.patch_pointer}")
+
+                cp = self.checkpoints.create(
+                    checkpoint_id=checkpoint_id,
+                    label=(req.summary if req is not None else task_text.strip().splitlines()[0][:120]),
+                    repo_ref=repo_ref,
+                    ledger_offset=self.ledger.count_lines(),
+                    artifacts=artifacts_blocked,
+                    green=False,
+                    restore_steps=restore_steps,
+                    meta={
+                        "route_level": route_level,
+                        "agents": activated_agents_list,
+                        "qa_profile": qa_profile,
+                        "reason": "fix_loop_blockers",
+                        "blockers": blockers[:20],
+                        "style": resolved_style,
+                    },
+                )
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="CHECKPOINT_CREATED",
+                        summary=f"Created checkpoint {cp.id} (non-green, blockers remain)",
+                        branch_id=self.branch_id,
+                        pointers=artifacts_blocked,
+                        meta={
+                            "green": False,
+                            "repo_ref": repo_ref,
+                            "route_level": route_level,
+                            "agents": activated_agents_list,
+                            "style": resolved_style,
+                            "reason": "fix_loop_blockers",
+                            "blockers": blockers[:20],
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+                return RunResult(checkpoint_id=cp.id, green=False)
 
         # Create green checkpoint
         artifacts: List[str] = []

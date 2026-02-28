@@ -553,6 +553,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         ? "这是 L0 草稿检查点，默认不标绿。"
         : reasonRaw === "qa_no_commands"
           ? "未检测到可执行的测试/校验命令（因此不算绿灯）。"
+          : reasonRaw === "fix_loop_blockers"
+            ? "修复循环结束后仍存在阻塞（已创建非绿灯检查点）。"
           : reasonRaw === "chat_only"
             ? "当前为仅聊天模式，不执行本地工具。"
             : reasonRaw
