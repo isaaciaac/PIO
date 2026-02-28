@@ -77,6 +77,25 @@ def init(path: Optional[Path] = typer.Option(None, "--path", help="Repo path (de
     typer.echo(f"Initialized .vibe in {repo_root}")
 
 
+@app.command()
+def scan(
+    ctx: typer.Context,
+    path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
+    force: bool = typer.Option(False, "--force", help="Force re-scan even if up-to-date"),
+) -> None:
+    repo_root = find_repo_root(path or Path.cwd())
+    cfg_path = repo_root / ".vibe" / "vibe.yaml"
+    if not cfg_path.exists():
+        raise typer.Exit(code=2)
+    tools = _make_toolbox(repo_root, policy_override=(ctx.obj or {}).get("policy"))
+    try:
+        status = tools.scan_repo(agent_id="router", reason="manual", force=force)
+        typer.echo(status)
+    except PolicyDeniedError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=3)
+
+
 @config_app.command("show")
 def config_show(path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)")) -> None:
     repo_root = find_repo_root(path or Path.cwd())
@@ -248,7 +267,22 @@ def chat(
     except Exception:
         tools = None
     if tools is not None:
-        for rel in ["README.md", ".vibe/manifests/run_manifest.md", ".vibe/manifests/project_manifest.md", "package.json", "pyproject.toml"]:
+        # Auto scan on first question / when stale, so the agent can ground in repo facts.
+        try:
+            tools.scan_repo(agent_id="router", reason="chat")
+        except PolicyDeniedError:
+            pass
+        except Exception:
+            pass
+
+        for rel in [
+            ".vibe/manifests/repo_overview.md",
+            ".vibe/manifests/run_manifest.md",
+            ".vibe/manifests/project_manifest.md",
+            "README.md",
+            "package.json",
+            "pyproject.toml",
+        ]:
             try:
                 rr = tools.read_file(agent_id=agent_id, path=rel, start_line=1, end_line=200)
                 repo_pointers.append(rr.pointer)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,7 @@ from vibe.tools.cmd import Cmd, CmdResult, CmdTool
 from vibe.tools.fs import FileReadResult, FsTool
 from vibe.tools.git import GitCommitResult, GitTool
 from vibe.tools.search import SearchTool
+from vibe.scan import scan_is_stale, write_scan_outputs
 
 
 def _is_internal_path(path: str) -> bool:
@@ -63,6 +65,32 @@ class Toolbox:
         self._require_tool_allowed(agent_id=agent_id, tool="search")
         self.policy.check(agent_id=agent_id, tool="search", detail=f"rg {query!r} (cwd={cwd or self.repo_root})")
         return self.search.ripgrep(query, cwd=cwd, timeout_s=timeout_s)
+
+    def scan_repo(self, *, agent_id: str, reason: str = "", force: bool = False) -> str:
+        """
+        Scan the repository to refresh .vibe/manifests/* derived facts (read-only for user files).
+        Returns a short status string.
+        """
+        self._require_tool_allowed(agent_id=agent_id, tool="scan_repo")
+
+        max_age_s = int(os.getenv("VIBE_SCAN_MAX_AGE_S", "1800"))
+        if not force and not scan_is_stale(self.repo_root, max_age_s=max_age_s):
+            return "scan: up-to-date"
+
+        self.policy.check(
+            agent_id=agent_id,
+            tool="scan_repo",
+            detail=f"scan repo to refresh .vibe/manifests (reason={reason or 'auto'})",
+        )
+        # Refresh derived manifests (tree/run hints) + scan outputs.
+        try:
+            from vibe.manifests import write_manifests
+
+            write_manifests(self.repo_root)
+        except Exception:
+            pass
+        repo_index, repo_overview, scan_state = write_scan_outputs(self.repo_root)
+        return f"scan: wrote {repo_index.name}, {repo_overview.name}, {scan_state.name}"
 
     # Git wrappers
     def git_head_sha(self, *, agent_id: str) -> str:

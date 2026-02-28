@@ -152,7 +152,7 @@ def default_config() -> VibeConfig:
                 "CHECKPOINT_CREATED",
                 "BRANCH_CREATED",
             ],
-            tools_allowed=["read_file", "run_cmd", "git", "search", "write_file"],
+            tools_allowed=["read_file", "run_cmd", "git", "search", "write_file", "scan_repo"],
         ),
         "log_compressor": agent(
             "log_compressor",
@@ -426,3 +426,8 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
         existing = set(router.memory_scope.ledger_write_types or [])
         if not needed.issubset(existing):
             router.memory_scope.ledger_write_types = sorted(existing | needed)
+
+        needed_tools = {"scan_repo"}
+        existing_tools = set(router.tools_allowed or [])
+        if not needed_tools.issubset(existing_tools):
+            router.tools_allowed = sorted(existing_tools | needed_tools)

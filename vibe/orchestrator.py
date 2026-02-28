@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from vibe.agents.registry import AGENT_REGISTRY
 from vibe.config import VibeConfig
-from vibe.policy import ToolPolicy, resolve_policy_mode
+from vibe.policy import PolicyDeniedError, ToolPolicy, resolve_policy_mode
 from vibe.schemas import packs
 from vibe.schemas.events import LedgerEvent, new_event
 from vibe.storage.artifacts import ArtifactsStore
@@ -87,7 +87,12 @@ class Orchestrator:
     def _build_context_packet(self) -> tuple[packs.ContextPacket, str]:
         pointers: List[str] = []
         excerpts: List[str] = []
-        for rel in [".vibe/manifests/project_manifest.md", ".vibe/manifests/run_manifest.md", "README.md"]:
+        for rel in [
+            ".vibe/manifests/project_manifest.md",
+            ".vibe/manifests/run_manifest.md",
+            ".vibe/manifests/repo_overview.md",
+            "README.md",
+        ]:
             path = self.repo_root / rel
             if not path.exists():
                 continue
@@ -467,6 +472,14 @@ class Orchestrator:
 
         if route_level not in {"L0", "L1", "L2"}:
             raise NotImplementedError(f"Route level {route_level} is not implemented yet (Phase 3+).")
+
+        # Keep manifests/index fresh so agents can ground answers in repo facts.
+        try:
+            self.toolbox.scan_repo(agent_id="router", reason="workflow")
+        except PolicyDeniedError:
+            pass
+        except Exception:
+            pass
 
         router = self._agent("router")
         pm = self._agent("pm") if "pm" in activated_agents else None
