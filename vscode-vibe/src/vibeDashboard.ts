@@ -613,12 +613,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         <div class="metaRow">
           <div class="leftMeta">
             <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
-            <select id="mode" title="权限只决定是否允许本地工具动作；你随时都在和 PM 对话。写项目时发送：执行">
+            <select id="mode" title="聊天模式：只对话；写项目模式：发送即执行工作流（自动创建任务并运行）。权限只决定本地工具是否逐项确认。">
               <option value="chat_only" selected>仅聊天（禁用工具）</option>
               <option value="prompt">确认权限（逐项询问）</option>
               <option value="allow_all">完全授权（不询问）</option>
             </select>
-            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；授权模式固定与 PM 对话">
+            <span class="agentWrap" id="agentWrap" title="仅聊天模式可选角色；写项目模式不在这里对话，会直接跑工作流（PM/Router/Coder/QA）。">
               <label for="agent">角色</label>
               <select id="agent">
                 <option value="pm" selected>产品经理（PM）</option>
