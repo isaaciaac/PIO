@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 from uuid import uuid4
 
 from vibe.agents.registry import AGENT_REGISTRY
@@ -167,6 +168,61 @@ class Orchestrator:
         msgs.append({"role": "user", "content": user})
         return msgs
 
+    def _python_has_module(self, name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except Exception:
+            return False
+
+    def _materialize_code_change(self, change: packs.CodeChange) -> Tuple[packs.CodeChange, List[str]]:
+        write_pointers: List[str] = []
+        if change.writes:
+            for w in change.writes:
+                rel = (w.path or "").replace("\\", "/").lstrip("/")
+                if rel.startswith(".vibe/") or rel.startswith(".git/"):
+                    raise RuntimeError(f"Refusing to write internal path: {w.path}")
+                ptr = self.toolbox.write_file(agent_id="coder_backend", path=w.path, content=w.content)
+                write_pointers.append(ptr)
+
+            if not change.files_changed:
+                change.files_changed = [w.path for w in change.writes if w.path]
+
+            # Best-effort patch evidence.
+            patch_ptr: Optional[str] = None
+            try:
+                if self.toolbox.git_is_repo(agent_id="router"):
+                    diff = self.toolbox.git_diff(agent_id="router")
+                    patch_ptr = diff.stdout
+            except Exception:
+                patch_ptr = None
+
+            if not patch_ptr:
+                patch_ptr = self.artifacts.put_json(
+                    {
+                        "kind": "writes",
+                        "files": [{"path": w.path, "pointer": p} for w, p in zip(change.writes, write_pointers)],
+                    },
+                    suffix=".writes.json",
+                    kind="patch",
+                ).to_pointer()
+
+            change.kind = "patch"
+            change.patch_pointer = patch_ptr
+
+        # If the model returned inline patch text, store it into artifacts.
+        if change.patch_pointer and "@sha256:" not in change.patch_pointer:
+            change.patch_pointer = self.artifacts.put_text(
+                change.patch_pointer,
+                suffix=".patch.diff",
+                kind="patch",
+            ).to_pointer()
+
+        if change.kind == "noop" or (not change.patch_pointer and not change.commit_hash and not write_pointers):
+            patch_ptr = self.artifacts.put_text("mock: no code changes", suffix=".patch.txt", kind="patch").to_pointer()
+            change = packs.CodeChange(kind="patch", summary=change.summary or "mock patch", patch_pointer=patch_ptr, files_changed=change.files_changed)
+
+        return change, write_pointers
+
     def _run_tests(self, *, profile: str) -> packs.TestReport:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
             return packs.TestReport(
@@ -181,6 +237,13 @@ class Orchestrator:
 
         is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
         is_node = (self.repo_root / "package.json").exists()
+        tests_dir = self.repo_root / "tests"
+        has_py_tests = False
+        if tests_dir.exists():
+            try:
+                has_py_tests = any(p.is_file() for p in tests_dir.rglob("test*.py"))
+            except Exception:
+                has_py_tests = True
 
         p = profile.strip().lower()
         if p == "smoke":
@@ -192,7 +255,11 @@ class Orchestrator:
                 return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
         else:
             if is_py:
-                commands = ["python -m compileall .", "pytest -q"]
+                # Prefer pytest when available and the project appears to have tests.
+                if has_py_tests and self._python_has_module("pytest"):
+                    commands = ["python -m compileall .", "pytest -q"]
+                else:
+                    commands = ["python -m compileall .", "python -m unittest -q"]
             elif is_node:
                 commands = ["npm test"]
             else:
@@ -349,15 +416,14 @@ class Orchestrator:
             agent_id="coder_backend",
             system=(
                 "You are Coder. Return JSON only for CodeChange with fields: "
-                "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
-                "No extra keys. No markdown."
+                "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                "Prefer 'writes' for file changes (especially when starting from an empty repo). "
+                "Each writes item must include the full file content. No extra keys. No markdown."
             ),
             user=coder_user,
         )
         change, _change_meta = coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
-        if change.kind == "noop" or not change.patch_pointer:
-            patch_ptr = self.artifacts.put_text("mock: no code changes", suffix=".patch.txt", kind="patch").to_pointer()
-            change = packs.CodeChange(kind="patch", summary=change.summary or "mock patch", patch_pointer=patch_ptr, files_changed=change.files_changed)
+        change, write_pointers = self._materialize_code_change(change)
 
         self._append_guarded(
             event=new_event(
@@ -365,7 +431,7 @@ class Orchestrator:
                 type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                 summary=change.summary,
                 branch_id=self.branch_id,
-                pointers=[p for p in [change.patch_pointer, change.commit_hash] if p],
+                pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
                 meta={"files_changed": change.files_changed, "route_level": route_level},
             ),
             activated_agents=activated_agents,
@@ -491,29 +557,25 @@ class Orchestrator:
             while loop < max_loops and not report.passed:
                 loop += 1
                 blocker = (report.blockers or ["tests failed"])[0]
-                change, _ = coder.chat_json(
-                    schema=packs.CodeChange,
+                fix_user = f"Blocker:\n{blocker}\n\nRequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+                fix_msgs = self._messages_with_memory(
+                    agent_id="coder_backend",
                     system=(
                         "You are Coder. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
-                        "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
-                        "No extra keys. No markdown."
+                        "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                        "Prefer 'writes' for file changes. No extra keys. No markdown."
                     ),
-                    user=f"Blocker:\n{blocker}\n\nRequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}",
+                    user=fix_user,
                 )
-                patch_ptr = self.artifacts.put_text(
-                    f"fix-loop {loop}: {blocker}\n",
-                    suffix=".patch.txt",
-                    kind="patch",
-                ).to_pointer()
-                if change.kind != "commit":
-                    change = packs.CodeChange(kind="patch", summary=change.summary or f"fix {blocker}", patch_pointer=patch_ptr)
+                change, _ = coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
+                change, write_pointers = self._materialize_code_change(change)
                 self._append_guarded(
                     event=new_event(
                         agent="coder_backend",
                         type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
-                        pointers=[p for p in [change.patch_pointer, change.commit_hash] if p],
+                        pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
                         meta={"blocker": blocker, "route_level": route_level},
                     ),
                     activated_agents=activated_agents,

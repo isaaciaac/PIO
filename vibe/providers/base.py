@@ -55,17 +55,40 @@ def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
 
     schema_name = schema.__name__
     # Common model behavior: wrap the payload under the schema name.
-    if schema_name in data and isinstance(data[schema_name], dict):
-        return data[schema_name]
+    if schema_name in data:
+        v = data[schema_name]
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                inner = _extract_json(v)
+                if isinstance(inner, dict):
+                    return inner
+            except Exception:
+                pass
 
     # Case-insensitive match.
     for k, v in data.items():
         if isinstance(k, str) and k.lower() == schema_name.lower() and isinstance(v, dict):
             return v
+        if isinstance(k, str) and k.lower() == schema_name.lower() and isinstance(v, str):
+            try:
+                inner = _extract_json(v)
+                if isinstance(inner, dict):
+                    return inner
+            except Exception:
+                pass
 
     # Another common wrapper key.
     if "data" in data and isinstance(data["data"], dict) and len(data) == 1:
         return data["data"]
+    if "data" in data and isinstance(data["data"], str) and len(data) == 1:
+        try:
+            inner = _extract_json(data["data"])
+            if isinstance(inner, dict):
+                return inner
+        except Exception:
+            pass
 
     return data
 

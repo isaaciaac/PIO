@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
@@ -53,7 +54,51 @@ class MockProvider:
                 ]
             )
         elif schema is schemas.CodeChange:
-            out = schemas.CodeChange(kind="noop", summary="mock: no changes", files_changed=[])
+            if os.getenv("VIBE_MOCK_WRITES", "").strip() == "1":
+                readme = (
+                    "# Mock Project (from Vibe)\n\n"
+                    "这是一个用 mock 模式生成的最小 Python 项目骨架，用来验证 Vibe 的「从 0 写文件」能力。\n\n"
+                    "## 运行\n\n"
+                    "```bash\n"
+                    "python main.py\n"
+                    "```\n\n"
+                    "## 测试（unittest）\n\n"
+                    "```bash\n"
+                    "python -m unittest -q\n"
+                    "```\n"
+                )
+                out = schemas.CodeChange(
+                    kind="patch",
+                    summary="mock: scaffolded a minimal python project",
+                    writes=[
+                        schemas.FileWrite(path="hello.txt", content="hello from mock\n"),
+                        schemas.FileWrite(
+                            path="main.py",
+                            content=(
+                                "def greet(name: str = \"world\") -> str:\n"
+                                "    return f\"hello, {name}\"\n\n"
+                                "if __name__ == \"__main__\":\n"
+                                "    print(greet())\n"
+                            ),
+                        ),
+                        schemas.FileWrite(path="README.md", content=readme),
+                        schemas.FileWrite(
+                            path="tests/test_main.py",
+                            content=(
+                                "import unittest\n\n"
+                                "from main import greet\n\n\n"
+                                "class TestGreet(unittest.TestCase):\n"
+                                "    def test_default(self):\n"
+                                "        self.assertEqual(greet(), \"hello, world\")\n\n"
+                                "    def test_name(self):\n"
+                                "        self.assertEqual(greet(\"vibe\"), \"hello, vibe\")\n"
+                            ),
+                        ),
+                    ],
+                    files_changed=["hello.txt", "main.py", "README.md", "tests/test_main.py"],
+                )
+            else:
+                out = schemas.CodeChange(kind="noop", summary="mock: no changes", files_changed=[])
         elif schema is schemas.TestReport:
             out = schemas.TestReport(
                 commands=["mock"],

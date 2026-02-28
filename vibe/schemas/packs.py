@@ -40,11 +40,17 @@ class ContextPacket(BaseModel):
     recent_events: List[ContextEventRef] = Field(default_factory=list)
 
 
+class FileWrite(BaseModel):
+    path: str
+    content: str
+
+
 class CodeChange(BaseModel):
     kind: Literal["commit", "patch", "noop"]
     summary: str
     commit_hash: Optional[str] = None
     patch_pointer: Optional[str] = None
+    writes: List[FileWrite] = Field(default_factory=list)
     files_changed: List[str] = Field(default_factory=list)
     blockers: List[str] = Field(default_factory=list)
 

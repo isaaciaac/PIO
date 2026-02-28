@@ -57,6 +57,24 @@ vibe run
 vibe checkpoint list
 ```
 
+## 从 0 开始搭建（空目录）
+
+在一个空目录里（可以没有 git）：
+
+```bash
+vibe init
+vibe task add "从 0 创建一个最小可运行的 Python 项目：包含 main.py、README、unittest 测试"
+vibe run
+```
+
+如果你还没配置 DeepSeek/DashScope key，可以用 mock 先验证“会写文件、能闭环”的能力：
+
+```bash
+vibe init
+vibe task add "从 0 创建一个最小 Python 项目"
+vibe run --mock --mock-writes
+```
+
 ## CLI 一览
 
 - `vibe init`

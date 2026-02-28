@@ -119,3 +119,8 @@ class Toolbox:
             if d.isdigit():
                 deleted += int(d)
         return DiffStats(file_count=len(files), loc_added=added, loc_deleted=deleted, paths=tuple(files), pointer=r.stdout)
+
+    def git_diff(self, *, agent_id: str) -> CmdResult:
+        self._require_tool_allowed(agent_id=agent_id, tool="git")
+        self.policy.check(agent_id=agent_id, tool="git", detail="git diff")
+        return self.git.diff()
