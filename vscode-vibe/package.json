@@ -2,7 +2,7 @@
   "name": "vibe-coding",
   "displayName": "Vibe Coding",
   "description": "Run the vibe multi-agent workflow from VS Code.",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -118,6 +118,11 @@
             "chat_only"
           ],
           "description": "Tool permission mode. 'config' uses .vibe/vibe.yaml policy.mode; 'prompt' requires approvals for each tool use."
+        },
+        "vibe.syncSecretsToWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "保存密钥后，同步写入当前工作区的 .vibe/secrets.json（便于在终端直接运行 vibe CLI）。注意：这是明文存储在磁盘上，但 .vibe/ 默认会被 gitignore。"
         }
       }
     }

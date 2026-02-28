@@ -24,6 +24,7 @@ from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.style import normalize_style, style_prompt, style_temperature
+from vibe.secrets import apply_workspace_secrets
 
 app = typer.Typer(help="vibe coding / multi-agent orchestrator (MVP)")
 config_app = typer.Typer(help="Config commands")
@@ -263,6 +264,7 @@ def chat(
         raise typer.Exit(code=2)
 
     cfg = VibeConfig.load(cfg_path)
+    apply_workspace_secrets(repo_root, providers=cfg.providers)
     agent_id = agent.strip()
     agent_cfg = cfg.agents.get(agent_id)
     if not agent_cfg:
@@ -446,6 +448,10 @@ def run(
         os.environ["VIBE_MOCK_WRITES"] = "1"
     repo_root = find_repo_root(path or Path.cwd())
     try:
+        cfg_path = repo_root / ".vibe" / "vibe.yaml"
+        if cfg_path.exists():
+            cfg = VibeConfig.load(cfg_path)
+            apply_workspace_secrets(repo_root, providers=cfg.providers)
         orch = Orchestrator(repo_root, policy_mode=(ctx.obj or {}).get("policy"))
         result = orch.run(task_id=task, route=route, style=style)
         typer.echo(result.checkpoint_id)

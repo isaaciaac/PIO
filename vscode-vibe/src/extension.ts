@@ -29,7 +29,42 @@ async function setSecretKey(
   });
   if (!value) return;
   await context.secrets.store(secretKey, value.trim());
-  vscode.window.showInformationMessage(`${label} 密钥已安全保存（SecretStorage）。`);
+
+  // Optional: also sync to workspace `.vibe/secrets.json` so running `vibe` in a terminal works.
+  const syncEnabled = vscode.workspace.getConfiguration("vibe").get<boolean>("syncSecretsToWorkspace", true);
+  let synced = false;
+  if (syncEnabled) {
+    try {
+      const root = requireWorkspaceRoot();
+      const vibeDir = vscode.Uri.file(path.join(root, ".vibe"));
+      try {
+        await vscode.workspace.fs.stat(vibeDir);
+        const secretsPath = vscode.Uri.file(path.join(root, ".vibe", "secrets.json"));
+        let current: any = {};
+        try {
+          const raw = await vscode.workspace.fs.readFile(secretsPath);
+          current = JSON.parse(Buffer.from(raw).toString("utf8"));
+        } catch {
+          current = {};
+        }
+        if (typeof current !== "object" || current === null || Array.isArray(current)) current = {};
+        current[secretKey] = value.trim();
+        const data = Buffer.from(JSON.stringify(current, null, 2) + "\n", "utf8");
+        await vscode.workspace.fs.writeFile(secretsPath, data);
+        synced = true;
+      } catch {
+        // workspace not initialized with .vibe yet
+      }
+    } catch {
+      // no workspace
+    }
+  }
+
+  vscode.window.showInformationMessage(
+    synced
+      ? `${label} 密钥已保存（SecretStorage + 工作区 .vibe/secrets.json）。`
+      : `${label} 密钥已安全保存（SecretStorage）。`
+  );
 }
 
 async function showApiKeyStatus(context: vscode.ExtensionContext): Promise<void> {
