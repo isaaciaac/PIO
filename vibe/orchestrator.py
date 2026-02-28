@@ -1094,7 +1094,12 @@ class Orchestrator:
                 f"You are {coder_role}. Return JSON only for CodeChange with fields: "
                 "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
-                "Each writes item must include the full file content. No extra keys. No markdown."
+                "Each writes item must include the full file content. No extra keys. No markdown.\n\n"
+                "Hard rules:\n"
+                "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
+                "- Do not do large refactors; prefer the smallest coherent change set.\n"
+                "- If you change exports/imports, ensure all references stay consistent.\n"
+                "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s)."
                 "\n\n"
                 f"{workflow_hint}"
             ),
@@ -1389,6 +1394,10 @@ class Orchestrator:
                         f"You are {fix_role}. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
                         "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                         "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
+                        "Hard rules:\n"
+                        "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
+                        "- Do not do architecture refactors during fix-loop.\n"
+                        "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
                         f"{workflow_hint}"
                     ),
                     user=fix_user,
