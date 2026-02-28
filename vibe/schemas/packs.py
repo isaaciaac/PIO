@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 RouteLevel = Literal["L0", "L1", "L2", "L3", "L4"]
@@ -44,6 +44,28 @@ class FileWrite(BaseModel):
     path: str
     content: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        # Models often output {file, content} or {path, text}. Accept common variants.
+        if not isinstance(data, dict):
+            return data
+
+        out = dict(data)
+        if "path" not in out:
+            for k in ("file", "filepath", "filename", "name"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["path"] = v.strip()
+                    break
+        if "content" not in out:
+            for k in ("text", "contents", "body", "value"):
+                v = out.get(k)
+                if isinstance(v, str):
+                    out["content"] = v
+                    break
+        return out
+
 
 class CodeChange(BaseModel):
     kind: Literal["commit", "patch", "noop"]
@@ -53,6 +75,42 @@ class CodeChange(BaseModel):
     writes: List[FileWrite] = Field(default_factory=list)
     files_changed: List[str] = Field(default_factory=list)
     blockers: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        out = dict(data)
+
+        # Common field name variants.
+        if "kind" not in out and isinstance(out.get("type"), str):
+            out["kind"] = out.get("type")
+        if "files_changed" not in out:
+            for k in ("files", "changed_files", "paths"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["files_changed"] = v
+                    break
+        if "commit_hash" not in out and isinstance(out.get("commit"), str):
+            out["commit_hash"] = out.get("commit")
+        if "patch_pointer" not in out and isinstance(out.get("patch"), str):
+            out["patch_pointer"] = out.get("patch")
+
+        # Normalize kind variants.
+        kind = out.get("kind")
+        if isinstance(kind, str):
+            k = kind.strip().lower()
+            mapping = {
+                "diff": "patch",
+                "patchfile": "patch",
+                "commit_hash": "commit",
+            }
+            if k in mapping:
+                out["kind"] = mapping[k]
+
+        return out
 
 
 class TestResult(BaseModel):

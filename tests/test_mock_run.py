@@ -29,3 +29,23 @@ def test_cli_run_mock_creates_green_checkpoint(tmp_path: Path, monkeypatch) -> N
     written = tmp_path / "hello.txt"
     assert written.exists()
     assert written.read_text(encoding="utf-8") == "hello from mock\n"
+
+
+def test_codechange_accepts_file_key() -> None:
+    from vibe.schemas.packs import CodeChange
+
+    payload = {
+        "kind": "patch",
+        "summary": "x",
+        "writes": [
+            {"file": "a.txt", "content": "hi\n"},
+            {"path": "b.txt", "text": "hello\n"},
+        ],
+        "files": ["a.txt", "b.txt"],
+    }
+    c = CodeChange.model_validate(payload)
+    assert c.writes[0].path == "a.txt"
+    assert c.writes[0].content == "hi\n"
+    assert c.writes[1].path == "b.txt"
+    assert c.writes[1].content == "hello\n"
+    assert "a.txt" in c.files_changed
