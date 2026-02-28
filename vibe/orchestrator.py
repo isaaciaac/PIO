@@ -218,23 +218,62 @@ class Orchestrator:
                 kind="patch",
             ).to_pointer()
 
+        # If the model returned a unified diff patch but no inline writes, try to apply it
+        # locally so the repo actually changes. This keeps the workflow auditable via
+        # cmd artifacts, and avoids "said it generated code but nothing changed".
+        if not write_pointers and not change.writes and change.patch_pointer and "@sha256:" in change.patch_pointer:
+            patch_text = self.artifacts.read_bytes(change.patch_pointer).decode("utf-8", errors="replace")
+            looks_like_patch = ("diff --git " in patch_text) or (patch_text.lstrip().startswith("--- ") and "\n+++ " in patch_text)
+            if looks_like_patch:
+                paths: set[str] = set()
+                for line in patch_text.splitlines():
+                    if line.startswith("diff --git "):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            for p in (parts[2], parts[3]):
+                                p = p[2:] if p.startswith(("a/", "b/")) else p
+                                paths.add(p)
+                    elif line.startswith(("--- ", "+++ ")):
+                        parts = line.split(maxsplit=1)
+                        if len(parts) == 2:
+                            p = parts[1].strip()
+                            if p == "/dev/null":
+                                continue
+                            p = p[2:] if p.startswith(("a/", "b/")) else p
+                            paths.add(p)
+
+                for p in sorted(paths):
+                    rel = p.replace("\\", "/").lstrip("/")
+                    if rel.startswith(".vibe/") or rel.startswith(".git/"):
+                        raise RuntimeError(f"Refusing to apply patch touching internal path: {p}")
+                    if ":" in rel or rel.startswith("\\\\") or rel.startswith("//") or "/../" in f"/{rel}/":
+                        raise RuntimeError(f"Refusing to apply patch with unsafe path: {p}")
+
+                patch_path = change.patch_pointer.split("@sha256:", 1)[0]
+                abs_patch = (self.repo_root / patch_path).resolve()
+                r = self.toolbox.run_cmd(
+                    agent_id="coder_backend",
+                    cmd=["git", "apply", "--whitespace=nowarn", str(abs_patch)],
+                    cwd=self.repo_root,
+                    timeout_s=600,
+                )
+                write_pointers.extend([r.stdout, r.stderr, r.meta])
+                if r.returncode != 0:
+                    err = self.artifacts.read_bytes(r.stderr).decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"Failed to apply patch via git apply (code={r.returncode}). {err}")
+
+                if not change.files_changed and paths:
+                    change.files_changed = sorted({p.replace("\\", "/").lstrip("/") for p in paths})
+
         if change.kind == "noop" or (not change.patch_pointer and not change.commit_hash and not write_pointers):
             patch_ptr = self.artifacts.put_text("mock: no code changes", suffix=".patch.txt", kind="patch").to_pointer()
             change = packs.CodeChange(kind="patch", summary=change.summary or "mock patch", patch_pointer=patch_ptr, files_changed=change.files_changed)
 
         return change, write_pointers
 
-    def _run_tests(self, *, profile: str) -> packs.TestReport:
+    def _determine_test_commands(self, *, profile: str) -> List[str]:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
-            return packs.TestReport(
-                commands=["mock"],
-                results=[packs.TestResult(command="mock", returncode=0, passed=True, stdout="", stderr="")],
-                passed=True,
-                blockers=[],
-                pointers=[],
-            )
-
-        commands: List[str] = []
+            return ["mock"]
 
         is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
         is_node = (self.repo_root / "package.json").exists()
@@ -249,35 +288,49 @@ class Orchestrator:
         p = profile.strip().lower()
         if p == "smoke":
             if is_py:
-                commands = ["python -m compileall ."]
-            elif is_node:
-                commands = ["npm test"]
-            else:
-                return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
-        else:
-            if is_py:
-                # Prefer pytest when available and the project appears to have tests.
-                if has_py_tests and self._python_has_module("pytest"):
-                    commands = ["python -m compileall .", "pytest -q"]
-                else:
-                    commands = ["python -m compileall .", "python -m unittest -q"]
-            elif is_node:
-                commands = ["npm test"]
-            else:
-                return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
+                return ["python -m compileall ."]
+            if is_node:
+                return ["npm test"]
+            return []
+
+        if is_py:
+            # Prefer pytest when available and the project appears to have tests.
+            if has_py_tests and self._python_has_module("pytest"):
+                return ["python -m compileall .", "pytest -q"]
+            return ["python -m compileall .", "python -m unittest -q"]
+        if is_node:
+            return ["npm test"]
+        return []
+
+    def _run_tests(self, *, profile: str, commands: Optional[List[str]] = None) -> packs.TestReport:
+        cmds = list(commands) if commands is not None else self._determine_test_commands(profile=profile)
+
+        if cmds == ["mock"]:
+            return packs.TestReport(
+                commands=["mock"],
+                results=[packs.TestResult(command="mock", returncode=0, passed=True, stdout="", stderr="")],
+                passed=True,
+                blockers=[],
+                pointers=[],
+            )
+
+        if not cmds:
+            return packs.TestReport(commands=[], results=[], passed=True, blockers=[], pointers=[])
 
         results: List[packs.TestResult] = []
         blockers: List[str] = []
         pointers: List[str] = []
-        for cmd in commands:
+        for cmd in cmds:
             r = self.toolbox.run_cmd(agent_id="qa", cmd=cmd, cwd=self.repo_root, timeout_s=1800)
             passed = r.returncode == 0
-            results.append(packs.TestResult(command=cmd, returncode=r.returncode, passed=passed, stdout=r.stdout, stderr=r.stderr, meta=r.meta))
+            results.append(
+                packs.TestResult(command=cmd, returncode=r.returncode, passed=passed, stdout=r.stdout, stderr=r.stderr, meta=r.meta)
+            )
             pointers.extend([r.stdout, r.stderr, r.meta])
             if not passed:
                 blockers.append(f"Command failed: {cmd}")
 
-        return packs.TestReport(commands=commands, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
+        return packs.TestReport(commands=cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
     def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None, style: Optional[str] = None) -> RunResult:
         task_evt = self._find_task(task_id)
@@ -584,26 +637,44 @@ class Orchestrator:
 
         # QA
         qa_profile = "smoke" if route_level == "L0" else ("unit" if route_level == "L1" else "full")
+        qa_commands = self._determine_test_commands(profile=qa_profile)
+        mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
+        if mock_mode:
+            test_run_summary = "mock: tests skipped"
+        elif not qa_commands:
+            test_run_summary = "No QA commands detected; skipping tests"
+        else:
+            test_run_summary = f"Running tests ({qa_profile})"
         self._append_guarded(
             event=new_event(
                 agent="qa",
                 type="TEST_RUN",
-                summary="mock: tests skipped" if os.getenv("VIBE_MOCK_MODE", "").strip() == "1" else f"Running tests ({qa_profile})",
+                summary=test_run_summary,
                 branch_id=self.branch_id,
                 pointers=[],
-                meta={"profile": qa_profile, "route_level": route_level, "style": resolved_style},
+                meta={"profile": qa_profile, "commands": qa_commands, "route_level": route_level, "style": resolved_style},
             ),
             activated_agents=activated_agents,
         )
-        report = self._run_tests(profile=qa_profile)
+        report = self._run_tests(profile=qa_profile, commands=qa_commands)
         self._append_guarded(
             event=new_event(
                 agent="qa",
                 type="TEST_PASSED" if report.passed else "TEST_FAILED",
-                summary="Tests passed" if report.passed else "Tests failed",
+                summary=(
+                    "No QA commands detected; tests skipped"
+                    if (not mock_mode and not report.commands)
+                    else ("Tests passed" if report.passed else "Tests failed")
+                ),
                 branch_id=self.branch_id,
                 pointers=report.pointers,
-                meta={"blockers": report.blockers, "profile": qa_profile, "route_level": route_level, "style": resolved_style},
+                meta={
+                    "blockers": report.blockers,
+                    "profile": qa_profile,
+                    "commands": report.commands,
+                    "route_level": route_level,
+                    "style": resolved_style,
+                },
             ),
             activated_agents=activated_agents,
         )
