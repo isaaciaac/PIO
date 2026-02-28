@@ -93,7 +93,7 @@ vibe run --mock --mock-writes
 - `--route L0`：极速路径（仅 smoke 验证；检查点一定是 `green=false` / draft）
 - `--route L1`：标准路径（PM→Router→Coder→QA；通过才允许 `green=true`）
 
-> 说明：`L2+` 的门禁流程会在后续 Phase 补齐；当前选择 `L2/L3/L4` 会报 “not implemented yet”。
+> 说明：当前已实现 `L0/L1/L2`；`L3/L4` 会报 “not implemented yet”。
 
 ## 权限模式（允许 / 每次提示 / 仅聊天）
 

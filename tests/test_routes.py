@@ -93,3 +93,27 @@ def test_cli_run_mock_route_auto_creates_green_checkpoint(tmp_path: Path, monkey
     assert "AGENTS_ACTIVATED" in types
     assert "CHECKPOINT_CREATED" in types
 
+
+def test_cli_run_mock_route_L2_runs_review_and_creates_green_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = runner.invoke(app, ["task", "add", "hello"])
+    assert r2.exit_code == 0, r2.output
+
+    r3 = runner.invoke(app, ["run", "--mock", "--route", "L2"])
+    assert r3.exit_code == 0, r3.output
+    ckpt_id = r3.output.strip()
+
+    cps = CheckpointsStore(tmp_path)
+    cp = cps.get(ckpt_id)
+    assert cp.green is True
+    assert cp.meta.get("route_level") == "L2"
+
+    types = _ledger_types(tmp_path)
+    assert "USECASES_DEFINED" in types
+    assert "ADR_ADDED" in types
+    assert "REVIEW_PASSED" in types
