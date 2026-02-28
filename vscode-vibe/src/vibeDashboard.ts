@@ -115,7 +115,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       id: newId("m"),
       role: "system",
       title: "Vibe",
-      text: "仅聊天模式：可选择角色（PM/架构/安全/工程等）对话；授权模式：只与 PM 对话并可执行工作流。开始执行：执行（或 /run）。清空草稿：取消（或 /cancel）。",
+      text: "聊天模式：可选择角色（PM/架构/安全/工程等）对话；写项目模式：发送即执行工作流（会自动创建任务并运行）。清空草稿：取消（或 /cancel）。",
       ts: Date.now(),
     },
   ];
@@ -337,7 +337,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         policyOverride,
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
-      this.addMessage("assistant", `已创建任务：${taskId}`, "任务");
 
       const runArgs = ["run", "--task", taskId, "--path", root, "--route", route || "auto"];
       if (mock) runArgs.push("--mock");
@@ -353,7 +352,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const checkpointId = lastNonEmptyLine(runRes.stdout) || "(unknown_checkpoint_id)";
       const cp = await readCheckpoint(root, checkpointId);
       const events = await readLedgerEventsSince(root, before);
-      this.addMessage("assistant", formatRunSummary(checkpointId, cp?.green, events), "工作流");
+      const summaryLines: string[] = [];
+      summaryLines.push(`任务：${taskId}`);
+      summaryLines.push("");
+      summaryLines.push(formatRunSummary(checkpointId, cp?.green, events));
+      this.addMessage("assistant", summaryLines.join("\n").trim(), "工作流");
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
@@ -384,7 +387,20 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     if (this.isCancelCommand(text)) {
       this.draftParts = [];
       this.draftHinted = false;
-      this.addMessage("assistant", "已清空当前草稿。继续描述你的需求，或发送：执行", "系统");
+      this.addMessage("assistant", "已清空当前草稿。继续描述你的需求即可。", "系统");
+      return;
+    }
+
+    if (policyOverride === "chat_only") {
+      const inline = this.parseInlineRun(text);
+      if (inline.isRun) {
+        this.addMessage("user", text);
+        this.addMessage("assistant", "当前是聊天模式，不能执行工作流。请切换到「确认权限」或「完全授权」后再发送需求。", "系统");
+        return;
+      }
+      const chatAgent = agent || "pm";
+      await this.handleAgentChat(root, chatAgent, text, mock, policyOverride, style);
+      this.draftParts.push(text);
       return;
     }
 
@@ -393,7 +409,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       this.addMessage("user", text);
       const taskText = (inline.taskText ?? this.draftParts.join("\n\n")).trim();
       if (!taskText) {
-        this.addMessage("assistant", "当前没有可执行的草稿。请先描述你要做的改动，然后再发送：执行", "系统");
+        this.addMessage("assistant", "当前没有可执行的草稿。请先描述你的需求，或直接发送一段完整需求来执行。", "系统");
         return;
       }
       await this.handleWorkflowRun(root, taskText, mock, policyOverride, route, style);
@@ -402,24 +418,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // Authorized modes always talk to PM; chat_only can pick an agent.
-    const chatAgent = policyOverride === "chat_only" ? (agent || "pm") : "pm";
-    await this.handleAgentChat(root, chatAgent, text, mock, policyOverride, style);
-
-    // Build a runnable draft in parallel with the conversation.
-    this.draftParts.push(text);
-
-    // If user is in a write-capable mode, guide them to run explicitly.
-    if (policyOverride === "prompt" || policyOverride === "allow_all") {
-      if (!this.draftHinted) {
-        this.draftHinted = true;
-        this.addMessage(
-          "assistant",
-          "已进入写项目模式：你可以继续补充需求/回答追问。确认要开始执行工作流时，请发送：执行（或 /run）。清空草稿：取消（或 /cancel）。",
-          "系统"
-        );
-      }
-    }
+    this.addMessage("user", text);
+    await this.handleWorkflowRun(root, text, mock, policyOverride, route, style);
+    this.draftParts = [];
+    this.draftHinted = false;
   }
 
   private renderHtml(): string {
