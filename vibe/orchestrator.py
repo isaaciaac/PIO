@@ -19,6 +19,7 @@ from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route, detect_risks
+from vibe.routes import RiskSignals
 from vibe.context import effective_context_config, read_memory_records
 from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
@@ -124,12 +125,74 @@ class Orchestrator:
         except Exception:
             return DiffStats()
 
+    def _contains_any(self, text: str, needles: List[str]) -> bool:
+        t = text or ""
+        for n in needles:
+            if n and n in t:
+                return True
+        return False
+
+    def _select_primary_coder(self, *, task_text: str, risks: RiskSignals, activated_agents: Set[str]) -> str:
+        # Prefer integrator for cross-module changes when available.
+        if risks.cross_module and "integration_engineer" in activated_agents:
+            return "integration_engineer"
+
+        # Prefer frontend coder for clearly-frontend tasks (when available).
+        if "coder_frontend" in activated_agents:
+            front_words = ["前端", "UI", "界面", "React", "Vite", "TypeScript", "TSX", "组件", "页面"]
+            back_words = ["后端", "接口", "API", "数据库", "迁移", "服务端", "Server", "Express", "FastAPI"]
+            if self._contains_any(task_text, front_words) and not self._contains_any(task_text, back_words):
+                return "coder_frontend"
+
+        return "coder_backend"
+
+    def _select_fix_coder_for_tests(self, *, report: packs.TestReport, blocker_text: str, activated_agents: Set[str]) -> str:
+        text = (blocker_text or "").lower()
+        cmd = ""
+        try:
+            for r in report.results:
+                if not r.passed:
+                    cmd = (r.command or "").lower()
+                    break
+        except Exception:
+            cmd = ""
+        combined = (cmd + "\n" + text).lower()
+
+        front = any(k in combined for k in ["tsc", "typescript", ".tsx", ".jsx", "vite", "react", "eslint", "client/", "frontend/", "web/"])
+        back = any(k in combined for k in ["pytest", "unittest", "backend/", "server/", "fastapi", "django", "flask", "express", "prisma"])
+
+        if front and back and "integration_engineer" in activated_agents:
+            return "integration_engineer"
+        if front and "coder_frontend" in activated_agents:
+            return "coder_frontend"
+        return "coder_backend"
+
+    def _select_fix_coder_for_review(self, *, review: Optional[packs.ReviewReport], activated_agents: Set[str]) -> str:
+        text = " ".join(list(review.blockers or []) if review is not None else []).lower()
+        if "integration_engineer" in activated_agents and any(k in text for k in ["contract", "契约", "route", "router", "mismatch", "integration", "兼容"]):
+            return "integration_engineer"
+        if "coder_frontend" in activated_agents and any(k in text for k in ["tsx", "react", "frontend", "vite"]):
+            return "coder_frontend"
+        return "coder_backend"
+
     def _agents_for_route(self, route_level: packs.RouteLevel) -> list[str]:
         profile = (self.config.routes.levels or {}).get(route_level)
         agents = list(profile.agents) if profile else []
         if not agents:
             # Backward compatible fallback: treat as L1 minimal set.
             agents = ["pm", "router", "coder_backend", "qa"] if route_level != "L0" else ["router", "coder_backend", "qa"]
+
+        # Helper coders (hard logic): keep routes fixed while enabling better error triage.
+        # These agents are only invoked when needed; activating them upfront keeps ledger
+        # permissions auditable without mid-run escalation.
+        if route_level != "L0":
+            for extra in ["coder_frontend"]:
+                if extra in self.config.agents and extra not in agents:
+                    agents.append(extra)
+        if route_level in {"L2", "L3", "L4"}:
+            for extra in ["integration_engineer"]:
+                if extra in self.config.agents and extra not in agents:
+                    agents.append(extra)
         # Router is mandatory for ledger/gates.
         if "router" not in agents:
             agents = ["router", *agents]
@@ -284,14 +347,14 @@ class Orchestrator:
             tail = "…（已截断）…\n" + tail
         return tail.strip()
 
-    def _materialize_code_change(self, change: packs.CodeChange) -> Tuple[packs.CodeChange, List[str]]:
+    def _materialize_code_change(self, change: packs.CodeChange, *, actor_agent_id: str = "coder_backend") -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
         if change.writes:
             for w in change.writes:
                 rel = (w.path or "").replace("\\", "/").lstrip("/")
                 if rel.startswith(".vibe/") or rel.startswith(".git/"):
                     raise RuntimeError(f"Refusing to write internal path: {w.path}")
-                ptr = self.toolbox.write_file(agent_id="coder_backend", path=w.path, content=w.content)
+                ptr = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=w.content)
                 write_pointers.append(ptr)
 
             if not change.files_changed:
@@ -361,7 +424,7 @@ class Orchestrator:
                 patch_path = change.patch_pointer.split("@sha256:", 1)[0]
                 abs_patch = (self.repo_root / patch_path).resolve()
                 r = self.toolbox.run_cmd(
-                    agent_id="coder_backend",
+                    agent_id=actor_agent_id,
                     cmd=["git", "apply", "--whitespace=nowarn", str(abs_patch)],
                     cwd=self.repo_root,
                     timeout_s=600,
@@ -585,7 +648,9 @@ class Orchestrator:
         req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in activated_agents else None
         architect = self._agent("architect") if "architect" in activated_agents else None
         api_confirm = self._agent("api_confirm") if "api_confirm" in activated_agents else None
-        coder = self._agent("coder_backend")
+        coder_backend = self._agent("coder_backend")
+        coder_frontend = self._agent("coder_frontend") if "coder_frontend" in activated_agents else None
+        integrator = self._agent("integration_engineer") if "integration_engineer" in activated_agents else None
         reviewer = self._agent("code_reviewer") if "code_reviewer" in activated_agents else None
 
         ctx, ctx_excerpts = self._build_context_packet()
@@ -771,6 +836,20 @@ class Orchestrator:
             activated_agents=activated_agents,
         )
 
+        primary_coder_id = self._select_primary_coder(task_text=task_text, risks=risks, activated_agents=activated_agents)
+        if primary_coder_id == "coder_frontend" and coder_frontend is None:
+            primary_coder_id = "coder_backend"
+        if primary_coder_id == "integration_engineer" and integrator is None:
+            primary_coder_id = "coder_backend"
+
+        primary_coder = (
+            coder_frontend
+            if primary_coder_id == "coder_frontend" and coder_frontend is not None
+            else integrator
+            if primary_coder_id == "integration_engineer" and integrator is not None
+            else coder_backend
+        )
+
         coder_user = (
             f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
             if req is not None
@@ -784,10 +863,18 @@ class Orchestrator:
             coder_user = f"{coder_user}\n\nDecisionPack:\n{decisions.model_dump_json()}"
         if contract is not None:
             coder_user = f"{coder_user}\n\nContractPack:\n{contract.model_dump_json()}"
+        coder_role = "Coder"
+        if primary_coder_id == "coder_frontend":
+            coder_role = "Frontend Coder (React/TypeScript)"
+        elif primary_coder_id == "integration_engineer":
+            coder_role = "Integration Engineer (align frontend/backend/contracts)"
+        elif primary_coder_id == "coder_backend":
+            coder_role = "Backend Coder"
+
         coder_msgs = self._messages_with_memory(
-            agent_id="coder_backend",
+            agent_id=primary_coder_id,
             system=(
-                "You are Coder. Return JSON only for CodeChange with fields: "
+                f"You are {coder_role}. Return JSON only for CodeChange with fields: "
                 "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
                 "Each writes item must include the full file content. No extra keys. No markdown."
@@ -796,12 +883,12 @@ class Orchestrator:
             ),
             user=coder_user,
         )
-        change, _change_meta = coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
-        change, write_pointers = self._materialize_code_change(change)
+        change, _change_meta = primary_coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
+        change, write_pointers = self._materialize_code_change(change, actor_agent_id=primary_coder_id)
 
         self._append_guarded(
             event=new_event(
-                agent="coder_backend",
+                agent=primary_coder_id,
                 type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                 summary=change.summary,
                 branch_id=self.branch_id,
@@ -1014,6 +1101,46 @@ class Orchestrator:
                     if excerpt:
                         blocker_text = f"{blocker_text}\n\n{excerpt}"
 
+                if blocker_source == "review":
+                    fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=activated_agents)
+                else:
+                    fix_coder_id = self._select_fix_coder_for_tests(
+                        report=report, blocker_text=blocker_text, activated_agents=activated_agents
+                    )
+
+                if fix_coder_id == "coder_frontend" and coder_frontend is None:
+                    fix_coder_id = "coder_backend"
+                if fix_coder_id == "integration_engineer" and integrator is None:
+                    fix_coder_id = "coder_backend"
+
+                fix_coder = (
+                    coder_frontend
+                    if fix_coder_id == "coder_frontend" and coder_frontend is not None
+                    else integrator
+                    if fix_coder_id == "integration_engineer" and integrator is not None
+                    else coder_backend
+                )
+
+                # Audit: record which agent is handling this fix-loop step.
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="STATE_TRANSITION",
+                        summary=f"Fix-loop {loop}: dispatch to {fix_coder_id}",
+                        branch_id=self.branch_id,
+                        pointers=[],
+                        meta={
+                            "phase": "fix_loop",
+                            "loop": loop,
+                            "blocker_source": blocker_source,
+                            "fix_agent": fix_coder_id,
+                            "route_level": route_level,
+                            "style": resolved_style,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+
                 fix_user = (
                     f"BlockerSource: {blocker_source}\n"
                     f"Blocker:\n{blocker_text}\n\n"
@@ -1027,21 +1154,29 @@ class Orchestrator:
                 )
                 if ctx_excerpts:
                     fix_user = f"{fix_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+
+                fix_role = "Coder"
+                if fix_coder_id == "coder_frontend":
+                    fix_role = "Frontend Coder (React/TypeScript)"
+                elif fix_coder_id == "integration_engineer":
+                    fix_role = "Integration Engineer (align frontend/backend/contracts)"
+                elif fix_coder_id == "coder_backend":
+                    fix_role = "Backend Coder"
                 fix_msgs = self._messages_with_memory(
-                    agent_id="coder_backend",
+                    agent_id=fix_coder_id,
                     system=(
-                        "You are Coder. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
+                        f"You are {fix_role}. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
                         "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                         "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
                         f"{workflow_hint}"
                     ),
                     user=fix_user,
                 )
-                change, _ = coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
-                change, write_pointers = self._materialize_code_change(change)
+                change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
+                change, write_pointers = self._materialize_code_change(change, actor_agent_id=fix_coder_id)
                 self._append_guarded(
                     event=new_event(
-                        agent="coder_backend",
+                        agent=fix_coder_id,
                         type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
