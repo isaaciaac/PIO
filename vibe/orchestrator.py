@@ -17,6 +17,7 @@ from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route
+from vibe.context import effective_context_config, read_memory_records
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,38 @@ class Orchestrator:
             if event.type not in allowed:
                 raise RuntimeError(f"Ledger write type not allowed for agent {event.agent}: {event.type}")
         self.ledger.append(event)
+
+    def _agent_memory_system(self, agent_id: str) -> Optional[str]:
+        view_dir = self.repo_root / ".vibe" / "views" / agent_id
+        mem_path = view_dir / "memory.jsonl"
+        if not mem_path.exists():
+            return None
+        ctx_cfg = effective_context_config(self.config, agent_id=agent_id)
+        limit = max(0, min(int(ctx_cfg.keep_last_digests) * 3, 24))
+        recs = read_memory_records(mem_path, limit=limit)
+        if not recs:
+            return None
+        take = recs[-max(1, int(ctx_cfg.keep_last_digests)) :]
+        lines: list[str] = []
+        lines.append("以下是该工种的结构化记忆摘要（来自 .vibe/views/<agent>/memory.jsonl；事实以 pointers 展开为准）：")
+        for r in take:
+            pinned = [s for s in (r.digest.pinned or [])][:3]
+            pin = ("；".join(pinned))[:240] if pinned else ""
+            ptrs = ", ".join(list(r.pointers or [])[:2])
+            lines.append(f"- {r.digest.summary.strip()[:200]}")
+            if pin:
+                lines.append(f"  要点: {pin}")
+            if ptrs:
+                lines.append(f"  pointers: {ptrs}")
+        return "\n".join(lines).strip()
+
+    def _messages_with_memory(self, *, agent_id: str, system: str, user: str) -> list[dict[str, str]]:
+        msgs: list[dict[str, str]] = [{"role": "system", "content": system}]
+        mem_text = self._agent_memory_system(agent_id)
+        if mem_text:
+            msgs.append({"role": "system", "content": mem_text})
+        msgs.append({"role": "user", "content": user})
+        return msgs
 
     def _run_tests(self, *, profile: str) -> packs.TestReport:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
@@ -251,14 +284,19 @@ class Orchestrator:
         if route_level != "L0":
             if not pm:
                 raise RuntimeError("pm must be activated for L1+ routes")
-            req, _req_meta = pm.chat_json(
-                schema=packs.RequirementPack,
+            pm_msgs = self._messages_with_memory(
+                agent_id="pm",
                 system=(
                     "You are PM. Return JSON only for RequirementPack with fields: "
                     "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
                     "No extra keys. No wrapping object. No markdown."
                 ),
                 user=f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}",
+            )
+            req, _req_meta = pm.chat_json(
+                schema=packs.RequirementPack,
+                messages=pm_msgs,
+                user=task_text,
             )
             self._append_guarded(
                 event=new_event(
@@ -277,12 +315,17 @@ class Orchestrator:
             if req is not None
             else f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
         )
-        plan, _plan_meta = router.chat_json(
-            schema=packs.Plan,
+        router_msgs = self._messages_with_memory(
+            agent_id="router",
             system=(
                 "You are Router. Return JSON only for Plan: {tasks:[{id,title,agent,description}]}. "
                 "No extra keys. No markdown."
             ),
+            user=plan_user,
+        )
+        plan, _plan_meta = router.chat_json(
+            schema=packs.Plan,
+            messages=router_msgs,
             user=plan_user,
         )
         self._append_guarded(
@@ -297,19 +340,21 @@ class Orchestrator:
             activated_agents=activated_agents,
         )
 
-        change, _change_meta = coder.chat_json(
-            schema=packs.CodeChange,
+        coder_user = (
+            f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            if req is not None
+            else f"Task:\n{task_text}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+        )
+        coder_msgs = self._messages_with_memory(
+            agent_id="coder_backend",
             system=(
                 "You are Coder. Return JSON only for CodeChange with fields: "
                 "kind ('commit'|'patch'|'noop'), summary, commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "No extra keys. No markdown."
             ),
-            user=(
-                f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
-                if req is not None
-                else f"Task:\n{task_text}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
-            ),
+            user=coder_user,
         )
+        change, _change_meta = coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
         if change.kind == "noop" or not change.patch_pointer:
             patch_ptr = self.artifacts.put_text("mock: no code changes", suffix=".patch.txt", kind="patch").to_pointer()
             change = packs.CodeChange(kind="patch", summary=change.summary or "mock patch", patch_pointer=patch_ptr, files_changed=change.files_changed)
