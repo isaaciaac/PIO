@@ -49,6 +49,8 @@ export async function runVibeCapture(args: string[], options: RunVibeCaptureOpti
   // Force UTF-8 for stdout/stderr so the VS Code Output + webview can decode consistently.
   if (!env.PYTHONUTF8) env.PYTHONUTF8 = "1";
   if (!env.PYTHONIOENCODING) env.PYTHONIOENCODING = "utf-8";
+  // Let the CLI tailor UX hints (e.g. "reply 执行") when invoked from VS Code.
+  env.VIBE_CLIENT = "vscode";
   if (options.mock) {
     env.VIBE_MOCK_MODE = "1";
   }

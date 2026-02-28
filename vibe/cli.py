@@ -354,6 +354,7 @@ def chat(
             pass
 
         for rel in [
+            ".vibe/manifests/vibe_system.md",
             ".vibe/manifests/repo_overview.md",
             ".vibe/manifests/run_manifest.md",
             ".vibe/manifests/project_manifest.md",
@@ -381,11 +382,26 @@ def chat(
 
     repo_context_text = "\n".join(repo_chunks).strip()
     ledger_context_text = "\n".join(ledger_lines).strip()
+    client = (os.getenv("VIBE_CLIENT") or "").strip().lower()
+    vscode_env = bool(os.getenv("VSCODE_PID") or (os.getenv("TERM_PROGRAM") or "").strip().lower() == "vscode")
+    if client == "vscode" or vscode_env:
+        exec_hint = (
+            "如果用户希望你继续动手写项目：提示用户在 VS Code 的「写项目模式」直接回复「执行/执行吧/开始执行」即可触发工作流，"
+            "不要让用户去手敲命令。"
+        )
+    else:
+        exec_hint = (
+            "如果用户希望你继续动手写项目：提示用户在终端运行 `vibe task add \"...\"` 然后 `vibe run`；"
+            "或在 VS Code 写项目模式回复「执行」。"
+        )
+
     system = (
         f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
         "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
-        "重要：你现在只是在“对话”模式下回答问题，不能真的运行命令、修改文件、创建分支或提交代码。"
-        "不要声称“已经生成/已经创建/已经运行/已经修改”。如果需要执行：在 VS Code 写项目模式下，提示用户回复「执行/执行吧/开始执行」来触发工作流；在终端则提示用户运行 `vibe run`。\n\n"
+        "重要：你现在只是在“对话”模式下回答问题，不能直接运行命令、修改文件、创建分支或提交代码。"
+        "不要声称“已经生成/已经创建/已经运行/已经修改”。\n"
+        "当用户只是询问现状/进度/怎么运行/为什么失败时，你应直接基于可追溯事实片段回答，不要反复要求用户先运行什么。\n"
+        f"{exec_hint}\n\n"
         f"{style_text}\n\n"
         "硬约束：你必须只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
         "{reply: string, suggested_actions: string[], pointers: string[]}。\n"

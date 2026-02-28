@@ -33,16 +33,25 @@ class MockProvider:
                 constraints=["VIBE_MOCK_MODE=1"],
             )
         elif schema is schemas.ChatReply:
+            client = (os.getenv("VIBE_CLIENT") or "").strip().lower()
+            vscode_env = bool(os.getenv("VSCODE_PID") or (os.getenv("TERM_PROGRAM") or "").strip().lower() == "vscode")
+            if client == "vscode" or vscode_env:
+                actions = [
+                    "如果要改代码：切到写项目模式后，直接回复「执行」即可触发工作流",
+                    "如果只想咨询用法：继续在聊天模式提问即可",
+                ]
+            else:
+                actions = [
+                    "如果要改代码：执行 `vibe task add \"...\"` 然后 `vibe run`",
+                    "如果只想咨询用法：继续在聊天模式提问即可",
+                ]
             out = schemas.ChatReply(
                 reply=(
                     "（mock）我是 Vibe 的产品经理（PM）代理：我可以帮你澄清需求、给出验收标准（AC）、"
                     "列出约束/非目标，并指导你如何用 `vibe` 在当前项目里跑起多代理工作流。\n\n"
                     f"你刚刚说：{last_user.strip()[:200]}"
                 ),
-                suggested_actions=[
-                    "如果要改代码：用侧边栏切到 Workflow 模式，或执行 `vibe task add \"...\"` 然后 `vibe run`",
-                    "如果只想咨询用法：继续在 Chat 模式提问即可",
-                ],
+                suggested_actions=actions,
                 pointers=[],
             )
         elif schema is schemas.Plan:

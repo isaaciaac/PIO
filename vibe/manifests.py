@@ -100,9 +100,50 @@ def generate_run_manifest(repo_root: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def generate_vibe_system_manifest(repo_root: Path) -> str:
+    """
+    A self-describing manifest so agents can understand how Vibe operates
+    in the current workspace. This is intentionally short and actionable.
+    """
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return (
+        "# Vibe System Manifest\n\n"
+        f"- Generated at: `{ts}`\n"
+        f"- Workspace: `{repo_root}`\n\n"
+        "## 目录结构（.vibe）\n\n"
+        "- `.vibe/vibe.yaml`：配置（providers/agents/routes/policy）\n"
+        "- `.vibe/ledger.jsonl`：事件账本（JSONL 追加写）\n"
+        "- `.vibe/artifacts/`：命令输出/patch/报告等工件（内容寻址去重）\n"
+        "- `.vibe/checkpoints.json`：检查点（green/restore_steps/meta）\n"
+        "- `.vibe/views/<agent_id>/`：各工种的记忆域（memory.jsonl/bookmarks/rollbacks）\n"
+        "- `.vibe/manifests/`：派生索引（project/run/repo_overview 等）\n\n"
+        "## 三种权限模式（policy.mode）\n\n"
+        "- `chat_only`：仅聊天（不运行本地命令、不写代码）\n"
+        "- `prompt`：逐项询问授权（每次工具调用都会弹窗确认/拒绝）\n"
+        "- `allow_all`：完全授权（不询问，按策略自动执行）\n\n"
+        "## 路由等级（L0–L4）\n\n"
+        "- `L0`：极速草稿（router/coder_backend/qa(smoke)；不标绿）\n"
+        "- `L1`：标准默认（pm/router/coder_backend/qa(unit+lint)；通过才 green）\n"
+        "- `L2`：安全路径（加 requirements_analyst/architect/api_confirm/code_reviewer；必须 review；QA 升级）\n"
+        "- `L3`：发布路径（加 env/security/doc/release 等交付门禁）\n"
+        "- `L4`：全路径（含 perf/compliance/runbook 等高风险门禁）\n\n"
+        "## VS Code / 终端如何触发执行\n\n"
+        "- VS Code（写项目模式）：先对话梳理需求；需要执行时直接回复「执行/执行吧/开始执行」。系统会自动：\n"
+        "  1) `vibe task add ...` 写入任务；2) `vibe run` 运行工作流；3) 产出 checkpoint + ledger 事件。\n"
+        "- 终端：\n"
+        "  - 初始化：`vibe init`\n"
+        "  - 添加任务：`vibe task add \"...\"`\n"
+        "  - 执行工作流：`vibe run --route auto`\n\n"
+        "## 事实与审计规则（非常重要）\n\n"
+        "- 禁止“装跑”：任何声称运行过命令，必须来自 `cmd.run` 的真实 stdout/stderr，并保存到 artifacts。\n"
+        "- 事实源必须可追溯：文件指针（path#Lx-Ly@sha256）、artifact 指针、git commit/ref。\n"
+        "- 如果工作流修复循环结束仍存在阻塞，会创建非绿灯检查点（reason=`fix_loop_blockers`），供继续修复。\n"
+    )
+
+
 def write_manifests(repo_root: Path) -> None:
     vibe_dir = repo_root / ".vibe" / "manifests"
     vibe_dir.mkdir(parents=True, exist_ok=True)
     (vibe_dir / "project_manifest.md").write_text(generate_project_manifest(repo_root), encoding="utf-8")
     (vibe_dir / "run_manifest.md").write_text(generate_run_manifest(repo_root), encoding="utf-8")
-
+    (vibe_dir / "vibe_system.md").write_text(generate_vibe_system_manifest(repo_root), encoding="utf-8")

@@ -207,6 +207,30 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     return t === "取消" || t === "清空" || t === "/cancel" || t === "cancel";
   }
 
+  private isConfirmToExecute(text: string): boolean {
+    const raw = String(text || "").trim();
+    if (!raw) return false;
+    const compact = raw.replace(/[，,。.;；!！?？\s]+/g, "").toLowerCase();
+    if (!compact) return false;
+
+    // Pure confirmations (often sent after PM asks to execute).
+    const re =
+      /^(?:好|好的|可以|行|没问题|ok|okay|开始|继续|来吧|走起|搞起|开干|开工)(?:吧|呀|呢|啦|哈|呗|嘛|哦|噢|一下|下|就|现在|立刻|马上|走起)*$/i;
+    return re.test(compact);
+  }
+
+  private lastAssistantMentionsExecute(): boolean {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role !== "assistant") continue;
+      const t = String(m.text || "");
+      if (!t) return false;
+      const low = t.toLowerCase();
+      return t.includes("执行") || low.includes("/run") || low.includes("vibe run") || t.includes("工作流");
+    }
+    return false;
+  }
+
   private shouldAutoRunWorkflow(text: string): boolean {
     const raw = String(text || "").trim();
     if (!raw) return false;
@@ -813,6 +837,22 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         this.addMessage("assistant", "当前没有可执行的草稿。请先描述你的需求，或直接发送一段完整需求来执行。", "系统");
         return;
       }
+      await this.handleWorkflowRun(root, taskText, mock, policyOverride, route, style);
+      this.draftParts = [];
+      this.draftHinted = false;
+      return;
+    }
+
+    // In fully authorized mode, allow a short "OK/好" to start execution when we already have a draft,
+    // and the assistant just asked the user to execute.
+    if (
+      policyOverride === "allow_all" &&
+      this.draftParts.length > 0 &&
+      this.isConfirmToExecute(text) &&
+      this.lastAssistantMentionsExecute()
+    ) {
+      const taskText = this.draftParts.join("\n\n").trim();
+      this.addMessage("user", text);
       await this.handleWorkflowRun(root, taskText, mock, policyOverride, route, style);
       this.draftParts = [];
       this.draftHinted = false;
