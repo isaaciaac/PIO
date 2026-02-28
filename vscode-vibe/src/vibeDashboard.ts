@@ -54,7 +54,15 @@ async function readCheckpoint(workspaceRoot: string, id: string): Promise<any | 
   }
 }
 
-type LedgerEvent = { id?: string; ts?: string; agent?: string; type?: string; summary?: string };
+type LedgerEvent = {
+  id?: string;
+  ts?: string;
+  agent?: string;
+  type?: string;
+  summary?: string;
+  pointers?: string[];
+  meta?: any;
+};
 
 async function readLedgerEventsSince(workspaceRoot: string, startLine: number): Promise<LedgerEvent[]> {
   const ledgerPath = vscode.Uri.file(path.join(workspaceRoot, ".vibe", "ledger.jsonl"));
@@ -108,6 +116,7 @@ function formatRunSummary(checkpointId: string, green: boolean | undefined, even
 export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private running = false;
+  private statusText = "";
   private draftParts: string[] = [];
   private draftHinted = false;
   private messages: ChatMessage[] = [
@@ -245,7 +254,249 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postState(): void {
-    this.view?.webview.postMessage({ type: "state", running: this.running, messages: this.messages, ts: Date.now() });
+    this.view?.webview.postMessage({
+      type: "state",
+      running: this.running,
+      statusText: this.statusText,
+      messages: this.messages,
+      ts: Date.now(),
+    });
+  }
+
+  private setStatus(text: string): void {
+    const t = String(text || "").trim();
+    if (this.statusText === t) return;
+    this.statusText = t;
+    this.postState();
+  }
+
+  private stagesForAgents(agents: string[]): { key: string; label: string; types: string[] }[] {
+    const a = new Set((agents || []).map((x) => String(x).trim()).filter(Boolean));
+    const stages: { key: string; label: string; types: string[] }[] = [
+      { key: "route", label: "路由选择", types: ["ROUTE_SELECTED", "AGENTS_ACTIVATED"] },
+      { key: "context", label: "构建上下文", types: ["CONTEXT_PACKET_BUILT"] },
+    ];
+    if (a.has("pm")) stages.push({ key: "req", label: "需求/验收", types: ["AC_DEFINED", "REQ_CREATED", "REQ_UPDATED"] });
+    if (a.has("requirements_analyst")) stages.push({ key: "usecases", label: "用例分析", types: ["USECASES_DEFINED"] });
+    if (a.has("architect")) stages.push({ key: "adr", label: "架构/ADR", types: ["ADR_ADDED", "ARCH_UPDATED"] });
+    if (a.has("api_confirm")) stages.push({ key: "contract", label: "契约确认", types: ["CONTRACT_CONFIRMED", "CONTRACT_CHANGED"] });
+    stages.push({ key: "plan", label: "规划", types: ["PLAN_CREATED"] });
+    stages.push({ key: "impl", label: "实现", types: ["PATCH_WRITTEN", "CODE_COMMIT", "CODE_REFACTOR"] });
+    stages.push({ key: "test", label: "测试", types: ["TEST_RUN", "TEST_PASSED", "TEST_FAILED"] });
+    if (a.has("code_reviewer")) stages.push({ key: "review", label: "代码审查", types: ["REVIEW_PASSED", "REVIEW_BLOCKED"] });
+    stages.push({ key: "checkpoint", label: "创建检查点", types: ["CHECKPOINT_CREATED"] });
+    return stages;
+  }
+
+  private startLedgerProgressWatcher(root: string, startLine: number): () => void {
+    const ledgerPath = vscode.Uri.file(path.join(root, ".vibe", "ledger.jsonl"));
+    let cursor = Math.max(0, startLine);
+    let stopped = false;
+    let inFlight = false;
+    let routeLevel = "";
+    let agents: string[] = [];
+    const seenTypes = new Set<string>();
+
+    const tick = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const raw = await readTextFile(ledgerPath);
+        const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
+        if (cursor >= lines.length) return;
+        const slice = lines.slice(cursor);
+        cursor = lines.length;
+
+        let last: LedgerEvent | undefined;
+        for (const line of slice) {
+          try {
+            const e: LedgerEvent = JSON.parse(line);
+            last = e;
+            const t = String(e.type || "").trim();
+            if (t) seenTypes.add(t);
+            if (t === "ROUTE_SELECTED") routeLevel = String(e.meta?.route_level || routeLevel || "").trim();
+            if (t === "AGENTS_ACTIVATED" && Array.isArray(e.meta?.agents)) {
+              agents = e.meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0);
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (!last) return;
+
+        const stages = this.stagesForAgents(agents);
+        let idx = -1;
+        for (let i = 0; i < stages.length; i++) {
+          if (stages[i].types.some((t) => seenTypes.has(t))) idx = i;
+        }
+        const stageLabel = idx >= 0 ? stages[idx].label : "启动";
+        const stepText = stages.length && idx >= 0 ? `进度：${idx + 1}/${stages.length} ${stageLabel}` : `进度：${stageLabel}`;
+        const who = this.agentTitle(String(last.agent || ""));
+        const evtType = String(last.type || "").trim();
+        const s = String(last.summary || "").trim();
+        const short = s.length > 60 ? `${s.slice(0, 60)}…` : s;
+        const routeText = routeLevel ? `（${routeLevel}）` : "";
+        const detail = evtType ? ` · 最近：${who} ${evtType}${short ? `：${short}` : ""}` : "";
+        this.setStatus(`${stepText}${routeText}${detail}`);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = setInterval(() => {
+      tick().catch(() => {});
+    }, 450);
+
+    tick().catch(() => {});
+
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }
+
+  private formatWorkflowNarrative(taskId: string, checkpointId: string, cp: any | undefined, events: LedgerEvent[]): string {
+    const green: boolean | undefined = typeof cp?.green === "boolean" ? Boolean(cp.green) : undefined;
+    const meta = (cp && typeof cp === "object" ? cp.meta : undefined) || {};
+
+    const styleRaw = String(meta?.style || "").trim();
+    const styleLabel =
+      styleRaw === "free" ? "自由发挥" : styleRaw === "detailed" ? "细致严谨" : styleRaw ? "平衡" : "";
+
+    let routeLevel = String(meta?.route_level || "").trim();
+    if (!routeLevel) {
+      const e = events.find((x) => String(x.type || "").trim() === "ROUTE_SELECTED");
+      routeLevel = String(e?.meta?.route_level || "").trim();
+    }
+    const routeLabel =
+      routeLevel === "L0"
+        ? "L0 极速（草稿）"
+        : routeLevel === "L1"
+          ? "L1 标准"
+          : routeLevel === "L2"
+            ? "L2 安全"
+            : routeLevel === "L3"
+              ? "L3 发布"
+              : routeLevel === "L4"
+                ? "L4 全路径"
+                : routeLevel
+                  ? routeLevel
+                  : "（未知）";
+
+    const agentIds: string[] = Array.isArray(meta?.agents)
+      ? meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+    const agentsText = agentIds.length ? agentIds.map((id) => this.agentTitle(id)).join("、") : "";
+
+    const lastByType = (types: string[]): LedgerEvent | undefined => {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const t = String(events[i].type || "").trim();
+        if (types.includes(t)) return events[i];
+      }
+      return undefined;
+    };
+
+    const coderEvt = lastByType(["PATCH_WRITTEN", "CODE_COMMIT", "CODE_REFACTOR"]);
+    const filesChanged: string[] = Array.isArray(coderEvt?.meta?.files_changed)
+      ? coderEvt!.meta.files_changed.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const qaEvt = lastByType(["TEST_PASSED", "TEST_FAILED"]);
+    const qaProfile = String(qaEvt?.meta?.profile || "").trim();
+    const qaCommands: string[] = Array.isArray(qaEvt?.meta?.commands)
+      ? qaEvt!.meta.commands.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+    const qaBlockers: string[] = Array.isArray(qaEvt?.meta?.blockers)
+      ? qaEvt!.meta.blockers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const reviewEvt = lastByType(["REVIEW_PASSED", "REVIEW_BLOCKED"]);
+    const reviewBlockers: string[] = Array.isArray(reviewEvt?.meta?.blockers)
+      ? reviewEvt!.meta.blockers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const reasonRaw = String(meta?.reason || "").trim();
+    const isDraft = Boolean(meta?.draft);
+    const reasonText =
+      isDraft
+        ? "这是 L0 草稿检查点，默认不标绿。"
+        : reasonRaw === "qa_no_commands"
+          ? "未检测到可执行的测试/校验命令（因此不算绿灯）。"
+          : reasonRaw === "chat_only"
+            ? "当前为仅聊天模式，不执行本地工具。"
+            : reasonRaw
+              ? `原因：${reasonRaw}`
+              : "";
+
+    const lines: string[] = [];
+    lines.push(`已完成工作流：任务 ${taskId}。`);
+    lines.push(`检查点：${checkpointId}（绿灯：${green === undefined ? "未知" : green ? "是" : "否"}）。`);
+    lines.push(`路由：${routeLabel}${styleLabel ? `；风格：${styleLabel}` : ""}`);
+    if (agentsText) lines.push(`启用角色：${agentsText}`);
+
+    if (coderEvt) {
+      const s = String(coderEvt.summary || "").trim();
+      const fileHint = filesChanged.length
+        ? `（影响 ${filesChanged.length} 个文件：${filesChanged.slice(0, 8).join("、")}${filesChanged.length > 8 ? "…" : ""}）`
+        : "";
+      lines.push(`代码变更：${s || "（无摘要）"}${fileHint}`);
+    }
+
+    if (qaEvt) {
+      const passed = String(qaEvt.type || "").trim() === "TEST_PASSED";
+      if (!qaCommands.length) {
+        lines.push(`测试：未执行（未检测到命令）。`);
+      } else {
+        const cmdHint = qaCommands.slice(0, 3).join("；") + (qaCommands.length > 3 ? "…" : "");
+        lines.push(`测试：${passed ? "通过" : "失败"}${qaProfile ? `（${qaProfile}）` : ""}；命令：${cmdHint}`);
+      }
+      if (!passed && qaBlockers.length) lines.push(`测试阻塞：${qaBlockers[0]}`);
+    }
+
+    if (reviewEvt) {
+      const passed = String(reviewEvt.type || "").trim() === "REVIEW_PASSED";
+      lines.push(`代码审查：${passed ? "通过" : "阻塞"}`);
+      if (!passed && reviewBlockers.length) lines.push(`审查阻塞：${reviewBlockers[0]}`);
+    }
+
+    if (green === false && reasonText) lines.push(`未绿灯说明：${reasonText}`);
+
+    lines.push("");
+    lines.push("关键事件：");
+    const filtered = events.filter((e) => String(e.agent || "").trim() !== "user");
+    const take = filtered.slice(Math.max(0, filtered.length - 10));
+    for (const e of take) {
+      const who = this.agentTitle(String(e.agent || ""));
+      const t = String(e.type || "").trim() || "事件";
+      const s = String(e.summary || "").trim();
+      const short = s.length > 80 ? `${s.slice(0, 80)}…` : s;
+      lines.push(`- ${who} ${t}${short ? `：${short}` : ""}`);
+    }
+    if (events.length > take.length) lines.push(`- ……（共 ${events.length} 条，详见账本）`);
+
+    const suggestions: string[] = [];
+    if (green === true) {
+      suggestions.push("可以继续补充需求或直接开始下一条任务；需要更严格门禁可把路由切到 L2/L3。");
+    } else if (green === false) {
+      if (isDraft) suggestions.push("这是 L0 草稿路线，想要绿灯请改用 L1/L2 后重跑。");
+      if (reasonRaw === "qa_no_commands") {
+        suggestions.push("当前项目未识别到可运行的测试/校验命令：如果是 Python/Node，请确保存在 `pyproject.toml`/`package.json` 或 `tests/`；否则请先补一个最小 smoke 命令后再跑。");
+      }
+      if (reviewEvt && String(reviewEvt.type || "").trim() === "REVIEW_BLOCKED") {
+        suggestions.push("存在审查阻塞：查看阻塞点后，继续发送“修复上述 blocker 并执行”。");
+      }
+      if (qaEvt && String(qaEvt.type || "").trim() === "TEST_FAILED") {
+        suggestions.push("存在测试阻塞：查看失败命令日志后，继续发送“修复测试并执行”。");
+      }
+    }
+
+    if (suggestions.length) {
+      lines.push("");
+      lines.push("建议：");
+      for (const s of suggestions) lines.push(`- ${s}`);
+    }
+
+    return lines.join("\n").trim();
   }
 
   private async ensureInit(root: string, envOverrides?: NodeJS.ProcessEnv): Promise<void> {
@@ -327,8 +578,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private async handleWorkflowRun(root: string, taskText: string, mock: boolean, policyOverride: string, route: string, style: string): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.setStatus("准备执行…");
     this.postState();
 
+    let stopWatcher: (() => void) | undefined;
     try {
       const envOverrides = await this.getEnvOverrides?.();
 
@@ -336,6 +589,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       const before = await countLedgerLines(root);
 
+      this.setStatus("正在创建任务…");
       const taskRes = await runVibeCapture(["task", "add", taskText, "--path", root], {
         cwd: root,
         mock: false,
@@ -346,25 +600,28 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
 
+      const runStart = await countLedgerLines(root);
+      stopWatcher = this.startLedgerProgressWatcher(root, runStart);
+      this.setStatus("正在运行工作流…");
       const runArgs = ["run", "--task", taskId, "--path", root, "--route", route || "auto"];
       if (mock) runArgs.push("--mock");
       if (style) runArgs.push("--style", style);
-      const runRes = await runVibeCapture(runArgs, {
-        cwd: root,
-        mock,
-        output: this.output,
-        title: mock ? "Vibe：运行（模拟）" : "Vibe：运行",
-        envOverrides,
-        policyOverride,
-      });
+      const runRes = await runVibeCapture(
+        runArgs,
+        {
+          cwd: root,
+          mock,
+          output: this.output,
+          title: mock ? "Vibe：运行（模拟）" : "Vibe：运行",
+          envOverrides,
+          policyOverride,
+        }
+      );
       const checkpointId = lastNonEmptyLine(runRes.stdout) || "(unknown_checkpoint_id)";
       const cp = await readCheckpoint(root, checkpointId);
       const events = await readLedgerEventsSince(root, before);
-      const summaryLines: string[] = [];
-      summaryLines.push(`任务：${taskId}`);
-      summaryLines.push("");
-      summaryLines.push(formatRunSummary(checkpointId, cp?.green, events));
-      this.addMessage("assistant", summaryLines.join("\n").trim(), "工作流");
+      const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events);
+      this.addMessage("assistant", narrative, "工作流");
     } catch (e) {
       if (e instanceof VibeRunError) {
         const hint =
@@ -377,7 +634,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         this.addMessage("assistant", message, "错误");
       }
     } finally {
+      stopWatcher?.();
+      stopWatcher = undefined;
       this.running = false;
+      this.setStatus("");
       this.postState();
     }
   }
@@ -709,7 +969,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           div.innerHTML = title + '<pre>' + escapeHtml(m.text || '') + '</pre>';
           elMessages.appendChild(div);
         }
-        elStatus.textContent = state.running ? '运行中…（详情见「输出」→ Vibe）' : '';
+        const st = (state && state.statusText) ? String(state.statusText) : '';
+        elStatus.textContent = state.running ? (st || '运行中…（详情见「输出」→ Vibe）') : '';
         elSend.disabled = !!state.running;
         elInput.disabled = !!state.running;
         if (!state.running) {
