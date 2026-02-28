@@ -520,6 +520,17 @@ class Orchestrator:
         add_excerpt(workdir / "package.json", start=1, end=200)
         add_excerpt(workdir / "tsconfig.json", start=1, end=200)
 
+        lower_text = text.lower()
+        # If DB/tooling smells show up, include the db module (often the root cause of TS errors).
+        try:
+            db_smell = ("pool" in lower_text) or ("knex" in lower_text) or bool(re.search(r"\bdb\s*\(", lower_text))
+        except Exception:
+            db_smell = False
+        if db_smell:
+            add_excerpt(workdir / "src" / "db.ts", start=1, end=200)
+            # If the repo already contains a working example of DB usage, include it as a reference snippet.
+            add_excerpt(workdir / "src" / "routes" / "posts.ts", start=1, end=220)
+
         # TypeScript compiler error lines: path(line,col): error TSxxxx: message
         ts_pat = re.compile(
             r"^(?P<file>[^\(\s]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+TS\d+:\s+(?P<msg>.*)$",
@@ -1422,6 +1433,7 @@ class Orchestrator:
             max_loops = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
             max_loops = max(1, min(max_loops, 12))
             loop = 0
+            fix_history: list[str] = []
             while loop < max_loops and ((not report.passed) or review_failed):
                 loop += 1
                 blocker_source = "tests" if not report.passed else "review"
@@ -1492,6 +1504,9 @@ class Orchestrator:
                     if failure_excerpts:
                         fix_user = f"{fix_user}\n\nFailureRepoExcerpts:\n{failure_excerpts}"
 
+                if fix_history:
+                    fix_user = f"{fix_user}\n\nFixLoopHistory（已尝试的修复，避免重复）：\n" + "\n".join(fix_history[-6:])
+
                 fix_role = "Coder"
                 if fix_coder_id == "coder_frontend":
                     fix_role = "Frontend Coder (React/TypeScript)"
@@ -1523,6 +1538,13 @@ class Orchestrator:
                     actor_role=fix_role,
                     workflow_hint=workflow_hint,
                 )
+                try:
+                    evidence = change.commit_hash or change.patch_pointer or ""
+                    files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
+                    files_short = ", ".join(files[:6]) + (" …" if len(files) > 6 else "")
+                    fix_history.append(f"- loop {loop} {fix_coder_id}: {change.summary.strip()[:160]} | files: {files_short} | evidence: {evidence}")
+                except Exception:
+                    pass
                 self._append_guarded(
                     event=new_event(
                         agent=fix_coder_id,
