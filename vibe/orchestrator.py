@@ -150,17 +150,55 @@ class Orchestrator:
     def _select_fix_coder_for_tests(self, *, report: packs.TestReport, blocker_text: str, activated_agents: Set[str]) -> str:
         text = (blocker_text or "").lower()
         cmd = ""
+        cmd_dir = Path(".")
         try:
             for r in report.results:
                 if not r.passed:
                     cmd = (r.command or "").lower()
+                    cmd_dir = self._shell_cd_dir(r.command or "")
                     break
         except Exception:
             cmd = ""
         combined = (cmd + "\n" + text).lower()
 
-        front = any(k in combined for k in ["tsc", "typescript", ".tsx", ".jsx", "vite", "react", "eslint", "client/", "frontend/", "web/"])
-        back = any(k in combined for k in ["pytest", "unittest", "backend/", "server/", "fastapi", "django", "flask", "express", "prisma"])
+        # Prefer routing by the failing command's working directory when possible.
+        # This avoids misclassifying backend TypeScript builds as "frontend" just because `tsc` appears.
+        cmd_dir_key = cmd_dir.as_posix().replace("\\", "/").strip().lower()
+        if cmd_dir_key and cmd_dir_key != ".":
+            top = cmd_dir.parts[0].lower() if cmd_dir.parts else ""
+            if top in {"client", "frontend", "web", "app"} and "coder_frontend" in activated_agents:
+                return "coder_frontend"
+            if top in {"backend", "server", "api"}:
+                return "coder_backend"
+
+        front = any(
+            k in combined
+            for k in [
+                ".tsx",
+                ".jsx",
+                "vite",
+                "react",
+                "eslint",
+                "client/",
+                "client\\",
+                "frontend/",
+                "web/",
+            ]
+        )
+        back = any(
+            k in combined
+            for k in [
+                "pytest",
+                "unittest",
+                "backend/",
+                "backend\\",
+                "server/",
+                "api/",
+                "express",
+                "prisma",
+                "knex",
+            ]
+        )
 
         if front and back and "integration_engineer" in activated_agents:
             return "integration_engineer"
