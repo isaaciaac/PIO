@@ -564,6 +564,87 @@ class Orchestrator:
             blob = blob[:max_chars] + "\n…（摘录过长，已截断）…"
         return blob
 
+    def _fix_loop_autohint_for_tests(self, *, report: packs.TestReport, blocker_text: str) -> str:
+        """
+        Provide a small deterministic hint for common failure patterns to help coders converge.
+        This must stay short and evidence-based (point to repo snippets).
+        """
+        try:
+            failed: Optional[packs.TestResult] = None
+            for r in report.results:
+                if not r.passed:
+                    failed = r
+                    break
+            if not failed:
+                return ""
+            cmd_dir = self._shell_cd_dir(failed.command or "")
+            if cmd_dir == Path("."):
+                return ""
+        except Exception:
+            return ""
+
+        text = (blocker_text or "").strip()
+        lower = text.lower()
+
+        # Only attempt for TS/Node-ish errors.
+        if not any(k in lower for k in ["tsc", "error ts", "typescript", "ts2349", "call signatures", "pool"]):
+            return ""
+
+        # Evidence snippets.
+        db_ptr = ""
+        db_text = ""
+        posts_ptr = ""
+        posts_text = ""
+        try:
+            db_rel = (cmd_dir / "src" / "db.ts").as_posix()
+            if (self.repo_root / db_rel).exists():
+                rr = self.toolbox.read_file(agent_id="router", path=db_rel, start_line=1, end_line=80)
+                db_ptr = rr.pointer
+                db_text = rr.content
+        except Exception:
+            db_ptr = ""
+            db_text = ""
+
+        try:
+            posts_rel = (cmd_dir / "src" / "routes" / "posts.ts").as_posix()
+            if (self.repo_root / posts_rel).exists():
+                rr = self.toolbox.read_file(agent_id="router", path=posts_rel, start_line=1, end_line=140)
+                posts_ptr = rr.pointer
+                posts_text = rr.content
+        except Exception:
+            posts_ptr = ""
+            posts_text = ""
+
+        db_lower = db_text.lower()
+        is_pool = ("from 'pg'" in db_lower or 'from "pg"' in db_lower) and ("new pool" in db_lower)
+        is_knex = ("from 'knex'" in db_lower or 'from "knex"' in db_lower) or ("knex(" in db_lower)
+
+        # If db exports pg.Pool but code calls db('table') / db.insert, point it out with options.
+        pool_type_error = any(k in lower for k in ["type 'pool' has no call signatures", "property 'insert' does not exist on type 'pool'", "property 'select' does not exist on type 'pool'"])
+        db_call_smell = bool(re.search(r"\bdb\s*\(", lower)) or ("db(" in db_lower and "export default" in db_lower)
+
+        if is_pool and (pool_type_error or "call signatures" in lower):
+            lines: list[str] = []
+            lines.append("检测到数据库层不一致，可能导致 TypeScript 编译错误反复出现：")
+            if db_ptr:
+                lines.append(f"- 证据：`db` 来自 `{db_ptr}`（看起来是 `pg.Pool`）。")
+            if posts_ptr and "pool.query" in (posts_text.lower()):
+                lines.append(f"- 证据：同仓库里已有 `pool.query` 用法：`{posts_ptr}`。")
+            lines.append("修复方向（二选一，选一个并把 `npm run build` 跑通）：")
+            lines.append("1) 保持 `pg.Pool`：把 controllers 里 `db('table')...` 改为 `pool.query(...)`（参照 posts.ts）。")
+            lines.append("2) 统一用 Knex：把 `src/db.ts` 改为导出 `knex(...)` 实例，并把 `pool.query` 相关代码改为 Knex 写法。")
+            return "\n".join(lines).strip()
+
+        if is_knex and "pool.query" in lower:
+            # Rare but symmetrical case.
+            if db_ptr:
+                return (
+                    "检测到 `src/db.ts` 可能是 Knex，但当前失败日志里出现了 `pool.query`。"
+                    f"请以 `{db_ptr}` 为准统一 DB 用法，让 `npm run build` 通过。"
+                )
+
+        return ""
+
     def _compact_error_excerpt(self, text: str, *, max_lines: int = 60, max_chars: int = 1600) -> str:
         t = (text or "").strip()
         if not t:
@@ -1506,6 +1587,11 @@ class Orchestrator:
 
                 if fix_history:
                     fix_user = f"{fix_user}\n\nFixLoopHistory（已尝试的修复，避免重复）：\n" + "\n".join(fix_history[-6:])
+
+                if blocker_source != "review":
+                    hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text)
+                    if hint:
+                        fix_user = f"{fix_user}\n\nAutoHint（硬逻辑，仅供参考，事实以 pointers 展开为准）：\n{hint}"
 
                 fix_role = "Coder"
                 if fix_coder_id == "coder_frontend":
