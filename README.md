@@ -80,6 +80,7 @@ vibe run --mock --mock-writes
 - `vibe init`
 - `vibe config show`
 - `vibe task add "..."`（写入 `REQ_CREATED` 到 ledger）
+- `vibe hint add "..."`（写入 `USER_HINT_ADDED`；下一次 `vibe run` 会注入到 ContextPacket.constraints）
 - `vibe chat "..."`（PM 自然语言对话；可用 `--json` 输出结构化结果）
 - `vibe run [--task <event_id>] [--mock] [--route auto|L0|L1|L2|L3|L4]`（mock 下闭环并产出 checkpoint）
 - `vibe checkpoint list/create/restore`
@@ -87,7 +88,7 @@ vibe run --mock --mock-writes
 
 ## 路由等级（L0–L4）
 
-`vibe run` 支持按风险/范围选择不同的门禁等级：
+`vibe run` 支持按风险/范围选择不同的**最小门禁档位**：
 
 - `--route auto`（默认）：由 `RouteDecider` 硬逻辑选择（低风险默认走 `L1`）
 - `--route L0`：快速（草稿验证；仅 smoke；检查点一定是 `green=false` / draft）
@@ -96,7 +97,28 @@ vibe run --mock --mock-writes
 - `--route L3`：可发布（交付/可复现；加 env/security/doc/release 门禁）
 - `--route L4`：生产级（高风险；含 perf/compliance/runbook/迁移回滚等门禁）
 
-> 说明：`L3/L4` 已实现，但会显著增加门禁与耗时（环境/安全/合规/性能/运维等）。没有密钥时可用 `--mock` 先跑通闭环。
+说明：门禁是硬约束；但**启用哪些 agent 是按需的**（到某个 gate 才激活该 gate 需要的 agent，并写入 `AGENTS_ACTIVATED` 事件，便于审计与回放）。
+没有密钥时可用 `--mock` 先跑通闭环。
+
+## UserHint（用户提示管道）
+
+当系统卡住时，你可以把“你希望它遵守的规则/修复方向”写入 ledger，下一次 `vibe run` 会把它注入 `ContextPacket.constraints`，从而影响 PM/Router/Coder 的决策：
+
+```bash
+vibe hint add "不要引入不存在的库；优先用仓库已有 scripts；必要时补齐依赖声明。"
+vibe run
+```
+
+> 说明：hint 会被作为“高优先级约束”注入（并用 artifacts 指针留痕），不会替代 repo facts；repo 事实仍以 pointers/artifacts/git 为准。
+
+## Incident 胶囊（失败诊断）
+
+当 QA/build/lint/test 失败进入 fix-loop 时，编排器会生成一个**确定性的 IncidentPack**（结构化诊断胶囊），并写入：
+
+- ledger 事件：`INCIDENT_CREATED`
+- 工件：`.vibe/artifacts/sha256/...*.incident.json`
+
+IncidentPack 会把噪声日志收敛成“可执行简报”（category/summary/evidence/next_steps/required_capabilities），并注入下一轮修复提示，减少反复猜错。
 
 ## 权限模式（允许 / 每次提示 / 仅聊天）
 
