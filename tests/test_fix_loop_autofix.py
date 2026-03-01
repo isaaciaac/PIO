@@ -85,6 +85,90 @@ def test_auto_fix_eslint_windows_single_quote_glob(tmp_path: Path, monkeypatch) 
     assert '"server/**/*.ts"' in lint2
 
 
+def test_auto_fix_node_missing_tsc_add_typescript(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    (tmp_path / "server").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server" / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "server",
+                "private": True,
+                "scripts": {"build": "tsc"},
+                "devDependencies": {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    cmd = 'cd /d "server" && npm run build'
+    report = _dummy_failed_report(cmd)
+    blocker = (
+        f"Command failed: {cmd}\n\n"
+        "> build\n"
+        "> tsc\n\n"
+        "'tsc' is not recognized as an internal or external command,\n"
+        "operable program or batch file.\n"
+    )
+    change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
+    assert change is not None
+    assert any(w.path == "server/package.json" for w in change.writes)
+
+    orch._materialize_code_change(change, actor_agent_id="coder_backend")
+    pkg2 = json.loads((tmp_path / "server" / "package.json").read_text(encoding="utf-8"))
+    dev2 = dict(pkg2.get("devDependencies") or {})
+    assert "typescript" in dev2
+
+
+def test_auto_fix_node_env_prefix_add_cross_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    (tmp_path / "server").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server" / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "server",
+                "private": True,
+                "scripts": {"build": "NODE_ENV=production tsc"},
+                "devDependencies": {"typescript": "^5.6.0"},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    cmd = 'cd /d "server" && npm run build'
+    report = _dummy_failed_report(cmd)
+    blocker = (
+        f"Command failed: {cmd}\n\n"
+        "> build\n"
+        "> NODE_ENV=production tsc\n\n"
+        "'NODE_ENV' is not recognized as an internal or external command,\n"
+        "operable program or batch file.\n"
+    )
+    change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
+    assert change is not None
+
+    orch._materialize_code_change(change, actor_agent_id="coder_backend")
+    pkg2 = json.loads((tmp_path / "server" / "package.json").read_text(encoding="utf-8"))
+    scripts2 = dict(pkg2.get("scripts") or {})
+    assert scripts2.get("build", "").startswith("cross-env ")
+    dev2 = dict(pkg2.get("devDependencies") or {})
+    assert "cross-env" in dev2
+
 def test_auto_fix_vite_index_html(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()

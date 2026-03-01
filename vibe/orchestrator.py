@@ -678,6 +678,59 @@ class Orchestrator:
                     return True
             return False
 
+        failed_cmd = ""
+        try:
+            for r in report.results:
+                if not r.passed:
+                    failed_cmd = str(r.command or "")
+                    break
+        except Exception:
+            failed_cmd = ""
+
+        failed_node_dir = Path(".")
+        if failed_cmd:
+            try:
+                failed_node_dir = self._shell_cd_dir(failed_cmd)
+            except Exception:
+                failed_node_dir = Path(".")
+
+        def parse_script_name(cmd: str) -> str:
+            c = cmd or ""
+            # Examples:
+            # - cd /d "client" && npm run lint
+            # - cd /d "client" && npm test
+            # - pnpm run build
+            m = re.search(r"\b(?:npm|pnpm|yarn)\s+run\s+(?P<name>[A-Za-z0-9:_-]+)\b", c, flags=re.IGNORECASE)
+            if m:
+                return (m.group("name") or "").strip()
+            m = re.search(r"\b(?:npm|pnpm|yarn)\s+(?P<name>test|lint|build)\b", c, flags=re.IGNORECASE)
+            if m:
+                return (m.group("name") or "").strip()
+            return ""
+
+        def extract_missing_bin(err_text: str) -> str:
+            t = err_text or ""
+            # Windows cmd.exe style:  'tsc' is not recognized as an internal or external command
+            m = re.search(
+                r"'(?P<bin>[^']+)'\s+is\s+not\s+recognized\s+as\s+an\s+internal\s+or\s+external\s+command",
+                t,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                return (m.group("bin") or "").strip()
+            # POSIX: sh: tsc: not found / command not found: tsc
+            m = re.search(r"\bsh:\s+(?P<bin>[A-Za-z0-9._-]+):\s+not\s+found\b", t, flags=re.IGNORECASE)
+            if m:
+                return (m.group("bin") or "").strip()
+            m = re.search(r"\bcommand\s+not\s+found:\s+(?P<bin>[A-Za-z0-9._-]+)\b", t, flags=re.IGNORECASE)
+            if m:
+                return (m.group("bin") or "").strip()
+            # Node spawn ENOENT
+            m = re.search(r"\bspawn\s+(?P<bin>[A-Za-z0-9._-]+)\s+enoent\b", t, flags=re.IGNORECASE)
+            if m:
+                return (m.group("bin") or "").strip()
+            return ""
+
         # 1) ESLint: missing config file
         if "eslint couldn't find a configuration file" in lower or "eslint could not find a configuration file" in lower:
             # If any config already exists, don't auto-create.
@@ -820,6 +873,94 @@ class Orchestrator:
                         files_changed=files_changed,
                         blockers=[],
                     )
+
+        # 1c) Node: common missing tool binaries (TypeScript/Jest/ESLint/Prettier) in npm scripts.
+        # This happens when package.json contains e.g. "build": "tsc" but devDependencies lacks "typescript".
+        missing_bin = extract_missing_bin(text)
+        bin_to_pkg: dict[str, tuple[str, str]] = {
+            "tsc": ("typescript", "^5.6.0"),
+            "typescript": ("typescript", "^5.6.0"),
+            "eslint": ("eslint", "^8.57.0"),
+            "jest": ("jest", "^29.7.0"),
+            "vitest": ("vitest", "^1.6.0"),
+            "prettier": ("prettier", "^3.3.0"),
+        }
+        if missing_bin and missing_bin.lower() in {k.lower() for k in bin_to_pkg.keys()}:
+            pkg_name, version = bin_to_pkg.get(missing_bin.lower(), bin_to_pkg.get(missing_bin, ("", "")))
+            if pkg_name:
+                pkg_path = self.repo_root / failed_node_dir / "package.json"
+                if pkg_path.exists():
+                    try:
+                        pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+                    except Exception:
+                        pkg = None
+                    if isinstance(pkg, dict):
+                        dev = dict(pkg.get("devDependencies") or {})
+                        deps = dict(pkg.get("dependencies") or {})
+                        if (pkg_name not in dev) and (pkg_name not in deps):
+                            dev[pkg_name] = version
+                            pkg["devDependencies"] = dev
+                            rel = (
+                                (failed_node_dir / "package.json").as_posix()
+                                if str(failed_node_dir) not in {"", "."}
+                                else "package.json"
+                            )
+                            return packs.CodeChange(
+                                kind="patch",
+                                summary=f"auto-fix: add missing devDependency `{pkg_name}`",
+                                writes=[packs.FileWrite(path=rel, content=json.dumps(pkg, ensure_ascii=False, indent=2) + '\n')],
+                                files_changed=[rel],
+                                blockers=[],
+                            )
+
+        # 1d) Node/Windows: env var prefix in npm scripts (e.g. NODE_ENV=production) breaks on cmd.exe.
+        # Fix by adding cross-env and rewriting the failing script.
+        if missing_bin and missing_bin.upper() == "NODE_ENV":
+            script_name = parse_script_name(failed_cmd)
+            pkg_path = self.repo_root / failed_node_dir / "package.json"
+            if pkg_path.exists():
+                try:
+                    pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    pkg = None
+                if isinstance(pkg, dict):
+                    scripts = pkg.get("scripts")
+                    if isinstance(scripts, dict) and scripts:
+                        targets: list[str] = [script_name] if script_name and script_name in scripts else list(scripts.keys())
+                        new_scripts = dict(scripts)
+                        updated = False
+                        for k in targets:
+                            v = scripts.get(k)
+                            if not isinstance(v, str):
+                                continue
+                            if "NODE_ENV=" not in v:
+                                continue
+                            if "cross-env" in v:
+                                continue
+                            new_scripts[k] = "cross-env " + v
+                            updated = True
+                            # Only patch one script if we could identify it from the failing command.
+                            if script_name:
+                                break
+                        if updated:
+                            pkg["scripts"] = new_scripts
+                            dev = dict(pkg.get("devDependencies") or {})
+                            deps = dict(pkg.get("dependencies") or {})
+                            if ("cross-env" not in dev) and ("cross-env" not in deps):
+                                dev["cross-env"] = "^7.0.3"
+                                pkg["devDependencies"] = dev
+                            rel = (
+                                (failed_node_dir / "package.json").as_posix()
+                                if str(failed_node_dir) not in {"", "."}
+                                else "package.json"
+                            )
+                            return packs.CodeChange(
+                                kind="patch",
+                                summary="auto-fix: add cross-env for NODE_ENV script on Windows",
+                                writes=[packs.FileWrite(path=rel, content=json.dumps(pkg, ensure_ascii=False, indent=2) + '\n')],
+                                files_changed=[rel],
+                                blockers=[],
+                            )
 
         # 2) Vite: missing index.html at project root
         if ("could not resolve entry module" in lower and "index.html" in lower) or ("entry module \"index.html\"" in lower):
