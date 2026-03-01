@@ -156,6 +156,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private abort?: AbortController;
   private draftParts: string[] = [];
   private draftHinted = false;
+  private workspaceRoot?: string;
+  private persistTimer?: NodeJS.Timeout;
+
+  private static readonly CHAT_HISTORY_KEY = "vibe.chatHistory.v1";
+  private static readonly CHAT_HISTORY_VERSION = 1;
+  private static readonly MAX_PERSIST_MESSAGES = 160;
+  private static readonly MAX_CHARS_PER_MESSAGE = 10_000;
+  private static readonly PERSIST_THROTTLE_MS = 500;
   private messages: ChatMessage[] = [
     {
       id: newId("m"),
@@ -167,6 +175,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   ];
 
   constructor(
+    private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel,
     private readonly getEnvOverrides?: EnvOverridesProvider
   ) {}
@@ -176,12 +185,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = this.renderHtml();
 
+    this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    this.restorePersisted();
+
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       if (!root) {
         vscode.window.showErrorMessage("No workspace folder open.");
         return;
       }
+      this.workspaceRoot = root;
       try {
         const envOverrides = await this.getEnvOverrides?.();
         if (msg?.type === "ready") {
@@ -199,6 +212,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         }
         if (msg?.type === "clearChat") {
           this.messages = this.messages.slice(0, 1);
+          try {
+            if (this.persistTimer) clearTimeout(this.persistTimer);
+          } catch {}
+          this.persistTimer = undefined;
+          await this.context.workspaceState.update(VibeDashboardViewProvider.CHAT_HISTORY_KEY, undefined);
           this.postState();
           return;
         }
@@ -241,6 +259,78 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private addMessage(role: ChatRole, text: string, title?: string): void {
     this.messages.push({ id: newId("m"), role, title, text, ts: Date.now() });
     this.postState();
+    // 不持久化高频进度行，避免刷屏和频繁写入。
+    if (String(title || "").trim() !== "进度") {
+      this.schedulePersist();
+    }
+  }
+
+  private persistableMessages(): Array<{ role: ChatRole; title?: string; text: string; ts: number }> {
+    const banner = this.messages.length ? this.messages[0] : undefined;
+    const filtered = this.messages
+      .slice(1)
+      .filter((m) => String(m?.title || "").trim() !== "进度")
+      .map((m) => {
+        const raw = String(m.text || "");
+        const text =
+          raw.length > VibeDashboardViewProvider.MAX_CHARS_PER_MESSAGE
+            ? raw.slice(0, VibeDashboardViewProvider.MAX_CHARS_PER_MESSAGE) + "\n…（已截断）…"
+            : raw;
+        return { role: m.role, title: m.title, text, ts: m.ts };
+      });
+
+    const limit = Math.max(1, VibeDashboardViewProvider.MAX_PERSIST_MESSAGES);
+    const tail = filtered.slice(Math.max(0, filtered.length - Math.max(0, limit - 1)));
+    const out: Array<{ role: ChatRole; title?: string; text: string; ts: number }> = [];
+    if (banner) out.push({ role: banner.role, title: banner.title, text: banner.text, ts: banner.ts });
+    out.push(...tail);
+    return out;
+  }
+
+  private schedulePersist(): void {
+    if (!this.workspaceRoot) return;
+    try {
+      if (this.persistTimer) clearTimeout(this.persistTimer);
+    } catch {}
+    this.persistTimer = setTimeout(() => {
+      this.persistNow().catch(() => undefined);
+    }, VibeDashboardViewProvider.PERSIST_THROTTLE_MS);
+  }
+
+  private async persistNow(): Promise<void> {
+    if (!this.workspaceRoot) return;
+    const payload = {
+      version: VibeDashboardViewProvider.CHAT_HISTORY_VERSION,
+      savedAt: Date.now(),
+      messages: this.persistableMessages(),
+    };
+    await this.context.workspaceState.update(VibeDashboardViewProvider.CHAT_HISTORY_KEY, payload);
+  }
+
+  private restorePersisted(): void {
+    try {
+      const raw: any = this.context.workspaceState.get(VibeDashboardViewProvider.CHAT_HISTORY_KEY);
+      if (!raw || typeof raw !== "object") return;
+      if (raw.version !== VibeDashboardViewProvider.CHAT_HISTORY_VERSION) return;
+      const items = Array.isArray(raw.messages) ? raw.messages : [];
+      const restored: ChatMessage[] = [];
+      for (const it of items) {
+        const role = String(it?.role || "").trim() as ChatRole;
+        if (role !== "user" && role !== "assistant" && role !== "system") continue;
+        const text = String(it?.text || "");
+        if (!text.trim()) continue;
+        const title = it?.title ? String(it.title) : undefined;
+        const ts = typeof it?.ts === "number" ? it.ts : Date.now();
+        restored.push({ id: newId("m"), role, title, text, ts });
+      }
+      if (!restored.length) return;
+
+      // 始终保留当前版本的 banner（文案可能会更新）。
+      const banner = this.messages.length ? this.messages[0] : restored[0];
+      this.messages = [banner, ...restored.slice(1)];
+    } catch {
+      // Ignore corrupt state.
+    }
   }
 
   private isRunCommand(text: string): boolean {

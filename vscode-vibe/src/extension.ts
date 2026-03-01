@@ -172,7 +172,7 @@ export function activate(context: vscode.ExtensionContext) {
     return env;
   }
 
-  const dashboard = new VibeDashboardViewProvider(output, getEnvOverrides);
+  const dashboard = new VibeDashboardViewProvider(context, output, getEnvOverrides);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("vibe.dashboard", dashboard, {
       webviewOptions: { retainContextWhenHidden: true },
