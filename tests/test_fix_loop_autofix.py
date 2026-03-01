@@ -76,3 +76,39 @@ def test_auto_fix_vite_index_html(tmp_path: Path, monkeypatch) -> None:
     orch._materialize_code_change(change, actor_agent_id="coder_backend")
     assert (tmp_path / "client" / "index.html").exists()
 
+
+def test_auto_fix_ts_auth_export_mismatch(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    (tmp_path / "server" / "src" / "routes").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server" / "src" / "middleware").mkdir(parents=True, exist_ok=True)
+
+    (tmp_path / "server" / "src" / "routes" / "customer.routes.ts").write_text(
+        "import { auth } from '../middleware/auth';\nexport const x = auth;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "server" / "src" / "middleware" / "auth.ts").write_text(
+        "export const authenticate = () => {};\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "server" / "package.json").write_text(
+        json.dumps({"name": "server", "private": True}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    report = _dummy_failed_report('cd /d "server" && npm run build')
+    blocker = (
+        "src/routes/customer.routes.ts(1,10): error TS2614: Module '\"../middleware/auth\"' has no exported member 'auth'.\n"
+    )
+    change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
+    assert change is not None
+    assert len(change.writes) == 1
+    assert change.writes[0].path == "server/src/middleware/auth.ts"
+
+    orch._materialize_code_change(change, actor_agent_id="coder_backend")
+    text = (tmp_path / "server" / "src" / "middleware" / "auth.ts").read_text(encoding="utf-8")
+    assert "export const auth = authenticate" in text

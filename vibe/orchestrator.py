@@ -812,6 +812,104 @@ class Orchestrator:
                     blockers=[],
                 )
 
+        # 3) TypeScript: common auth middleware export mismatch (scaffold bug)
+        # Example:
+        # src/routes/customer.routes.ts(...): error TS2614: Module '"../middleware/auth"' has no exported member 'auth'.
+        # Fix by aliasing `auth` <-> `authenticate` in the module when one of them exists.
+        ts_lines = [l.strip() for l in text.splitlines() if "has no exported member" in l.lower() and "error ts" in l.lower()]
+        if ts_lines:
+            pat = re.compile(
+                r"^(?P<file>[^:(]+)\(\d+,\d+\):\s*error\s+TS(?:2305|2614):\s*Module\s+'\"(?P<spec>[^\"]+)\"'\s+has\s+no\s+exported\s+member\s+'(?P<name>[^']+)'",
+                re.IGNORECASE,
+            )
+
+            def _candidate_base_dirs() -> list[Path]:
+                out: list[Path] = []
+                for d in self._find_node_project_dirs():
+                    if d not in out:
+                        out.append(d)
+                if Path(".") not in out:
+                    out.append(Path("."))
+                return out
+
+            def _find_importer_abs(rel_file: str) -> Optional[Path]:
+                rel = (rel_file or "").replace("\\", "/").lstrip("/")
+                if not rel:
+                    return None
+                for base in _candidate_base_dirs():
+                    p = (self.repo_root / base / rel).resolve()
+                    if p.exists() and p.is_file():
+                        return p
+                return None
+
+            def _resolve_module_abs(importer_abs: Path, spec: str) -> Optional[Path]:
+                s = (spec or "").strip()
+                if not s.startswith("."):
+                    return None
+                target = (importer_abs.parent / s).resolve()
+                candidates: list[Path] = []
+                if target.suffix:
+                    candidates.append(target)
+                else:
+                    for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts"]:
+                        candidates.append(Path(str(target) + ext))
+                    for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts"]:
+                        candidates.append(target / f"index{ext}")
+                for c in candidates:
+                    if c.exists() and c.is_file():
+                        try:
+                            if c.resolve().is_relative_to(self.repo_root.resolve()):
+                                return c.resolve()
+                        except Exception:
+                            return c.resolve()
+                return None
+
+            for line in ts_lines[:12]:
+                m = pat.match(line)
+                if not m:
+                    continue
+                rel_file = (m.group("file") or "").strip()
+                spec = (m.group("spec") or "").strip()
+                missing_name = (m.group("name") or "").strip()
+
+                if missing_name not in {"auth", "authenticate"}:
+                    continue
+
+                importer_abs = _find_importer_abs(rel_file)
+                if importer_abs is None:
+                    continue
+                module_abs = _resolve_module_abs(importer_abs, spec)
+                if module_abs is None:
+                    continue
+
+                try:
+                    mod_text = module_abs.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                has_auth = re.search(r"\bexport\s+(?:const|function|class)\s+auth\b", mod_text) is not None
+                has_authenticate = re.search(r"\bexport\s+(?:const|function|class)\s+authenticate\b", mod_text) is not None
+
+                if missing_name == "auth" and (not has_auth) and has_authenticate:
+                    add = "\nexport const auth = authenticate;\n"
+                elif missing_name == "authenticate" and (not has_authenticate) and has_auth:
+                    add = "\nexport const authenticate = auth;\n"
+                else:
+                    continue
+
+                if "export default" not in mod_text and has_authenticate:
+                    add += "export default authenticate;\n"
+
+                new_text = mod_text.rstrip() + add
+                rel_out = module_abs.relative_to(self.repo_root.resolve()).as_posix()
+                return packs.CodeChange(
+                    kind="patch",
+                    summary=f"auto-fix: add missing export `{missing_name}` in {rel_out}",
+                    writes=[packs.FileWrite(path=rel_out, content=new_text)],
+                    files_changed=[rel_out],
+                    blockers=[],
+                )
+
         return None
 
     def _compact_error_excerpt(self, text: str, *, max_lines: int = 60, max_chars: int = 1600) -> str:
