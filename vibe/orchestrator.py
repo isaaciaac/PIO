@@ -756,6 +756,71 @@ class Orchestrator:
                 blockers=[],
             )
 
+        # 1b) ESLint: npm scripts use single-quoted globs (breaks on Windows cmd.exe)
+        # Example error:
+        #   No files matching the pattern "'server/**/*.ts'" were found.
+        if "eslint" in lower and "no files matching the pattern" in lower:
+            m = re.search(
+                r'No files matching the pattern\s+"(?P<pat>.+?)"\s+were found\.',
+                text,
+                flags=re.IGNORECASE,
+            )
+            raw_pat = (m.group("pat") if m else "").strip()
+            # We only auto-fix the common Windows-incompatible case: extra single quotes
+            # become part of the glob string (e.g. "'server/**/*.ts'").
+            if raw_pat.startswith("'") and raw_pat.endswith("'") and len(raw_pat) >= 3:
+                core = raw_pat[1:-1].strip()
+            else:
+                core = ""
+
+            if core and any(ch in core for ch in ("*", "?", "{", "}", "[")):
+                replacement = f"\"{core}\""
+                writes: list[packs.FileWrite] = []
+                files_changed: list[str] = []
+                for node_dir in self._find_node_project_dirs():
+                    pkg_path = self.repo_root / node_dir / "package.json"
+                    if not pkg_path.exists():
+                        continue
+                    try:
+                        pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+                    except Exception:
+                        continue
+
+                    scripts = pkg.get("scripts")
+                    if not isinstance(scripts, dict):
+                        continue
+
+                    new_scripts: dict[str, Any] = dict(scripts)
+                    updated = False
+                    for k, v in list(new_scripts.items()):
+                        if not isinstance(v, str):
+                            continue
+                        if raw_pat not in v:
+                            continue
+                        new_scripts[k] = v.replace(raw_pat, replacement)
+                        updated = True
+
+                    if not updated:
+                        continue
+
+                    pkg["scripts"] = new_scripts
+                    rel = (
+                        (node_dir / "package.json").as_posix()
+                        if str(node_dir) not in {"", "."}
+                        else "package.json"
+                    )
+                    writes.append(packs.FileWrite(path=rel, content=json.dumps(pkg, ensure_ascii=False, indent=2) + "\n"))
+                    files_changed.append(rel)
+
+                if writes:
+                    return packs.CodeChange(
+                        kind="patch",
+                        summary="auto-fix: normalize ESLint glob quoting in npm scripts",
+                        writes=writes,
+                        files_changed=files_changed,
+                        blockers=[],
+                    )
+
         # 2) Vite: missing index.html at project root
         if ("could not resolve entry module" in lower and "index.html" in lower) or ("entry module \"index.html\"" in lower):
             for node_dir in self._find_node_project_dirs():

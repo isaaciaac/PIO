@@ -49,6 +49,42 @@ def test_auto_fix_eslint_config(tmp_path: Path, monkeypatch) -> None:
     assert "@typescript-eslint/eslint-plugin" in (pkg2.get("devDependencies") or {})
 
 
+def test_auto_fix_eslint_windows_single_quote_glob(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    (tmp_path / "server" / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server" / "src" / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+
+    pkg = {
+        "name": "x",
+        "private": True,
+        "scripts": {"lint": "eslint 'server/**/*.ts' --fix"},
+        "devDependencies": {"eslint": "^8.57.0"},
+    }
+    (tmp_path / "package.json").write_text(json.dumps(pkg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    report = _dummy_failed_report("npm run lint")
+    blocker = (
+        "Oops! Something went wrong! :(\n\n"
+        "ESLint: 8.57.1\n\n"
+        "No files matching the pattern \"'server/**/*.ts'\" were found.\n"
+        "Please check for typing mistakes in the pattern.\n"
+    )
+    change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
+    assert change is not None
+
+    orch._materialize_code_change(change, actor_agent_id="coder_backend")
+
+    pkg2 = json.loads((tmp_path / "package.json").read_text(encoding="utf-8"))
+    lint2 = str((pkg2.get("scripts") or {}).get("lint") or "")
+    assert "'server/**/*.ts'" not in lint2
+    assert '"server/**/*.ts"' in lint2
+
+
 def test_auto_fix_vite_index_html(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
