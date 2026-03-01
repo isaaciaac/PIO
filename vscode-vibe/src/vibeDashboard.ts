@@ -1039,8 +1039,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}`
         : replyText || "（无回复）";
 
-      const withEvidence = pointers.length ? `${assistantText}\n\n证据：\n- ${pointers.join("\n- ")}` : assistantText;
-      this.addMessage("assistant", withEvidence, this.agentTitle(agentId));
+      // 不在对话流里打印证据指针（pointers）；它们仍会保存在账本/工件中，供审计与回放。
+      void pointers;
+      this.addMessage("assistant", assistantText, this.agentTitle(agentId));
     } catch (e) {
       if (e instanceof VibeRunError) {
         if (e.code === 130 || /cancelled/i.test(e.message || "")) {
@@ -1158,10 +1159,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const facts = this.collectWorkflowFacts(taskText, taskId, checkpointId, cp, events, { attempts: attempt });
       try {
         const summary = await this.summarizeWorkflowWithPm(root, facts, mock, style, envOverrides, abort.signal);
-        const withEvidence = summary.pointers.length
-          ? `${summary.text}\n\n证据：\n- ${summary.pointers.join("\n- ")}`
-          : summary.text;
-        this.addMessage("assistant", withEvidence, "产品经理（PM）");
+        // 不在对话流里打印证据指针（pointers）；它们仍会保存在账本/工件中，供审计与回放。
+        this.addMessage("assistant", summary.text, "产品经理（PM）");
       } catch (e) {
         // Fallback: deterministic narrative (compact) if PM summary fails.
         const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events, { attempts: attempt });
@@ -1381,6 +1380,17 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         background: var(--vscode-notifications-background, rgba(70, 130, 180, 0.10));
         border-color: var(--vscode-notifications-border, var(--vscode-panel-border));
       }
+      /* 进度行：更紧凑，不显示卡片边框 */
+      .msg.progress {
+        max-width: 100%;
+        margin: 4px 0;
+        padding: 2px 0;
+        border: none;
+        border-radius: 0;
+        background: transparent;
+        color: var(--vscode-descriptionForeground);
+        font-size: 11px;
+      }
       pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 
       .composer {
@@ -1468,7 +1478,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       <div class="composer">
         <div class="metaRow">
           <div class="leftMeta">
-            <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
             <select id="mode" title="聊天模式：只对话（禁用本地工具）；写项目模式：允许本地工具（确认权限会逐项询问、完全授权不询问）。写项目模式下：信息足够会自动执行并落地到代码；不足会追问。">
               <option value="chat_only" selected>仅聊天（只读）</option>
               <option value="prompt">确认权限（逐项询问）</option>
@@ -1515,7 +1524,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
               <option value="detailed">风格：细致严谨</option>
             </select>
           </div>
-          <span>设置：<code>vibe.cliPath</code> / <code>vibe.permissionMode</code></span>
         </div>
 
         <textarea id="input" placeholder="请输入你的问题或需求…（Ctrl/⌘ + Enter 发送）"></textarea>
@@ -1536,7 +1544,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elSend = document.getElementById('send');
       const elStatus = document.getElementById('status');
       const elStop = document.getElementById('stop');
-      const elMock = document.getElementById('mock');
       const elMode = document.getElementById('mode');
       const elAgent = document.getElementById('agent');
       const elAgentWrap = document.getElementById('agentWrap');
@@ -1552,9 +1559,12 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         elMessages.innerHTML = '';
         for (const m of messages) {
           const div = document.createElement('div');
-          div.className = 'msg ' + (m.role || 'assistant');
-          const titleLeft = m.title ? escapeHtml(m.title) : '';
-          const title = titleLeft ? '<div class=\"title\"><span>' + titleLeft + '</span><span></span></div>' : '';
+          const titleLeft = m.title ? String(m.title) : '';
+          const isProgress = titleLeft === '进度';
+          div.className = 'msg ' + (m.role || 'assistant') + (isProgress ? ' progress' : '');
+          const title = (!isProgress && titleLeft)
+            ? '<div class=\"title\"><span>' + escapeHtml(titleLeft) + '</span><span></span></div>'
+            : '';
           div.innerHTML = title + '<pre>' + escapeHtml(m.text || '') + '</pre>';
           elMessages.appendChild(div);
         }
@@ -1583,7 +1593,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
         const route = (elRoute && elRoute.value) ? elRoute.value : 'auto';
         const style = (elStyle && elStyle.value) ? elStyle.value : 'balanced';
-        vscode.postMessage({ type: 'chatSend', mode, route, agent, style, text, mock: !!elMock.checked });
+        vscode.postMessage({ type: 'chatSend', mode, route, agent, style, text, mock: false });
         elInput.value = '';
       }
 
@@ -1605,7 +1615,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       function loadUiState() {
         const st = vscode.getState() || {};
         try {
-          if (st && typeof st.mock === 'boolean' && elMock) elMock.checked = st.mock;
           if (st && st.mode && elMode) elMode.value = String(st.mode);
           if (st && st.agent && elAgent) elAgent.value = String(st.agent);
           if (st && st.route && elRoute) elRoute.value = String(st.route);
@@ -1615,7 +1624,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       function saveUiState() {
         vscode.setState({
-          mock: !!(elMock && elMock.checked),
           mode: (elMode && elMode.value) ? elMode.value : 'chat_only',
           agent: (elAgent && elAgent.value) ? elAgent.value : 'pm',
           route: (elRoute && elRoute.value) ? elRoute.value : 'auto',
@@ -1627,7 +1635,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       if (elAgent) elAgent.addEventListener('change', saveUiState);
       if (elRoute) elRoute.addEventListener('change', saveUiState);
       if (elStyle) elStyle.addEventListener('change', saveUiState);
-      if (elMock) elMock.addEventListener('change', saveUiState);
 
       loadUiState();
       syncMode();
