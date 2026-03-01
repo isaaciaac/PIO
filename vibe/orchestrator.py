@@ -226,7 +226,7 @@ class Orchestrator:
         # These agents are only invoked when needed; activating them upfront keeps ledger
         # permissions auditable without mid-run escalation.
         if route_level != "L0":
-            for extra in ["coder_frontend"]:
+            for extra in ["coder_frontend", "env_engineer"]:
                 if extra in self.config.agents and extra not in agents:
                     agents.append(extra)
         if route_level in {"L2", "L3", "L4"}:
@@ -1073,6 +1073,7 @@ class Orchestrator:
         req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in activated_agents else None
         architect = self._agent("architect") if "architect" in activated_agents else None
         api_confirm = self._agent("api_confirm") if "api_confirm" in activated_agents else None
+        env_engineer = self._agent("env_engineer") if "env_engineer" in activated_agents else None
         coder_backend = self._agent("coder_backend")
         coder_frontend = self._agent("coder_frontend") if "coder_frontend" in activated_agents else None
         integrator = self._agent("integration_engineer") if "integration_engineer" in activated_agents else None
@@ -1382,8 +1383,88 @@ class Orchestrator:
 
         # QA
         qa_profile = "smoke" if route_level == "L0" else ("unit" if route_level == "L1" else "full")
-        qa_commands = self._determine_test_commands(profile=qa_profile)
         mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
+        qa_commands = self._determine_test_commands(profile=qa_profile)
+
+        # On-demand env probing (L1/L2): if we can't find any runnable QA commands,
+        # ask env_engineer to propose a minimal runnable command set.
+        if (not mock_mode) and (not qa_commands) and env_engineer is not None:
+            try:
+                env_user = (
+                    f"Task:\n{task_text}\n\n"
+                    f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                    f"Plan:\n{plan.model_dump_json()}\n\n"
+                    f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
+                    "Problem:\n"
+                    f"- QA profile is {qa_profile}\n"
+                    "- The system could not detect any runnable test/lint/build commands by heuristics.\n\n"
+                    "Request:\n"
+                    "- Propose 1–4 shell commands that can be run locally to verify the repo is runnable (prefer build/lint/test).\n"
+                    "- Use repo-root relative `cd` + `&&` when needed (Windows: `cd /d \"dir\" && ...`).\n"
+                    "- Do not invent commands that do not exist in the repo (prefer using package.json scripts, Makefile, etc.).\n"
+                    "- If truly nothing is runnable, return an empty commands list.\n"
+                )
+                if ctx_excerpts:
+                    env_user = f"{env_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+
+                env_msgs = self._messages_with_memory(
+                    agent_id="env_engineer",
+                    system=(
+                        "你是环境工程师（env_engineer）。你的目标是让项目“能跑起来并可验证”。\n"
+                        "只输出 JSON（不要 markdown），并严格匹配 EnvSpec schema：{commands: string[]}。\n"
+                        "不要额外 key；不要最外层包一层对象。\n\n"
+                        "规则：\n"
+                        "- commands 仅包含可执行命令（1–4 条），优先 build/lint/test，其次 smoke。\n"
+                        "- 命令必须尽量跨平台；如需进入子目录，按系统约定使用 `cd ... &&`。\n"
+                        "- 不要输出破坏性命令（rm/del/format 等）。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=env_user,
+                )
+                spec, _ = env_engineer.chat_json(schema=packs.EnvSpec, messages=env_msgs, user=env_user)
+                spec_ptr = self.artifacts.put_json(spec.model_dump(), suffix=".envspec.json", kind="envspec").to_pointer()
+
+                # Normalize common shell patterns so downstream install detection works.
+                normalized: list[str] = []
+                for c in list(spec.commands or [])[:6]:
+                    s = str(c).strip()
+                    if not s:
+                        continue
+                    s = s.replace("\r", " ").replace("\n", " ").strip()
+                    low = s.lower()
+                    if low.startswith("cd ") and "&&" in s and '"' not in s:
+                        left, rest = s.split("&&", 1)
+                        parts = left.strip().split()
+                        # cd [/d] dir
+                        dir_part = ""
+                        if len(parts) >= 3 and parts[1].lower() == "/d":
+                            dir_part = parts[2]
+                        elif len(parts) >= 2:
+                            dir_part = parts[1]
+                        if dir_part:
+                            if os.name == "nt":
+                                s = f'cd /d "{dir_part}" && {rest.strip()}'
+                            else:
+                                s = f'cd "{dir_part}" && {rest.strip()}'
+                    normalized.append(s)
+
+                self._append_guarded(
+                    event=new_event(
+                        agent="env_engineer",
+                        type="ENV_PROBED",
+                        summary="EnvSpec generated (no QA commands detected)",
+                        branch_id=self.branch_id,
+                        pointers=[spec_ptr],
+                        meta={"route_level": route_level, "style": resolved_style, "commands": normalized},
+                    ),
+                    activated_agents=activated_agents,
+                )
+
+                if normalized:
+                    qa_commands = normalized
+            except Exception:
+                pass
+
         if mock_mode:
             test_run_summary = "mock: tests skipped"
         elif not qa_commands:

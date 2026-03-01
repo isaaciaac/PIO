@@ -90,10 +90,13 @@ vibe run --mock --mock-writes
 `vibe run` 支持按风险/范围选择不同的门禁等级：
 
 - `--route auto`（默认）：由 `RouteDecider` 硬逻辑选择（低风险默认走 `L1`）
-- `--route L0`：极速路径（仅 smoke 验证；检查点一定是 `green=false` / draft）
-- `--route L1`：标准路径（PM→Router→Coder→QA；通过才允许 `green=true`）
+- `--route L0`：快速（草稿验证；仅 smoke；检查点一定是 `green=false` / draft）
+- `--route L1`：简单 MVP（默认；PM→Router→Coder→QA(unit+lint)；通过才允许 `green=true`；如未检测到可跑命令，会按需调用 `env_engineer` 生成最小可运行命令并继续）
+- `--route L2`：多模块 MVP（跨模块/契约/鉴权等风险域；加 ADR-lite/契约确认/代码审查；QA 升级为 full/integration；通过才允许 `green=true`）
+- `--route L3`：可发布（交付/可复现；加 env/security/doc/release 门禁）
+- `--route L4`：生产级（高风险；含 perf/compliance/runbook/迁移回滚等门禁）
 
-> 说明：当前已实现 `L0/L1/L2`；`L3/L4` 会报 “not implemented yet”。
+> 说明：当前已实现 `L0/L1/L2`；选择 `L3/L4` 会自动降级为 `L2` 执行，但会在 ledger/checkpoint 里记录 `requested_route_level` 以便审计与后续回放。
 
 ## 权限模式（允许 / 每次提示 / 仅聊天）
 

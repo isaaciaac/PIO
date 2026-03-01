@@ -196,7 +196,7 @@ def decide_route(
     # If nothing forces L2+, default to L1 unless user explicitly asks for L0.
     if requested is None:
         if hard_required == "L0":
-            return RouteDecision(route_level="L1", reasons=["默认：低风险任务走 L1 标准路径"] + reasons)
+            return RouteDecision(route_level="L1", reasons=["默认：低风险任务走 L1（简单 MVP）"] + reasons)
         return RouteDecision(route_level=hard_required, reasons=reasons or [f"硬规则选择：{hard_required}"])
 
     # User requested a level; do not allow downgrading below hard rules.
@@ -206,7 +206,7 @@ def decide_route(
 
     # Explicit L0 is allowed only when hard_required is L0 (i.e. no forced gates).
     if requested == "L0" and hard_required == "L0":
-        reasons.insert(0, "用户明确指定 L0 极速路径（仅 smoke 验证，检查点不标绿）")
+        reasons.insert(0, "用户明确指定 L0（快速草稿，仅 smoke 验证，检查点不标绿）")
         return RouteDecision(route_level="L0", reasons=reasons)
 
     # Otherwise honor the requested level (can be >= hard_required).
@@ -231,4 +231,3 @@ def extract_explicit_route_hint(task_text: str) -> Optional[RouteLevel]:
     if token in {"L0", "L1", "L2", "L3", "L4"}:
         return token  # type: ignore[return-value]
     return None
-

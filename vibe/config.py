@@ -390,7 +390,8 @@ def default_routes(agent_ids: List[str]) -> RoutesConfig:
     return RoutesConfig(
         levels={
             "L0": RouteProfile(agents=["router", "coder_backend", "qa"]),
-            "L1": RouteProfile(agents=["pm", "router", "coder_backend", "qa"]),
+            # L1/L2 include env_engineer for on-demand environment probing (invoked only when needed).
+            "L1": RouteProfile(agents=["pm", "router", "coder_backend", "qa", "env_engineer"]),
             "L2": RouteProfile(
                 agents=[
                     "pm",
@@ -400,6 +401,7 @@ def default_routes(agent_ids: List[str]) -> RoutesConfig:
                     "coder_backend",
                     "code_reviewer",
                     "qa",
+                    "env_engineer",
                 ]
             ),
             "L3": RouteProfile(
@@ -436,3 +438,31 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
         existing_tools = set(router.tools_allowed or [])
         if not needed_tools.issubset(existing_tools):
             router.tools_allowed = sorted(existing_tools | needed_tools)
+
+    # Route profiles: older configs may not include env_engineer in L1/L2; we add it only
+    # when the profile matches the historical default exactly to avoid surprising custom setups.
+    if "env_engineer" in cfg.agents and (cfg.routes.levels or {}):
+        l1 = cfg.routes.levels.get("L1")
+        if l1 and (l1.agents or []) == ["pm", "router", "coder_backend", "qa"]:
+            l1.agents = ["pm", "router", "coder_backend", "qa", "env_engineer"]
+
+        l2 = cfg.routes.levels.get("L2")
+        if l2 and (l2.agents or []) == [
+            "pm",
+            "requirements_analyst",
+            "architect",
+            "api_confirm",
+            "coder_backend",
+            "code_reviewer",
+            "qa",
+        ]:
+            l2.agents = [
+                "pm",
+                "requirements_analyst",
+                "architect",
+                "api_confirm",
+                "coder_backend",
+                "code_reviewer",
+                "qa",
+                "env_engineer",
+            ]
