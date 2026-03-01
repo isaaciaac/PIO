@@ -503,3 +503,38 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
                 "qa",
                 "env_engineer",
             ]
+
+    # Capabilities: older configs won't have them; fill minimal defaults without overriding user customizations.
+    default_caps: dict[str, list[str]] = {
+        "router": ["orchestration", "routing", "triage"],
+        "pm": ["requirements", "acceptance", "product"],
+        "requirements_analyst": ["requirements", "usecases"],
+        "architect": ["architecture", "adr"],
+        "api_confirm": ["api", "contract"],
+        "env_engineer": ["env", "build", "run", "tests", "node", "python"],
+        "coder_backend": ["code", "backend", "node", "typescript", "eslint", "debug"],
+        "coder_frontend": ["code", "frontend", "react", "vite", "node", "typescript", "eslint", "debug"],
+        "integration_engineer": ["code", "integration", "contract", "node", "typescript", "debug"],
+        "qa": ["qa", "tests", "triage", "node", "python"],
+        "code_reviewer": ["review", "quality"],
+        "security": ["security", "threat_model"],
+        "compliance": ["compliance", "privacy"],
+        "performance": ["performance", "bench"],
+        "doc_writer": ["docs", "handoff"],
+        "release_manager": ["release", "changelog"],
+        "devops": ["ci", "cd", "devops"],
+        "support_engineer": ["runbook", "support"],
+    }
+    for aid, caps in default_caps.items():
+        a = cfg.agents.get(aid)
+        if a is None:
+            continue
+        if not list(getattr(a, "capabilities", []) or []):
+            a.capabilities = list(caps)
+
+    # Add new agents introduced in later versions (non-breaking; disabled by default).
+    if "specialist" not in cfg.agents:
+        try:
+            cfg.agents["specialist"] = default_config().agents["specialist"]
+        except Exception:
+            pass
