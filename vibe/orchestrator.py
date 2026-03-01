@@ -90,7 +90,63 @@ class Orchestrator:
             return evt
         raise RuntimeError("No tasks found. Use `vibe task add \"...\"` first.")
 
-    def _build_context_packet(self) -> tuple[packs.ContextPacket, str]:
+    def _collect_user_hints(self, *, task_evt: LedgerEvent, limit: int = 8) -> tuple[list[str], list[str]]:
+        """
+        Collect user-provided hints/constraints that belong to the given task.
+
+        We treat hints as *requirements constraints*, not repo facts; they are still
+        persisted and pointer-backed for auditability.
+        """
+        if limit <= 0:
+            return [], []
+
+        target_ledger = self.main_ledger if (task_evt.branch_id or "main") == "main" else self.ledger
+        try:
+            events = list(target_ledger.iter_events())
+        except Exception:
+            return [], []
+
+        start_idx = -1
+        for i, e in enumerate(events):
+            if e.id == task_evt.id:
+                start_idx = i
+                break
+        if start_idx < 0:
+            return [], []
+
+        end_idx = len(events)
+        for j in range(start_idx + 1, len(events)):
+            if events[j].type == "REQ_CREATED":
+                end_idx = j
+                break
+
+        hints: list[str] = []
+        pointers: list[str] = []
+        seen: set[str] = set()
+        for e in events[start_idx + 1 : end_idx]:
+            if e.type not in {"USER_HINT_ADDED", "REQ_UPDATED"}:
+                continue
+            raw = e.meta.get("text") if isinstance(e.meta, dict) else None
+            txt = str(raw or e.summary or "").strip()
+            if not txt:
+                continue
+            txt = txt.replace("\r", " ").strip()
+            if len(txt) > 400:
+                txt = txt[:400] + "…（已截断）…"
+            if txt in seen:
+                continue
+            seen.add(txt)
+            hints.append(txt)
+            for p in list(e.pointers or [])[:4]:
+                ps = str(p).strip()
+                if ps and ps not in pointers:
+                    pointers.append(ps)
+            if len(hints) >= limit:
+                break
+
+        return hints, pointers
+
+    def _build_context_packet(self, *, task_evt: Optional[LedgerEvent] = None) -> tuple[packs.ContextPacket, str]:
         pointers: List[str] = []
         excerpts: List[str] = []
         for rel in [
@@ -114,6 +170,19 @@ class Orchestrator:
         for evt in self.ledger.iter_events(limit=20, reverse=True):
             recent.append(packs.ContextEventRef(id=evt.id, summary=evt.summary, pointers=evt.pointers))
         ctx = packs.ContextPacket(repo_pointers=pointers, recent_events=recent)
+
+        if task_evt is not None:
+            try:
+                hints, hint_ptrs = self._collect_user_hints(task_evt=task_evt, limit=8)
+            except Exception:
+                hints, hint_ptrs = [], []
+            if hints:
+                # These are high-priority constraints coming directly from the user.
+                for h in hints[:8]:
+                    ctx.constraints.append(f"用户提示（高优先级约束）：{h}")
+            if hint_ptrs:
+                ctx.log_pointers.extend(hint_ptrs[:16])
+
         return ctx, ("\n".join(excerpts).strip() if excerpts else "")
 
     def _recent_test_fail_count(self, *, lookback_events: int = 50) -> int:
@@ -1914,7 +1983,7 @@ class Orchestrator:
         release_manager = self._agent("release_manager") if "release_manager" in activated_agents else None
         support_engineer = self._agent("support_engineer") if "support_engineer" in activated_agents else None
 
-        ctx, ctx_excerpts = self._build_context_packet()
+        ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
         self._append_guarded(
             event=new_event(
                 agent="router",

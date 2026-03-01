@@ -53,11 +53,13 @@ def _guess_image_mime(path: str) -> str:
 app = typer.Typer(help="vibe coding / multi-agent orchestrator (MVP)")
 config_app = typer.Typer(help="Config commands")
 task_app = typer.Typer(help="Task commands")
+hint_app = typer.Typer(help="User hints (persistent, fed into workflow context)")
 checkpoint_app = typer.Typer(help="Checkpoint commands")
 branch_app = typer.Typer(help="Branch commands")
 
 app.add_typer(config_app, name="config")
 app.add_typer(task_app, name="task")
+app.add_typer(hint_app, name="hint")
 app.add_typer(checkpoint_app, name="checkpoint")
 app.add_typer(branch_app, name="branch")
 
@@ -149,6 +151,48 @@ def task_add(
         summary=text.strip().splitlines()[0][:200],
         branch_id=branch_id,
         meta={"text": text},
+    )
+    ledger.append(event)
+    typer.echo(event.id)
+
+
+def _latest_task_id(repo_root: Path, *, branch_id: str) -> Optional[str]:
+    led = Ledger(repo_root, branch_id=branch_id)
+    for evt in led.iter_events(types={"REQ_CREATED"}, reverse=True):
+        return evt.id
+    if branch_id != "main":
+        led_main = Ledger(repo_root, branch_id="main")
+        for evt in led_main.iter_events(types={"REQ_CREATED"}, reverse=True):
+            return evt.id
+    return None
+
+
+@hint_app.command("add")
+def hint_add(
+    ctx: typer.Context,
+    text: str = typer.Argument(..., help="Hint / constraint to persist and feed into the next workflow run"),
+    task: Optional[str] = typer.Option(None, "--task", help="Attach hint to a specific task event id (default: latest task)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
+) -> None:
+    repo_root = find_repo_root(path or Path.cwd())
+    if not (repo_root / ".vibe" / "ledger.jsonl").exists():
+        raise typer.Exit(code=2)
+
+    tools = _make_toolbox(repo_root, policy_override=(ctx.obj or {}).get("policy"))
+    branch_id = _detect_branch_id(repo_root, tools)
+    task_id = (task or "").strip() or _latest_task_id(repo_root, branch_id=branch_id)
+
+    artifacts = ArtifactsStore(repo_root)
+    hint_ptr = artifacts.put_text(text, suffix=".hint.txt", kind="user_hint").to_pointer()
+
+    ledger = Ledger(repo_root, branch_id=branch_id)
+    event = new_event(
+        agent="user",
+        type="USER_HINT_ADDED",
+        summary=text.strip().splitlines()[0][:200],
+        branch_id=branch_id,
+        pointers=[hint_ptr],
+        meta={"text": text, "task_id": task_id},
     )
     ledger.append(event)
     typer.echo(event.id)
