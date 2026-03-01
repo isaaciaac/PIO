@@ -206,10 +206,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const text = String(msg?.text || "").trim();
           const mock = Boolean(msg?.mock);
           const permissionMode = String(msg?.mode || "chat_only").trim();
-          const route = String(msg?.route || "auto").trim();
+          let route = String(msg?.route || "auto").trim();
           const agent = String(msg?.agent || "pm").trim();
           const style = String(msg?.style || "balanced").trim();
           if (!text) return;
+          if (route === "L3" || route === "L4") {
+            this.addMessage("system", `提示：当前版本未实现 ${route}，已自动降级为 L2（安全）执行。`, "系统");
+            route = "L2";
+          }
           await this.handleSend(root, text, mock, permissionMode, route, agent, style);
           return;
         }
@@ -1492,13 +1496,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
                 <option value="router">调度器（Router）</option>
               </select>
             </span>
-            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（未实现等级会报错）">
+            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（当前版本仅实现 L0–L2，选择 L3/L4 会自动降级为 L2）">
               <option value="auto" selected>路由：自动</option>
               <option value="L0">路由：L0 极速</option>
               <option value="L1">路由：L1 标准</option>
               <option value="L2">路由：L2 安全</option>
-              <option value="L3">路由：L3 发布</option>
-              <option value="L4">路由：L4 全路径</option>
+              <option value="L3">路由：L3 发布（未实现→降级 L2）</option>
+              <option value="L4">路由：L4 全路径（未实现→降级 L2）</option>
             </select>
             <select id="style" title="对话/方案的细致程度：自由发挥会更少追问、更多默认假设；细致严谨会更全面">
               <option value="balanced" selected>风格：平衡</option>

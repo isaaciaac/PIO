@@ -1006,7 +1006,16 @@ class Orchestrator:
             recent_test_fail_count=self._recent_test_fail_count(),
             requested_level=route,
         )
-        route_level = decision.route_level
+        requested_route_level = decision.route_level
+        route_level = requested_route_level
+        route_reasons = list(decision.reasons or [])
+
+        # MVP only implements L0–L2. Higher routes are planned (Phase 3+), but should not hard-fail UX.
+        # Downgrade to L2 while preserving the requested level for audit + UI messaging.
+        if route_level in {"L3", "L4"}:
+            route_reasons.insert(0, f"当前版本未实现 {route_level}（Phase 3+），已自动降级为 L2 执行")
+            route_level = "L2"
+
         activated_agents_list = self._agents_for_route(route_level)
         activated_agents: Set[str] = set(activated_agents_list)
 
@@ -1021,7 +1030,8 @@ class Orchestrator:
                 pointers=route_pointers,
                 meta={
                     "route_level": route_level,
-                    "reasons": decision.reasons,
+                    "requested_route_level": requested_route_level,
+                    "reasons": route_reasons,
                     "style": resolved_style,
                     "diff": {
                         "files": diff.file_count,
@@ -1040,13 +1050,15 @@ class Orchestrator:
                 summary=f"Activated {len(activated_agents_list)} agents",
                 branch_id=self.branch_id,
                 pointers=[],
-                meta={"route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
+                meta={
+                    "route_level": route_level,
+                    "requested_route_level": requested_route_level,
+                    "agents": activated_agents_list,
+                    "style": resolved_style,
+                },
             ),
             activated_agents=activated_agents,
         )
-
-        if route_level not in {"L0", "L1", "L2"}:
-            raise NotImplementedError(f"Route level {route_level} is not implemented yet (Phase 3+).")
 
         # Keep manifests/index fresh so agents can ground answers in repo facts.
         try:
