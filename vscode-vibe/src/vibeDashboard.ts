@@ -575,6 +575,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     let routeLevel = "";
     let agents: string[] = [];
     const seenTypes = new Set<string>();
+    let lastProgressLine = "";
 
     const tick = async () => {
       if (stopped || inFlight) return;
@@ -622,7 +623,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const short = s.length > 60 ? `${s.slice(0, 60)}…` : s;
         const routeText = routeLevel ? `（${routeLevel}）` : "";
         const detail = evtType ? ` · 最近：${who} ${evtType}${short ? `：${short}` : ""}` : "";
-        this.setStatus(`${stepText}${routeText}${detail}`);
+        const progressLine = `${stepText}${routeText}${detail}`.trim();
+        // Keep the bottom status minimal; stream the detailed line into the chat timeline.
+        this.setStatus(`${stepText}${routeText}`.trim());
+        if (progressLine && progressLine !== lastProgressLine) {
+          lastProgressLine = progressLine;
+          this.addMessage("system", progressLine, "进度");
+        }
       } finally {
         inFlight = false;
       }
@@ -638,6 +645,151 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       stopped = true;
       clearInterval(timer);
     };
+  }
+
+  private collectWorkflowFacts(
+    taskText: string,
+    taskId: string,
+    checkpointId: string,
+    cp: any | undefined,
+    events: LedgerEvent[],
+    extra?: { attempts?: number }
+  ): any {
+    const green: boolean | undefined = typeof cp?.green === "boolean" ? Boolean(cp.green) : undefined;
+    const meta = (cp && typeof cp === "object" ? cp.meta : undefined) || {};
+    const attempts = Math.max(1, Number(extra?.attempts || 1));
+
+    let routeLevel = String(meta?.route_level || "").trim();
+    if (!routeLevel) {
+      const e = events.find((x) => String(x.type || "").trim() === "ROUTE_SELECTED");
+      routeLevel = String(e?.meta?.route_level || "").trim();
+    }
+    const style = String(meta?.style || "").trim();
+    const reason = String(meta?.reason || "").trim();
+
+    let agents: string[] = Array.isArray(meta?.agents)
+      ? meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+    if (!agents.length) {
+      const e = events.find((x) => String(x.type || "").trim() === "AGENTS_ACTIVATED");
+      if (Array.isArray(e?.meta?.agents)) {
+        agents = e!.meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0);
+      }
+    }
+
+    const lastByType = (types: string[]): LedgerEvent | undefined => {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const t = String(events[i].type || "").trim();
+        if (types.includes(t)) return events[i];
+      }
+      return undefined;
+    };
+
+    const coderEvt = lastByType(["PATCH_WRITTEN", "CODE_COMMIT", "CODE_REFACTOR"]);
+    const filesChanged: string[] = Array.isArray(coderEvt?.meta?.files_changed)
+      ? coderEvt!.meta.files_changed.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const qaEvt = lastByType(["TEST_PASSED", "TEST_FAILED"]);
+    const qaCommands: string[] = Array.isArray(qaEvt?.meta?.commands)
+      ? qaEvt!.meta.commands.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+    const qaBlockers: string[] = Array.isArray(qaEvt?.meta?.blockers)
+      ? qaEvt!.meta.blockers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const reviewEvt = lastByType(["REVIEW_PASSED", "REVIEW_BLOCKED"]);
+    const reviewBlockers: string[] = Array.isArray(reviewEvt?.meta?.blockers)
+      ? reviewEvt!.meta.blockers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    return {
+      task_text: String(taskText || "").trim() || undefined,
+      task_id: taskId,
+      checkpoint_id: checkpointId,
+      green,
+      route_level: routeLevel || undefined,
+      style: style || undefined,
+      reason: reason || undefined,
+      attempts,
+      agents,
+      code_change: coderEvt
+        ? {
+            summary: String(coderEvt.summary || "").trim() || undefined,
+            files_changed: filesChanged.slice(0, 24),
+            files_changed_count: filesChanged.length,
+          }
+        : undefined,
+      qa: qaEvt
+        ? {
+            profile: String(qaEvt.meta?.profile || "").trim() || undefined,
+            result: String(qaEvt.type || "").trim() || undefined,
+            commands: qaCommands.slice(0, 10),
+            blockers: qaBlockers.slice(0, 6),
+          }
+        : undefined,
+      review: reviewEvt
+        ? {
+            result: String(reviewEvt.type || "").trim() || undefined,
+            blockers: reviewBlockers.slice(0, 6),
+          }
+        : undefined,
+    };
+  }
+
+  private async summarizeWorkflowWithPm(
+    root: string,
+    facts: any,
+    mock: boolean,
+    style: string,
+    envOverrides: NodeJS.ProcessEnv | undefined,
+    abortSignal: AbortSignal
+  ): Promise<{ text: string; pointers: string[] }> {
+    const prompt =
+      "你是产品经理（PM）。下面是一轮 Vibe 工作流的“事实数据”（JSON）。请给用户一个自然语言总结，用中文回答。\n\n" +
+      "必须包含：\n" +
+      "1) 这次做了什么（1–3 句）\n" +
+      "2) 谁参与了（列出角色）\n" +
+      "3) 当前状态（绿灯/非绿灯；如果非绿灯说明原因；不要输出事件流水账）\n" +
+      "4) 怎么用/怎么运行（从 README / run_manifest 推断，给 2–4 条具体步骤/命令）\n" +
+      "5) 数据来源真实性（如果涉及“实时数据/价格/行情”，必须明确是「真实外部数据」还是「模拟/占位数据」；如果是模拟，告诉用户如何切换到真实数据：需要哪些 key/配置、在哪个文件改）\n" +
+      "6) 下一步建议（<= 3 条）\n\n" +
+      "约束：\n" +
+      "- 不要要求用户手动运行 vibe 命令（例如不要说“请运行 vibe run”）。\n" +
+      "- 不要输出长列表/日志；避免重复“进度/事件”。\n" +
+      "- 如果你引用了仓库事实片段，请把对应指针写入输出的 pointers。\n\n" +
+      "事实（JSON）：\n" +
+      JSON.stringify(facts, null, 2);
+
+    const args = ["chat", prompt, "--path", root, "--json", "--agent", "pm"];
+    if (mock) args.push("--mock");
+    if (style) args.push("--style", style);
+    const res = await runVibeCapture(args, {
+      cwd: root,
+      mock,
+      output: this.output,
+      title: "Vibe：生成总结",
+      envOverrides,
+      policyOverride: "chat_only",
+      abortSignal,
+    });
+
+    let payload: any = undefined;
+    try {
+      payload = JSON.parse(res.stdout);
+    } catch {
+      payload = undefined;
+    }
+    const replyText = (payload?.reply ? String(payload.reply) : res.stdout).trim();
+    const actions = Array.isArray(payload?.suggested_actions)
+      ? payload.suggested_actions.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+    const pointers = Array.isArray(payload?.pointers)
+      ? payload.pointers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+      : [];
+
+    const text = actions.length ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}` : replyText;
+    return { text: text || "（无总结）", pointers };
   }
 
   private formatWorkflowNarrative(
@@ -720,8 +872,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           : reasonRaw === "fix_loop_blockers"
             ? "修复循环结束后仍存在阻塞（已创建非绿灯检查点）。"
           : reasonRaw === "chat_only"
-            ? "当前为仅聊天模式，不执行本地工具。"
-            : reasonRaw
+            ? "当前为仅聊天（只读）模式：可读取/搜索/扫描，但不执行命令、不写代码。"
+          : reasonRaw
               ? `原因：${reasonRaw}`
               : "";
 
@@ -839,6 +991,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.running = true;
     const abort = new AbortController();
     this.abort = abort;
+    this.setStatus("正在对话…");
     this.addMessage("user", text);
     this.postState();
 
@@ -869,12 +1022,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const actions = Array.isArray(payload?.suggested_actions)
         ? payload.suggested_actions.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
         : [];
+      const pointers = Array.isArray(payload?.pointers)
+        ? payload.pointers.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+        : [];
 
       const assistantText = actions.length
         ? `${replyText}\n\n下一步：\n- ${actions.join("\n- ")}`
         : replyText || "（无回复）";
 
-      this.addMessage("assistant", assistantText, this.agentTitle(agentId));
+      const withEvidence = pointers.length ? `${assistantText}\n\n证据：\n- ${pointers.join("\n- ")}` : assistantText;
+      this.addMessage("assistant", withEvidence, this.agentTitle(agentId));
     } catch (e) {
       if (e instanceof VibeRunError) {
         if (e.code === 130 || /cancelled/i.test(e.message || "")) {
@@ -893,6 +1050,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.running = false;
       this.abort = undefined;
+      this.setStatus("");
       this.postState();
     }
   }
@@ -983,8 +1141,23 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       }
 
       const events = await readLedgerEventsSince(root, before);
-      const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events, { attempts: attempt });
-      this.addMessage("assistant", narrative, "工作流");
+      // Stop streaming progress before generating the final summary (avoid interleaving).
+      stopWatcher?.();
+      stopWatcher = undefined;
+      this.setStatus("正在生成总结…");
+
+      const facts = this.collectWorkflowFacts(taskText, taskId, checkpointId, cp, events, { attempts: attempt });
+      try {
+        const summary = await this.summarizeWorkflowWithPm(root, facts, mock, style, envOverrides, abort.signal);
+        const withEvidence = summary.pointers.length
+          ? `${summary.text}\n\n证据：\n- ${summary.pointers.join("\n- ")}`
+          : summary.text;
+        this.addMessage("assistant", withEvidence, "产品经理（PM）");
+      } catch (e) {
+        // Fallback: deterministic narrative (compact) if PM summary fails.
+        const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events, { attempts: attempt });
+        this.addMessage("assistant", narrative, "工作流");
+      }
     } catch (e) {
       if (e instanceof VibeRunError) {
         if (e.code === 130 || /cancelled/i.test(e.message || "")) {
@@ -1288,7 +1461,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           <div class="leftMeta">
             <label><input type="checkbox" id="mock" /> 模拟（无需密钥）</label>
             <select id="mode" title="聊天模式：只对话（禁用本地工具）；写项目模式：允许本地工具（确认权限会逐项询问、完全授权不询问）。写项目模式下：信息足够会自动执行并落地到代码；不足会追问。">
-              <option value="chat_only" selected>仅聊天（禁用工具）</option>
+              <option value="chat_only" selected>仅聊天（只读）</option>
               <option value="prompt">确认权限（逐项询问）</option>
               <option value="allow_all">完全授权（不询问）</option>
             </select>

@@ -118,7 +118,7 @@ def generate_vibe_system_manifest(repo_root: Path) -> str:
         "- `.vibe/views/<agent_id>/`：各工种的记忆域（memory.jsonl/bookmarks/rollbacks）\n"
         "- `.vibe/manifests/`：派生索引（project/run/repo_overview 等）\n\n"
         "## 三种权限模式（policy.mode）\n\n"
-        "- `chat_only`：仅聊天（不运行本地命令、不写代码）\n"
+        "- `chat_only`：仅聊天（只读：可扫描/读取/搜索；不运行命令、不写代码、不改 git）\n"
         "- `prompt`：逐项询问授权（每次工具调用都会弹窗确认/拒绝）\n"
         "- `allow_all`：完全授权（不询问，按策略自动执行）\n\n"
         "## 路由等级（L0–L4）\n\n"

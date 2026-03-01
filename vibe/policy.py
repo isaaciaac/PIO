@@ -36,10 +36,26 @@ class ToolPolicy:
         self.mode = mode
         self._session_allow_all = False
 
+    def _chat_only_allows(self, *, tool: str, detail: str) -> bool:
+        t = (tool or "").strip()
+        d = (detail or "").strip().lower()
+        if t in {"read_file", "search", "scan_repo"}:
+            return True
+        if t == "git":
+            # Read-only git operations used for grounding context.
+            if d.startswith("git diff") or " diff" in d:
+                return True
+            if "rev-parse" in d or "--is-inside-work-tree" in d:
+                return True
+            return False
+        return False
+
     def check(self, *, agent_id: str, tool: str, detail: str) -> None:
         if self.mode == "allow_all" or self._session_allow_all:
             return
         if self.mode == "chat_only":
+            if self._chat_only_allows(tool=tool, detail=detail):
+                return
             raise PolicyDeniedError(f"Denied by policy(chat_only): {agent_id} -> {tool}: {detail}")
         if self.mode != "prompt":
             raise PolicyDeniedError(f"Denied by unknown policy mode {self.mode!r}")
@@ -128,4 +144,3 @@ def resolve_policy_mode(config_mode: PolicyMode, *, override: Optional[str] = No
     if mode not in {"allow_all", "prompt", "chat_only"}:
         raise ValueError(f"Invalid policy mode: {mode!r}")
     return mode  # type: ignore[return-value]
-

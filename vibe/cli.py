@@ -340,8 +340,10 @@ def chat(
     # Ground chat with a small set of repo facts when policy allows (read-only).
     repo_chunks: list[str] = []
     repo_pointers: list[str] = []
+    policy_override = (ctx.obj or {}).get("policy")
+    effective_policy = resolve_policy_mode(cfg.policy.mode, override=policy_override)
     try:
-        tools = _make_toolbox(repo_root, policy_override=(ctx.obj or {}).get("policy"))
+        tools = _make_toolbox(repo_root, policy_override=policy_override)
     except Exception:
         tools = None
     if tools is not None:
@@ -395,11 +397,17 @@ def chat(
             "或使用 VS Code 扩展在写项目模式下继续描述需求（信息足够会自动执行）。"
         )
 
+    mode_banner = (
+        "当前模式：仅聊天（只读）。我可以扫描/读取/搜索仓库来回答问题，但不能运行命令、修改文件或改动 git。"
+        if effective_policy == "chat_only"
+        else "当前模式：可使用本地工具（受权限策略控制）。"
+    )
+
     system = (
         f"你是 Vibe 系统里的一个工种代理。{role_hint}\n\n"
         "你要用自然语言与用户对话，帮助用户把问题变成可执行的下一步（必要时给出验收标准/风险点/排障步骤）。\n\n"
-        "重要：你现在只是在“对话”模式下回答问题，不能直接运行命令、修改文件、创建分支或提交代码。"
-        "不要声称“已经生成/已经创建/已经运行/已经修改”。\n"
+        f"{mode_banner}\n"
+        "重要：你现在只是在“对话”模式下回答问题。不要声称“已经生成/已经创建/已经运行/已经修改”。\n"
         "当用户只是询问现状/进度/怎么运行/为什么失败时，你应直接基于可追溯事实片段回答，不要反复要求用户先运行什么。\n"
         f"{exec_hint}\n\n"
         f"{style_text}\n\n"
@@ -438,6 +446,49 @@ def chat(
     messages.extend(past)
     messages.append({"role": "user", "content": message})
     reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=style_temperature(resolved_style))
+
+    # Normalize/repair pointers:
+    # - Prefer verifiable pointers (path#Lx-Ly@sha256 / artifact@sha256)
+    # - If the model outputs a plain repo-relative file path, try to expand it to a pointer by reading a small excerpt.
+    def _looks_like_repo_path(s: str) -> bool:
+        if not s or len(s) > 240:
+            return False
+        if any(c.isspace() for c in s):
+            return False
+        if "@" in s or "#L" in s:
+            return False
+        if ":" in s:
+            # Avoid Windows drive paths or URLs.
+            return False
+        return ("/" in s or "\\" in s or s.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".toml", ".yaml", ".yml")))
+
+    repaired: list[str] = []
+    if tools is not None:
+        for raw in list(reply.pointers or [])[:12]:
+            s = str(raw).strip()
+            if not s:
+                continue
+            if "@sha256:" in s:
+                repaired.append(s)
+                continue
+            if _looks_like_repo_path(s):
+                try:
+                    rr = tools.read_file(agent_id=agent_id, path=s.replace("\\", "/"), start_line=1, end_line=200)
+                    repaired.append(rr.pointer)
+                except Exception:
+                    continue
+
+    # Ensure chat replies include at least some traceable pointers when we provided repo excerpts.
+    merged: list[str] = []
+    seen: set[str] = set()
+    for p in repaired + list(repo_pointers):
+        s = str(p).strip()
+        if not s or "@sha256:" not in s or s in seen:
+            continue
+        seen.add(s)
+        merged.append(s)
+    if merged:
+        reply = reply.model_copy(update={"pointers": merged[:24]})
 
     _append_chat_history(hist_path, role="user", content=message)
     _append_chat_history(hist_path, role="assistant", content=reply.reply)
