@@ -845,19 +845,35 @@ class Orchestrator:
 
         planned = {norm(w.path) for w in change.writes if (w.path or "").strip()}
         planned_lower = {p.lower() for p in planned}
+        planned_text_by_path_lower = {norm(w.path).lower(): (w.content or "") for w in change.writes if (w.path or "").strip()}
 
-        def extract_relative_specs(text: str) -> list[str]:
-            # Best-effort: cover common import styles. We only care about specs starting with '.'
+        def _read_text_best_effort(rel_path: str) -> Optional[str]:
+            rel = norm(rel_path)
+            if not rel:
+                return None
+            key = rel.lower()
+            if key in planned_text_by_path_lower:
+                return planned_text_by_path_lower[key]
+            p = (self.repo_root / rel).resolve()
+            if not p.exists() or not p.is_file():
+                return None
+            try:
+                return p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return None
+
+        def extract_import_specs(text: str) -> list[str]:
+            # Best-effort: cover common import styles.
             t = text or ""
             specs: list[str] = []
-            pat_from = re.compile(r"\b(?:import|export)\b[\s\S]*?\bfrom\s*(['\"])(\.[^'\"]+)\1", re.MULTILINE)
-            pat_side = re.compile(r"\bimport\s*(['\"])(\.[^'\"]+)\1", re.MULTILINE)
-            pat_req = re.compile(r"\brequire\s*\(\s*(['\"])(\.[^'\"]+)\1\s*\)", re.MULTILINE)
-            pat_dyn = re.compile(r"\bimport\s*\(\s*(['\"])(\.[^'\"]+)\1\s*\)", re.MULTILINE)
+            pat_from = re.compile(r"\b(?:import|export)\b[\s\S]*?\bfrom\s*(['\"])([^'\"]+)\1", re.MULTILINE)
+            pat_side = re.compile(r"\bimport\s*(['\"])([^'\"]+)\1", re.MULTILINE)
+            pat_req = re.compile(r"\brequire\s*\(\s*(['\"])([^'\"]+)\1\s*\)", re.MULTILINE)
+            pat_dyn = re.compile(r"\bimport\s*\(\s*(['\"])([^'\"]+)\1\s*\)", re.MULTILINE)
             for pat in (pat_from, pat_side, pat_req, pat_dyn):
                 for m in pat.finditer(t):
                     spec = (m.group(2) or "").strip()
-                    if spec.startswith("."):
+                    if spec:
                         specs.append(spec)
             # De-dup while preserving order.
             seen: set[str] = set()
@@ -895,7 +911,9 @@ class Orchestrator:
                 continue
             if Path(importer_rel).suffix.lower() not in js_like:
                 continue
-            for spec in extract_relative_specs(w.content):
+            for spec in extract_import_specs(w.content):
+                if not spec.startswith("."):
+                    continue
                 cands = resolve_candidates(importer_rel, spec)
                 if not cands:
                     continue
@@ -922,6 +940,184 @@ class Orchestrator:
             raise RuntimeError(
                 "Missing referenced modules in CodeChange.writes. "
                 "If you introduce a new relative import, you MUST also create that file in writes (or fix the import).\n"
+                f"{lines}"
+            )
+
+        # Validate bare imports against package.json dependencies (best-effort).
+        node_builtins = {
+            "assert",
+            "async_hooks",
+            "buffer",
+            "child_process",
+            "cluster",
+            "console",
+            "constants",
+            "crypto",
+            "dgram",
+            "diagnostics_channel",
+            "dns",
+            "domain",
+            "events",
+            "fs",
+            "http",
+            "http2",
+            "https",
+            "inspector",
+            "module",
+            "net",
+            "os",
+            "path",
+            "perf_hooks",
+            "process",
+            "punycode",
+            "querystring",
+            "readline",
+            "repl",
+            "stream",
+            "string_decoder",
+            "timers",
+            "tls",
+            "tty",
+            "url",
+            "util",
+            "v8",
+            "vm",
+            "worker_threads",
+            "zlib",
+        }
+
+        def _base_package(spec: str) -> str:
+            s = (spec or "").strip()
+            s = s.split("?", 1)[0].split("#", 1)[0].strip()
+            if not s:
+                return ""
+            if s.startswith("node:"):
+                s = s[len("node:") :]
+            if s.startswith("@"):
+                parts = [p for p in s.split("/") if p]
+                if len(parts) >= 2:
+                    return f"{parts[0]}/{parts[1]}"
+                return s
+            return s.split("/", 1)[0].strip()
+
+        def _is_local_alias(spec: str, *, aliases: list[str]) -> bool:
+            s = (spec or "").strip()
+            if not s:
+                return False
+            if s.startswith(("@/", "~/")):
+                return True
+            if s.startswith(("#", "virtual:", "data:", "http://", "https://")):
+                return True
+            for a in aliases:
+                if a and s.startswith(a):
+                    return True
+            return False
+
+        def _tsconfig_aliases(node_dir: Path) -> list[str]:
+            aliases: list[str] = []
+            rel = (node_dir / "tsconfig.json").as_posix() if str(node_dir) not in {"", "."} else "tsconfig.json"
+            raw = _read_text_best_effort(rel)
+            if not raw:
+                return []
+            try:
+                data = json.loads(raw)
+            except Exception:
+                return []
+            paths = (((data.get("compilerOptions") or {}).get("paths")) or {}) if isinstance(data, dict) else {}
+            if not isinstance(paths, dict):
+                return []
+            for k in paths.keys():
+                kk = str(k).replace("\\", "/").strip()
+                if not kk or kk.startswith("."):
+                    continue
+                pre = kk.split("*", 1)[0]
+                if pre:
+                    aliases.append(pre)
+            # Prefer longer prefixes first to reduce accidental matches.
+            out: list[str] = []
+            seen: set[str] = set()
+            for a in sorted(aliases, key=lambda x: (-len(x), x)):
+                if a not in seen:
+                    seen.add(a)
+                    out.append(a)
+            return out
+
+        def _find_pkg_dir(importer_rel: str) -> Optional[Path]:
+            p = Path(importer_rel).parent
+            while True:
+                rel = (p / "package.json").as_posix() if str(p) not in {"", "."} else "package.json"
+                if _read_text_best_effort(rel) is not None:
+                    return p
+                if str(p) in {"", "."}:
+                    break
+                parent = p.parent
+                if parent == p:
+                    break
+                p = parent
+            if _read_text_best_effort("package.json") is not None:
+                return Path(".")
+            return None
+
+        def _deps_for_pkg_dir(pkg_dir: Path) -> set[str]:
+            deps: set[str] = set()
+            rels = []
+            rels.append((pkg_dir / "package.json").as_posix() if str(pkg_dir) not in {"", "."} else "package.json")
+            if str(pkg_dir) not in {"", "."}:
+                rels.append("package.json")  # allow hoisted deps (npm/yarn workspaces)
+            for rel in rels:
+                raw = _read_text_best_effort(rel)
+                if not raw:
+                    continue
+                try:
+                    pkg = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(pkg, dict):
+                    continue
+                for k in ("dependencies", "devDependencies", "optionalDependencies"):
+                    d = pkg.get(k)
+                    if isinstance(d, dict):
+                        deps.update({str(x).strip() for x in d.keys() if str(x).strip()})
+            return deps
+
+        missing_deps: list[tuple[str, str]] = []
+        for w in change.writes:
+            importer_rel = norm(w.path)
+            if not importer_rel:
+                continue
+            if Path(importer_rel).suffix.lower() not in js_like:
+                continue
+
+            pkg_dir = _find_pkg_dir(importer_rel)
+            if pkg_dir is None:
+                continue
+            deps = _deps_for_pkg_dir(pkg_dir)
+            aliases = _tsconfig_aliases(pkg_dir)
+
+            for spec in extract_import_specs(w.content):
+                s = (spec or "").strip()
+                if not s or s.startswith("."):
+                    continue
+                if _is_local_alias(s, aliases=aliases):
+                    continue
+                base = _base_package(s)
+                if not base:
+                    continue
+                if base in node_builtins:
+                    continue
+                if base not in deps:
+                    missing_deps.append((importer_rel, base))
+                    if len(missing_deps) >= 12:
+                        break
+            if len(missing_deps) >= 12:
+                break
+
+        if missing_deps:
+            lines = "\n".join([f"- {imp}: {pkg}" for imp, pkg in missing_deps[:8]])
+            raise RuntimeError(
+                "Missing npm dependencies for imports in CodeChange.writes. "
+                "If you import a package, you MUST add it to the nearest package.json "
+                "(dependencies/devDependencies) for that node project, or remove the import.\n"
                 f"{lines}"
             )
 
@@ -1055,6 +1251,7 @@ class Orchestrator:
                         "Failed to apply patch via git apply",
                         "is not in the subpath of",
                         "Missing referenced modules in CodeChange.writes",
+                        "Missing npm dependencies for imports in CodeChange.writes",
                     ]
                 )
                 if not repairable or attempt >= max_repairs:
@@ -1070,6 +1267,7 @@ class Orchestrator:
                     "- 如果你要写文档，请写到 `docs/...` 或 `README.md`，不要写到 `.vibe/docs/...`。\n"
                     "- 优先使用 `writes` 给出完整文件内容；不要依赖 patch 指针。\n"
                     "- 如果你新增了相对 import（例如 `../controllers/x`），必须在 writes 里创建对应文件（或改成指向已存在文件）。\n"
+                    "- 如果你新增了外部依赖（例如 `import axios from 'axios'`），必须在对应的 `package.json`（dependencies/devDependencies）里声明它。\n"
                     "- 保持原意不变：只修复路径/可落地性问题，不要引入大重构。\n\n"
                     "请只输出符合 CodeChange schema 的 JSON（不要 markdown，不要包裹对象）。\n\n"
                     f"上一个 CodeChange（供参考）：\n{prev}\n"
@@ -1595,6 +1793,7 @@ class Orchestrator:
                 "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
                 "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                 "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
+                "- Do not import new npm packages unless you ALSO add them to the correct `package.json` (dependencies/devDependencies) in writes.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
@@ -2211,13 +2410,14 @@ class Orchestrator:
                             "Hard rules:\n"
                             "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
                             "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
-                            "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
-                            "- Do not do architecture refactors during fix-loop.\n"
-                            "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
-                            f"{workflow_hint}"
-                        ),
-                        user=fix_user,
-                    )
+                        "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
+                        "- Do not do architecture refactors during fix-loop.\n"
+                        "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
+                        "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=fix_user,
+                )
                     change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
                     change, write_pointers = self._materialize_code_change_with_repair(
                         change=change,
