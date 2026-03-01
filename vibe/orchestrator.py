@@ -322,27 +322,27 @@ class Orchestrator:
             return "coder_frontend"
         return "coder_backend"
 
-    def _agents_for_route(self, route_level: packs.RouteLevel) -> list[str]:
+    def _agent_pool_for_route(self, route_level: packs.RouteLevel) -> list[str]:
+        """
+        Agent pool is a *preference list* (configurable). It is NOT a hard restriction:
+        required gates may pull in additional agents, and incident-driven routing may
+        consult extra agents when needed.
+        """
+
         profile = (self.config.routes.levels or {}).get(route_level)
         agents = list(profile.agents) if profile else []
         if not agents:
             # Backward compatible fallback: treat as L1 minimal set.
             agents = ["pm", "router", "coder_backend", "qa"] if route_level != "L0" else ["router", "coder_backend", "qa"]
 
-        # Helper coders (hard logic): keep routes fixed while enabling better error triage.
-        # These agents are only invoked when needed; activating them upfront keeps ledger
-        # permissions auditable without mid-run escalation.
+        # Router/coder/qa are baseline; keep them in pool so on-demand activation is possible.
+        baseline = ["router", "coder_backend", "qa"]
         if route_level != "L0":
-            for extra in ["coder_frontend", "env_engineer"]:
-                if extra in self.config.agents and extra not in agents:
-                    agents.append(extra)
-        if route_level in {"L2", "L3", "L4"}:
-            for extra in ["integration_engineer"]:
-                if extra in self.config.agents and extra not in agents:
-                    agents.append(extra)
-        # Router is mandatory for ledger/gates.
-        if "router" not in agents:
-            agents = ["router", *agents]
+            baseline.insert(1, "pm")
+        for b in baseline:
+            if b in self.config.agents and b not in agents:
+                agents.insert(0, b) if b == "router" else agents.append(b)
+
         # De-duplicate while preserving order.
         out: list[str] = []
         seen: set[str] = set()
@@ -353,6 +353,31 @@ class Orchestrator:
             seen.add(a)
             out.append(a)
         return out
+
+    def _required_agents_for_route(self, route_level: packs.RouteLevel, *, risks: RiskSignals) -> list[str]:
+        """
+        Minimal activation set for the workflow start.
+
+        We intentionally keep this small and activate additional agents *on-demand* right
+        before the gate that needs them. This makes the system less "flowchart-ish" while
+        keeping hard gates auditable (each activation is logged).
+        """
+
+        req: list[str] = []
+
+        def add(x: str) -> None:
+            if x in self.config.agents and x not in req:
+                req.append(x)
+
+        # Router is mandatory for ledger/gates.
+        add("router")
+        add("coder_backend")
+        add("qa")
+
+        if route_level != "L0":
+            add("pm")
+
+        return req
 
     def _append_guarded(self, *, event: LedgerEvent, activated_agents: Set[str]) -> None:
         if event.agent != "user" and event.agent not in activated_agents:
@@ -2081,7 +2106,14 @@ class Orchestrator:
         route_level = requested_route_level
         route_reasons = list(decision.reasons or [])
 
-        activated_agents_list = self._agents_for_route(route_level)
+        agent_pool_list = self._agent_pool_for_route(route_level)
+        agent_pool: Set[str] = set(agent_pool_list)
+
+        activated_agents_list = self._required_agents_for_route(route_level, risks=risks)
+        for a in activated_agents_list:
+            if a not in agent_pool:
+                agent_pool.add(a)
+                agent_pool_list.append(a)
         activated_agents: Set[str] = set(activated_agents_list)
 
         # Ledger: route selection + activation set (must be auditable).
@@ -2118,12 +2150,44 @@ class Orchestrator:
                 meta={
                     "route_level": route_level,
                     "requested_route_level": requested_route_level,
+                    "agent_pool": agent_pool_list,
                     "agents": activated_agents_list,
                     "style": resolved_style,
                 },
             ),
             activated_agents=activated_agents,
         )
+
+        def activate_agent(agent_id: str, *, reason: str) -> None:
+            nonlocal activated_agents_list, activated_agents, agent_pool_list, agent_pool
+            a = (agent_id or "").strip()
+            if not a or a in activated_agents:
+                return
+            if a not in self.config.agents:
+                return
+            activated_agents.add(a)
+            activated_agents_list.append(a)
+            if a not in agent_pool:
+                agent_pool.add(a)
+                agent_pool_list.append(a)
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="AGENTS_ACTIVATED",
+                    summary=f"Activated agent {a}",
+                    branch_id=self.branch_id,
+                    pointers=[],
+                    meta={
+                        "route_level": route_level,
+                        "requested_route_level": requested_route_level,
+                        "reason": reason,
+                        "added": [a],
+                        "agents": activated_agents_list,
+                        "style": resolved_style,
+                    },
+                ),
+                activated_agents=activated_agents,
+            )
 
         # Keep manifests/index fresh so agents can ground answers in repo facts.
         try:
@@ -2134,23 +2198,24 @@ class Orchestrator:
             pass
 
         router = self._agent("router")
-        pm = self._agent("pm") if "pm" in activated_agents else None
-        req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in activated_agents else None
-        architect = self._agent("architect") if "architect" in activated_agents else None
-        api_confirm = self._agent("api_confirm") if "api_confirm" in activated_agents else None
-        env_engineer = self._agent("env_engineer") if "env_engineer" in activated_agents else None
+        pm = self._agent("pm") if "pm" in self.config.agents else None
+        req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in self.config.agents else None
+        architect = self._agent("architect") if "architect" in self.config.agents else None
+        api_confirm = self._agent("api_confirm") if "api_confirm" in self.config.agents else None
+        env_engineer = self._agent("env_engineer") if "env_engineer" in self.config.agents else None
         coder_backend = self._agent("coder_backend")
-        coder_frontend = self._agent("coder_frontend") if "coder_frontend" in activated_agents else None
-        integrator = self._agent("integration_engineer") if "integration_engineer" in activated_agents else None
-        reviewer = self._agent("code_reviewer") if "code_reviewer" in activated_agents else None
-        security = self._agent("security") if "security" in activated_agents else None
-        compliance = self._agent("compliance") if "compliance" in activated_agents else None
-        performance = self._agent("performance") if "performance" in activated_agents else None
-        data_engineer = self._agent("data_engineer") if "data_engineer" in activated_agents else None
-        devops = self._agent("devops") if "devops" in activated_agents else None
-        doc_writer = self._agent("doc_writer") if "doc_writer" in activated_agents else None
-        release_manager = self._agent("release_manager") if "release_manager" in activated_agents else None
-        support_engineer = self._agent("support_engineer") if "support_engineer" in activated_agents else None
+        coder_frontend = self._agent("coder_frontend") if "coder_frontend" in self.config.agents else None
+        integrator = self._agent("integration_engineer") if "integration_engineer" in self.config.agents else None
+        reviewer = self._agent("code_reviewer") if "code_reviewer" in self.config.agents else None
+        security = self._agent("security") if "security" in self.config.agents else None
+        compliance = self._agent("compliance") if "compliance" in self.config.agents else None
+        performance = self._agent("performance") if "performance" in self.config.agents else None
+        data_engineer = self._agent("data_engineer") if "data_engineer" in self.config.agents else None
+        devops = self._agent("devops") if "devops" in self.config.agents else None
+        doc_writer = self._agent("doc_writer") if "doc_writer" in self.config.agents else None
+        release_manager = self._agent("release_manager") if "release_manager" in self.config.agents else None
+        support_engineer = self._agent("support_engineer") if "support_engineer" in self.config.agents else None
+        specialist = self._agent("specialist") if "specialist" in self.config.agents else None
 
         ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
         self._append_guarded(
@@ -2173,8 +2238,9 @@ class Orchestrator:
         contract: Optional[packs.ContractPack] = None
         contract_ptr: Optional[str] = None
         if route_level != "L0":
+            activate_agent("pm", reason="gate:requirements")
             if not pm:
-                raise RuntimeError("pm must be activated for L1+ routes")
+                raise RuntimeError("pm is required for L1+ routes")
             pm_user = f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
             if ctx_excerpts:
                 pm_user = f"{pm_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
@@ -2212,8 +2278,9 @@ class Orchestrator:
             )
 
         if route_level in {"L2", "L3", "L4"}:
+            activate_agent("requirements_analyst", reason="gate:usecases")
             if req_analyst is None:
-                raise RuntimeError("requirements_analyst must be activated for L2+ routes")
+                raise RuntimeError("requirements_analyst is required for L2+ routes")
             ua_user = f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
             if ctx_excerpts:
                 ua_user = f"{ua_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
@@ -2241,8 +2308,9 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
+            activate_agent("architect", reason="gate:adr")
             if architect is None:
-                raise RuntimeError("architect must be activated for L2+ routes")
+                raise RuntimeError("architect is required for L2+ routes")
             adr_user = (
                 f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
@@ -2274,8 +2342,9 @@ class Orchestrator:
             )
 
             if risks.contract_change or risks.touches_external_api:
+                activate_agent("api_confirm", reason="gate:contract")
                 if api_confirm is None:
-                    raise RuntimeError("api_confirm must be activated for contract/external API changes")
+                    raise RuntimeError("api_confirm is required for contract/external API changes")
                 contract_user = (
                     f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                     f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
@@ -2351,11 +2420,13 @@ class Orchestrator:
             activated_agents=activated_agents,
         )
 
-        primary_coder_id = self._select_primary_coder(task_text=task_text, risks=risks, activated_agents=activated_agents)
+        available_agents: Set[str] = set(self.config.agents.keys())
+        primary_coder_id = self._select_primary_coder(task_text=task_text, risks=risks, activated_agents=available_agents)
         if primary_coder_id == "coder_frontend" and coder_frontend is None:
             primary_coder_id = "coder_backend"
         if primary_coder_id == "integration_engineer" and integrator is None:
             primary_coder_id = "coder_backend"
+        activate_agent(primary_coder_id, reason="gate:implement")
 
         primary_coder = (
             coder_frontend
@@ -2477,6 +2548,7 @@ class Orchestrator:
                 return envspec_ptr, envspec_commands
             if env_engineer is None:
                 return None, []
+            activate_agent("env_engineer", reason="gate:envspec")
             try:
                 env_user = (
                     f"Task:\n{task_text}\n\n"
@@ -2559,7 +2631,7 @@ class Orchestrator:
         # L3/L4 require EnvSpec as an auditable deliverable.
         if route_level in {"L3", "L4"}:
             if env_engineer is None:
-                raise RuntimeError("env_engineer must be activated for L3+ routes")
+                raise RuntimeError("env_engineer is required for L3+ routes")
             maybe_envspec(reason="L3+ env gate", event_type="ENV_UPDATED")
 
         # On-demand env probing (L1/L2): if we can't find any runnable QA commands,
@@ -2679,8 +2751,9 @@ class Orchestrator:
         review_ptr: Optional[str] = None
 
         def run_review() -> tuple[packs.ReviewReport, str]:
+            activate_agent("code_reviewer", reason="gate:review")
             if not reviewer:
-                raise RuntimeError("code_reviewer must be activated for L2+ routes")
+                raise RuntimeError("code_reviewer is required for L2+ routes")
 
             review_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
@@ -2737,8 +2810,9 @@ class Orchestrator:
         perf_failed = False
 
         def run_security() -> tuple[packs.RiskRegister, str, bool]:
+            activate_agent("security", reason="gate:security")
             if not security:
-                raise RuntimeError("security must be activated for L3+ routes")
+                raise RuntimeError("security is required for L3+ routes")
             sec_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
@@ -2780,8 +2854,9 @@ class Orchestrator:
             return reg, ptr, passed
 
         def run_compliance() -> tuple[packs.ComplianceReport, str, bool]:
+            activate_agent("compliance", reason="gate:compliance")
             if not compliance:
-                raise RuntimeError("compliance must be activated for L4 routes")
+                raise RuntimeError("compliance is required for L4 routes")
             comp_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
@@ -2819,8 +2894,9 @@ class Orchestrator:
             return cr, ptr, passed
 
         def run_perf() -> tuple[packs.PerfReport, str, bool]:
+            activate_agent("performance", reason="gate:performance")
             if not performance:
-                raise RuntimeError("performance must be activated for L4 routes")
+                raise RuntimeError("performance is required for L4 routes")
             perf_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
@@ -2928,7 +3004,7 @@ class Orchestrator:
                 incident_ptr: Optional[str] = None
                 if blocker_source == "tests":
                     try:
-                        incident = self._incident_for_tests(report=report, blocker_text=blocker_text, activated_agents=activated_agents)
+                        incident = self._incident_for_tests(report=report, blocker_text=blocker_text, activated_agents=available_agents)
                         incident_ptr = self.artifacts.put_json(
                             incident.model_dump(), suffix=".incident.json", kind="incident"
                         ).to_pointer()
@@ -2965,18 +3041,19 @@ class Orchestrator:
                         incident_ptr = None
 
                 if blocker_source == "review":
-                    fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=activated_agents)
+                    fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=available_agents)
                 elif blocker_source == "tests":
                     fix_coder_id = (incident.suggested_fix_agent if incident is not None else None) or self._select_fix_coder_for_tests(
-                        report=report, blocker_text=blocker_text, activated_agents=activated_agents
+                        report=report, blocker_text=blocker_text, activated_agents=available_agents
                     )
                 else:
-                    fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=activated_agents)
+                    fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=available_agents)
 
                 if fix_coder_id == "coder_frontend" and coder_frontend is None:
                     fix_coder_id = "coder_backend"
                 if fix_coder_id == "integration_engineer" and integrator is None:
                     fix_coder_id = "coder_backend"
+                activate_agent(fix_coder_id, reason="gate:fix_loop")
 
                 fix_coder = (
                     coder_frontend
@@ -3324,8 +3401,9 @@ class Orchestrator:
         migration_ptr: Optional[str] = None
 
         if route_level in {"L3", "L4"}:
+            activate_agent("doc_writer", reason="gate:docs")
             if doc_writer is None:
-                raise RuntimeError("doc_writer must be activated for L3+ routes")
+                raise RuntimeError("doc_writer is required for L3+ routes")
             doc_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
@@ -3363,8 +3441,9 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
+            activate_agent("release_manager", reason="gate:release_notes")
             if release_manager is None:
-                raise RuntimeError("release_manager must be activated for L3+ routes")
+                raise RuntimeError("release_manager is required for L3+ routes")
             rel_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"CodeChange:\n{change.model_dump_json()}\n\n"
@@ -3405,6 +3484,7 @@ class Orchestrator:
             ]
             needs_ci = risks.touches_release or any(m.exists() for m in ci_markers) or ("ci" in (task_text or "").lower())
             if needs_ci and devops is not None:
+                activate_agent("devops", reason="gate:ci")
                 ci_user = (
                     f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                     f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
@@ -3436,8 +3516,9 @@ class Orchestrator:
                 )
 
         if route_level == "L4":
+            activate_agent("support_engineer", reason="gate:runbook")
             if support_engineer is None:
-                raise RuntimeError("support_engineer must be activated for L4 routes")
+                raise RuntimeError("support_engineer is required for L4 routes")
             rb_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
@@ -3469,8 +3550,9 @@ class Orchestrator:
             )
 
             if risks.touches_migration:
+                activate_agent("data_engineer", reason="gate:migration")
                 if data_engineer is None:
-                    raise RuntimeError("data_engineer must be activated for migration tasks in L4")
+                    raise RuntimeError("data_engineer is required for migration tasks in L4")
                 mig_user = (
                     f"Task:\n{task_text}\n\n"
                     f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
