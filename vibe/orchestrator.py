@@ -215,6 +215,20 @@ class Orchestrator:
             return "coder_frontend"
         return "coder_backend"
 
+    def _select_fix_coder_for_text(self, *, text: str, activated_agents: Set[str]) -> str:
+        combined = (text or "").lower()
+        if "integration_engineer" in activated_agents and any(
+            k in combined for k in ["contract", "契约", "route", "router", "mismatch", "integration", "兼容"]
+        ):
+            return "integration_engineer"
+        front = any(k in combined for k in ["tsx", "jsx", "react", "frontend", "vite", "client/", "client\\", "eslint"])
+        back = any(k in combined for k in ["backend/", "backend\\", "server/", "api/", "express", "prisma", "knex", "pytest", "unittest"])
+        if front and back and "integration_engineer" in activated_agents:
+            return "integration_engineer"
+        if front and "coder_frontend" in activated_agents:
+            return "coder_frontend"
+        return "coder_backend"
+
     def _agents_for_route(self, route_level: packs.RouteLevel) -> list[str]:
         profile = (self.config.routes.levels or {}).get(route_level)
         agents = list(profile.agents) if profile else []
@@ -1010,12 +1024,6 @@ class Orchestrator:
         route_level = requested_route_level
         route_reasons = list(decision.reasons or [])
 
-        # MVP only implements L0–L2. Higher routes are planned (Phase 3+), but should not hard-fail UX.
-        # Downgrade to L2 while preserving the requested level for audit + UI messaging.
-        if route_level in {"L3", "L4"}:
-            route_reasons.insert(0, f"当前版本未实现 {route_level}（Phase 3+），已自动降级为 L2 执行")
-            route_level = "L2"
-
         activated_agents_list = self._agents_for_route(route_level)
         activated_agents: Set[str] = set(activated_agents_list)
 
@@ -1078,6 +1086,14 @@ class Orchestrator:
         coder_frontend = self._agent("coder_frontend") if "coder_frontend" in activated_agents else None
         integrator = self._agent("integration_engineer") if "integration_engineer" in activated_agents else None
         reviewer = self._agent("code_reviewer") if "code_reviewer" in activated_agents else None
+        security = self._agent("security") if "security" in activated_agents else None
+        compliance = self._agent("compliance") if "compliance" in activated_agents else None
+        performance = self._agent("performance") if "performance" in activated_agents else None
+        data_engineer = self._agent("data_engineer") if "data_engineer" in activated_agents else None
+        devops = self._agent("devops") if "devops" in activated_agents else None
+        doc_writer = self._agent("doc_writer") if "doc_writer" in activated_agents else None
+        release_manager = self._agent("release_manager") if "release_manager" in activated_agents else None
+        support_engineer = self._agent("support_engineer") if "support_engineer" in activated_agents else None
 
         ctx, ctx_excerpts = self._build_context_packet()
         self._append_guarded(
@@ -1138,67 +1154,71 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
-        if route_level == "L2":
-            if req_analyst:
-                ua_user = f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
-                if ctx_excerpts:
-                    ua_user = f"{ua_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-                ua_msgs = self._messages_with_memory(
-                    agent_id="requirements_analyst",
-                    system=(
-                        "You are Requirements Analyst. Return JSON only for UseCasePack with fields: "
-                        "positive (string[]), negative (string[]), edge_cases (string[]). "
-                        "No extra keys. No wrapping object. No markdown.\n\n"
-                        f"{workflow_hint}"
-                    ),
-                    user=ua_user,
-                )
-                usecases, _ = req_analyst.chat_json(schema=packs.UseCasePack, messages=ua_msgs, user=ua_user)
-                usecases_ptr = self.artifacts.put_json(usecases.model_dump(), suffix=".usecases.json", kind="usecases").to_pointer()
-                self._append_guarded(
-                    event=new_event(
-                        agent="requirements_analyst",
-                        type="USECASES_DEFINED",
-                        summary="Use cases defined",
-                        branch_id=self.branch_id,
-                        pointers=[usecases_ptr],
-                        meta={"route_level": route_level, "style": resolved_style},
-                    ),
-                    activated_agents=activated_agents,
-                )
+        if route_level in {"L2", "L3", "L4"}:
+            if req_analyst is None:
+                raise RuntimeError("requirements_analyst must be activated for L2+ routes")
+            ua_user = f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            if ctx_excerpts:
+                ua_user = f"{ua_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            ua_msgs = self._messages_with_memory(
+                agent_id="requirements_analyst",
+                system=(
+                    "You are Requirements Analyst. Return JSON only for UseCasePack with fields: "
+                    "positive (string[]), negative (string[]), edge_cases (string[]). "
+                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=ua_user,
+            )
+            usecases, _ = req_analyst.chat_json(schema=packs.UseCasePack, messages=ua_msgs, user=ua_user)
+            usecases_ptr = self.artifacts.put_json(usecases.model_dump(), suffix=".usecases.json", kind="usecases").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="requirements_analyst",
+                    type="USECASES_DEFINED",
+                    summary="Use cases defined",
+                    branch_id=self.branch_id,
+                    pointers=[usecases_ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
 
-            if architect:
-                adr_user = (
-                    f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
-                    f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
-                )
-                if ctx_excerpts:
-                    adr_user = f"{adr_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-                adr_msgs = self._messages_with_memory(
-                    agent_id="architect",
-                    system=(
-                        "You are Architect. Produce an ADR-lite. Return JSON only for DecisionPack with fields: "
-                        "adrs (list[object]). Each adr should include at least: title, context, decision, consequences. "
-                        "No extra keys. No wrapping object. No markdown.\n\n"
-                        f"{workflow_hint}"
-                    ),
-                    user=adr_user,
-                )
-                decisions, _ = architect.chat_json(schema=packs.DecisionPack, messages=adr_msgs, user=adr_user)
-                decisions_ptr = self.artifacts.put_json(decisions.model_dump(), suffix=".adr.json", kind="adr").to_pointer()
-                self._append_guarded(
-                    event=new_event(
-                        agent="architect",
-                        type="ADR_ADDED",
-                        summary="ADR-lite added",
-                        branch_id=self.branch_id,
-                        pointers=[decisions_ptr],
-                        meta={"route_level": route_level, "style": resolved_style},
-                    ),
-                    activated_agents=activated_agents,
-                )
+            if architect is None:
+                raise RuntimeError("architect must be activated for L2+ routes")
+            adr_user = (
+                f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                adr_user = f"{adr_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            adr_msgs = self._messages_with_memory(
+                agent_id="architect",
+                system=(
+                    "You are Architect. Produce an ADR-lite. Return JSON only for DecisionPack with fields: "
+                    "adrs (list[object]). Each adr should include at least: title, context, decision, consequences. "
+                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=adr_user,
+            )
+            decisions, _ = architect.chat_json(schema=packs.DecisionPack, messages=adr_msgs, user=adr_user)
+            decisions_ptr = self.artifacts.put_json(decisions.model_dump(), suffix=".adr.json", kind="adr").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="architect",
+                    type="ADR_ADDED",
+                    summary="ADR-lite added",
+                    branch_id=self.branch_id,
+                    pointers=[decisions_ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
 
-            if api_confirm and (risks.contract_change or risks.touches_external_api):
+            if risks.contract_change or risks.touches_external_api:
+                if api_confirm is None:
+                    raise RuntimeError("api_confirm must be activated for contract/external API changes")
                 contract_user = (
                     f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                     f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
@@ -1386,9 +1406,15 @@ class Orchestrator:
         mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
         qa_commands = self._determine_test_commands(profile=qa_profile)
 
-        # On-demand env probing (L1/L2): if we can't find any runnable QA commands,
-        # ask env_engineer to propose a minimal runnable command set.
-        if (not mock_mode) and (not qa_commands) and env_engineer is not None:
+        envspec_ptr: Optional[str] = None
+        envspec_commands: list[str] = []
+
+        def maybe_envspec(*, reason: str, event_type: str) -> tuple[Optional[str], list[str]]:
+            nonlocal envspec_ptr, envspec_commands
+            if envspec_ptr is not None:
+                return envspec_ptr, envspec_commands
+            if env_engineer is None:
+                return None, []
             try:
                 env_user = (
                     f"Task:\n{task_text}\n\n"
@@ -1397,7 +1423,7 @@ class Orchestrator:
                     f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
                     "Problem:\n"
                     f"- QA profile is {qa_profile}\n"
-                    "- The system could not detect any runnable test/lint/build commands by heuristics.\n\n"
+                    f"- Reason: {reason}\n\n"
                     "Request:\n"
                     "- Propose 1–4 shell commands that can be run locally to verify the repo is runnable (prefer build/lint/test).\n"
                     "- Use repo-root relative `cd` + `&&` when needed (Windows: `cd /d \"dir\" && ...`).\n"
@@ -1422,7 +1448,6 @@ class Orchestrator:
                     user=env_user,
                 )
                 spec, _ = env_engineer.chat_json(schema=packs.EnvSpec, messages=env_msgs, user=env_user)
-                spec_ptr = self.artifacts.put_json(spec.model_dump(), suffix=".envspec.json", kind="envspec").to_pointer()
 
                 # Normalize common shell patterns so downstream install detection works.
                 normalized: list[str] = []
@@ -1448,22 +1473,39 @@ class Orchestrator:
                                 s = f'cd "{dir_part}" && {rest.strip()}'
                     normalized.append(s)
 
+                if not normalized and qa_commands:
+                    normalized = list(qa_commands)
+
+                spec_to_save = spec.model_copy(update={"commands": normalized})
+                envspec_ptr = self.artifacts.put_json(spec_to_save.model_dump(), suffix=".envspec.json", kind="envspec").to_pointer()
+                envspec_commands = list(normalized)
                 self._append_guarded(
                     event=new_event(
                         agent="env_engineer",
-                        type="ENV_PROBED",
-                        summary="EnvSpec generated (no QA commands detected)",
+                        type=event_type,
+                        summary="EnvSpec generated" if event_type == "ENV_UPDATED" else "EnvSpec generated (no QA commands detected)",
                         branch_id=self.branch_id,
-                        pointers=[spec_ptr],
-                        meta={"route_level": route_level, "style": resolved_style, "commands": normalized},
+                        pointers=[envspec_ptr],
+                        meta={"route_level": route_level, "style": resolved_style, "commands": envspec_commands},
                     ),
                     activated_agents=activated_agents,
                 )
-
-                if normalized:
-                    qa_commands = normalized
             except Exception:
-                pass
+                return None, []
+            return envspec_ptr, envspec_commands
+
+        # L3/L4 require EnvSpec as an auditable deliverable.
+        if route_level in {"L3", "L4"}:
+            if env_engineer is None:
+                raise RuntimeError("env_engineer must be activated for L3+ routes")
+            maybe_envspec(reason="L3+ env gate", event_type="ENV_UPDATED")
+
+        # On-demand env probing (L1/L2): if we can't find any runnable QA commands,
+        # ask env_engineer to propose a minimal runnable command set.
+        if (not mock_mode) and (not qa_commands) and env_engineer is not None:
+            _ptr, cmds = maybe_envspec(reason="No QA commands detected by heuristics", event_type="ENV_PROBED")
+            if cmds:
+                qa_commands = cmds
 
         if mock_mode:
             test_run_summary = "mock: tests skipped"
@@ -1576,7 +1618,7 @@ class Orchestrator:
 
         def run_review() -> tuple[packs.ReviewReport, str]:
             if not reviewer:
-                raise RuntimeError("code_reviewer must be activated for L2 routes")
+                raise RuntimeError("code_reviewer must be activated for L2+ routes")
 
             review_user = (
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
@@ -1616,33 +1658,208 @@ class Orchestrator:
             return rr, ptr
 
         review_failed = False
-        if route_level == "L2" and reviewer and report.passed:
+        if route_level in {"L2", "L3", "L4"} and report.passed:
             review, review_ptr = run_review()
             review_failed = (not review.passed) or bool(review.blockers)
 
-        if (not report.passed) or review_failed:
+        security_report: Optional[packs.RiskRegister] = None
+        security_ptr: Optional[str] = None
+        security_failed = False
+
+        compliance_report: Optional[packs.ComplianceReport] = None
+        compliance_ptr: Optional[str] = None
+        compliance_failed = False
+
+        perf_report: Optional[packs.PerfReport] = None
+        perf_ptr: Optional[str] = None
+        perf_failed = False
+
+        def run_security() -> tuple[packs.RiskRegister, str, bool]:
+            if not security:
+                raise RuntimeError("security must be activated for L3+ routes")
+            sec_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"CodeChange:\n{change.model_dump_json()}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                sec_user = f"{sec_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            sec_msgs = self._messages_with_memory(
+                agent_id="security",
+                system=(
+                    "你是安全审计（security）。你必须只列出 blockers 和 high 风险，其他不要展开。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 RiskRegister schema："
+                    "{passed: bool, blockers: RiskItem[], highs: RiskItem[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    "规则：\n"
+                    "- passed 只有在 blockers 和 highs 都为空时才为 true。\n"
+                    "- 每个 RiskItem 必须给出可定位的 pointers（文件片段/日志/契约）。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=sec_user,
+            )
+            reg, _ = security.chat_json(schema=packs.RiskRegister, messages=sec_msgs, user=sec_user)
+            ptr = self.artifacts.put_json(reg.model_dump(), suffix=".security.json", kind="security").to_pointer()
+            passed = bool(reg.passed) and not (reg.blockers or []) and not (reg.highs or [])
+            self._append_guarded(
+                event=new_event(
+                    agent="security",
+                    type="SEC_REVIEW_PASSED" if passed else "SEC_REVIEW_BLOCKED",
+                    summary="Security review passed" if passed else "Security review blocked",
+                    branch_id=self.branch_id,
+                    pointers=[ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+            return reg, ptr, passed
+
+        def run_compliance() -> tuple[packs.ComplianceReport, str, bool]:
+            if not compliance:
+                raise RuntimeError("compliance must be activated for L4 routes")
+            comp_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"CodeChange:\n{change.model_dump_json()}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                comp_user = f"{comp_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            comp_msgs = self._messages_with_memory(
+                agent_id="compliance",
+                system=(
+                    "你是合规/隐私审计（compliance）。输出必须可执行：指出阻塞点并给出最小整改建议。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 ComplianceReport schema：{passed: bool, notes: string[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=comp_user,
+            )
+            cr, _ = compliance.chat_json(schema=packs.ComplianceReport, messages=comp_msgs, user=comp_user)
+            ptr = self.artifacts.put_json(cr.model_dump(), suffix=".compliance.json", kind="compliance").to_pointer()
+            passed = bool(cr.passed)
+            self._append_guarded(
+                event=new_event(
+                    agent="compliance",
+                    type="COMPLIANCE_PASSED" if passed else "COMPLIANCE_BLOCKED",
+                    summary="Compliance passed" if passed else "Compliance blocked",
+                    branch_id=self.branch_id,
+                    pointers=[ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+            return cr, ptr, passed
+
+        def run_perf() -> tuple[packs.PerfReport, str, bool]:
+            if not performance:
+                raise RuntimeError("performance must be activated for L4 routes")
+            perf_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"CodeChange:\n{change.model_dump_json()}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                perf_user = f"{perf_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            perf_msgs = self._messages_with_memory(
+                agent_id="performance",
+                system=(
+                    "你是性能/资源评审（performance）。只输出 JSON 并匹配 PerfReport schema。\n"
+                    "如果有性能回退/高风险，必须将 passed=false 并把原因写在 blockers/notes 中。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=perf_user,
+            )
+            pr, _ = performance.chat_json(schema=packs.PerfReport, messages=perf_msgs, user=perf_user)
+            ptr = self.artifacts.put_json(pr.model_dump(), suffix=".perf.json", kind="perf").to_pointer()
+            passed = bool(getattr(pr, "passed", True)) and not (getattr(pr, "blockers", []) or [])
+            self._append_guarded(
+                event=new_event(
+                    agent="performance",
+                    type="PERF_BENCH_RUN" if passed else "PERF_REGRESSION",
+                    summary="Performance OK" if passed else "Performance regression",
+                    branch_id=self.branch_id,
+                    pointers=[ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+            return pr, ptr, passed
+
+        if route_level in {"L3", "L4"} and report.passed and not review_failed:
+            security_report, security_ptr, sec_passed = run_security()
+            security_failed = not sec_passed
+
+        if route_level == "L4" and report.passed and not review_failed and not security_failed:
+            compliance_report, compliance_ptr, comp_passed = run_compliance()
+            compliance_failed = not comp_passed
+            if not compliance_failed:
+                perf_report, perf_ptr, perf_passed = run_perf()
+                perf_failed = not perf_passed
+
+        if (not report.passed) or review_failed or security_failed or compliance_failed or perf_failed:
             max_loops = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
             max_loops = max(1, min(max_loops, 12))
             loop = 0
             fix_history: list[str] = []
-            while loop < max_loops and ((not report.passed) or review_failed):
+            while loop < max_loops and ((not report.passed) or review_failed or security_failed or compliance_failed or perf_failed):
                 loop += 1
-                blocker_source = "tests" if not report.passed else "review"
+                if not report.passed:
+                    blocker_source = "tests"
+                elif review_failed:
+                    blocker_source = "review"
+                elif security_failed:
+                    blocker_source = "security"
+                elif compliance_failed:
+                    blocker_source = "compliance"
+                else:
+                    blocker_source = "performance"
+
                 if blocker_source == "review":
                     blocker = ((review.blockers or []) if review is not None else [])[:1] or ["review blocked"]
                     blocker_text = blocker[0]
-                else:
+                elif blocker_source == "tests":
                     excerpt = self._test_failure_excerpt(report)
                     blocker_text = (report.blockers or ["tests failed"])[0]
                     if excerpt:
                         blocker_text = f"{blocker_text}\n\n{excerpt}"
+                elif blocker_source == "security":
+                    items = list((security_report.blockers or []) if security_report is not None else []) + list(
+                        (security_report.highs or []) if security_report is not None else []
+                    )
+                    item = items[0] if items else None
+                    if item is not None:
+                        blocker_text = f"[{item.severity}] {item.title}\n{item.description}".strip()
+                        ptrs = [str(p).strip() for p in (item.pointers or []) if str(p).strip()]
+                        if ptrs:
+                            blocker_text = f"{blocker_text}\n\nPointers:\n" + "\n".join(ptrs[:8])
+                    else:
+                        blocker_text = "Security review blocked"
+                elif blocker_source == "compliance":
+                    notes = list((compliance_report.notes or []) if compliance_report is not None else [])
+                    blocker_text = "\n".join([str(n).strip() for n in notes if str(n).strip()][:8]) or "Compliance blocked"
+                else:
+                    blockers = list(getattr(perf_report, "blockers", []) or [])
+                    notes = list(getattr(perf_report, "notes", []) or [])
+                    lines = [str(n).strip() for n in (blockers + notes) if str(n).strip()]
+                    blocker_text = "\n".join(lines[:8]) or "Performance blocked"
 
                 if blocker_source == "review":
                     fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=activated_agents)
-                else:
+                elif blocker_source == "tests":
                     fix_coder_id = self._select_fix_coder_for_tests(
                         report=report, blocker_text=blocker_text, activated_agents=activated_agents
                     )
+                else:
+                    fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=activated_agents)
 
                 if fix_coder_id == "coder_frontend" and coder_frontend is None:
                     fix_coder_id = "coder_backend"
@@ -1685,6 +1902,9 @@ class Orchestrator:
                     f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
                     f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
                     f"ReviewReport:\n{review.model_dump_json() if review is not None else '{}'}\n\n"
+                    f"SecurityReport:\n{security_report.model_dump_json() if security_report is not None else '{}'}\n\n"
+                    f"ComplianceReport:\n{compliance_report.model_dump_json() if compliance_report is not None else '{}'}\n\n"
+                    f"PerfReport:\n{perf_report.model_dump_json() if perf_report is not None else '{}'}\n\n"
                     f"TestReport:\n{report.model_dump_json()}\n\n"
                     f"ContextPacket:\n{ctx.model_dump_json()}"
                 )
@@ -1698,7 +1918,7 @@ class Orchestrator:
                 if fix_history:
                     fix_user = f"{fix_user}\n\nFixLoopHistory（已尝试的修复，避免重复）：\n" + "\n".join(fix_history[-6:])
 
-                if blocker_source != "review":
+                if blocker_source == "tests":
                     hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text)
                     if hint:
                         fix_user = f"{fix_user}\n\nAutoHint（硬逻辑，仅供参考，事实以 pointers 展开为准）：\n{hint}"
@@ -1787,20 +2007,59 @@ class Orchestrator:
                 review_failed = False
                 review = None
                 review_ptr = None
-                if route_level == "L2" and reviewer and report.passed:
+                if route_level in {"L2", "L3", "L4"} and report.passed:
                     review, review_ptr = run_review()
                     review_failed = (not review.passed) or bool(review.blockers)
 
-            if (not report.passed) or review_failed:
+                security_failed = False
+                security_report = None
+                security_ptr = None
+                if route_level in {"L3", "L4"} and report.passed and not review_failed:
+                    security_report, security_ptr, sec_passed = run_security()
+                    security_failed = not sec_passed
+
+                compliance_failed = False
+                compliance_report = None
+                compliance_ptr = None
+                perf_failed = False
+                perf_report = None
+                perf_ptr = None
+                if route_level == "L4" and report.passed and not review_failed and not security_failed:
+                    compliance_report, compliance_ptr, comp_passed = run_compliance()
+                    compliance_failed = not comp_passed
+                    if not compliance_failed:
+                        perf_report, perf_ptr, perf_passed = run_perf()
+                        perf_failed = not perf_passed
+
+            if (not report.passed) or review_failed or security_failed or compliance_failed or perf_failed:
                 # Do not crash the CLI/UI: record a non-green checkpoint with the remaining blockers.
                 blockers: list[str] = []
                 if not report.passed:
                     blockers.extend([str(b) for b in (report.blockers or []) if str(b).strip()])
                 if review_failed and review is not None:
                     blockers.extend([str(b) for b in (review.blockers or []) if str(b).strip()])
+                if security_failed and security_report is not None:
+                    items = list(security_report.blockers or []) + list(security_report.highs or [])
+                    for it in items[:4]:
+                        title = f"[{it.severity}] {it.title}".strip()
+                        blockers.append(title)
+                if compliance_failed and compliance_report is not None:
+                    for n in list(compliance_report.notes or [])[:4]:
+                        s = str(n).strip()
+                        if s:
+                            blockers.append(s)
+                if perf_failed and perf_report is not None:
+                    for n in list(getattr(perf_report, "blockers", []) or [])[:4]:
+                        s = str(n).strip()
+                        if s:
+                            blockers.append(s)
+                    for n in list(getattr(perf_report, "notes", []) or [])[:4]:
+                        s = str(n).strip()
+                        if s:
+                            blockers.append(s)
 
                 artifacts_blocked: List[str] = []
-                artifacts_blocked.extend([p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr] if p])
+                artifacts_blocked.extend([p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr, security_ptr, compliance_ptr, perf_ptr, envspec_ptr] if p])
                 if change.patch_pointer:
                     artifacts_blocked.append(change.patch_pointer)
                 artifacts_blocked.extend(report.pointers)
@@ -1859,9 +2118,213 @@ class Orchestrator:
                 )
                 return RunResult(checkpoint_id=cp.id, green=False)
 
+        doc_ptr: Optional[str] = None
+        release_ptr: Optional[str] = None
+        ci_ptr: Optional[str] = None
+        runbook_ptr: Optional[str] = None
+        migration_ptr: Optional[str] = None
+
+        if route_level in {"L3", "L4"}:
+            if doc_writer is None:
+                raise RuntimeError("doc_writer must be activated for L3+ routes")
+            doc_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
+                f"CodeChange:\n{change.model_dump_json()}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
+                "Request:\n"
+                "- 列出本次交付需要更新/确认的文档文件路径（例如 README.md / docs/... / CHANGELOG.md）。\n"
+                "- 如果 README 里缺少“安装/启动/最小验证步骤”，必须把 README.md 包含进 files。\n"
+                "- 如果存在 mock 数据源/可切换数据源，也必须要求 README 写清楚。\n"
+            )
+            if ctx_excerpts:
+                doc_user = f"{doc_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            doc_msgs = self._messages_with_memory(
+                agent_id="doc_writer",
+                system=(
+                    "你是文档工程师（doc_writer）。目标：让用户拿到项目后能立即运行并验证。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 DocPack schema：{files: string[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=doc_user,
+            )
+            doc_pack, _ = doc_writer.chat_json(schema=packs.DocPack, messages=doc_msgs, user=doc_user)
+            doc_ptr = self.artifacts.put_json(doc_pack.model_dump(), suffix=".docs.json", kind="docs").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="doc_writer",
+                    type="DOC_UPDATED",
+                    summary="Docs checklist prepared",
+                    branch_id=self.branch_id,
+                    pointers=[doc_ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+
+            if release_manager is None:
+                raise RuntimeError("release_manager must be activated for L3+ routes")
+            rel_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"CodeChange:\n{change.model_dump_json()}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                "Request:\n"
+                "- 给出一个版本号（可使用 0.1.x）和简明 changelog。\n"
+                "- 不要真的打 tag；只输出 ReleasePack。\n"
+            )
+            rel_msgs = self._messages_with_memory(
+                agent_id="release_manager",
+                system=(
+                    "你是发布经理（release_manager）。只输出 JSON 并严格匹配 ReleasePack schema：{version: string, changelog: string[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=rel_user,
+            )
+            rel_pack, _ = release_manager.chat_json(schema=packs.ReleasePack, messages=rel_msgs, user=rel_user)
+            release_ptr = self.artifacts.put_json(rel_pack.model_dump(), suffix=".release.json", kind="release").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="release_manager",
+                    type="CHANGELOG_UPDATED",
+                    summary=f"Release notes prepared ({rel_pack.version})",
+                    branch_id=self.branch_id,
+                    pointers=[release_ptr],
+                    meta={"route_level": route_level, "style": resolved_style, "version": rel_pack.version},
+                ),
+                activated_agents=activated_agents,
+            )
+
+            # DevOps is on-demand in L3+: only run when CI configs exist or user requests release/CI work.
+            ci_markers = [
+                self.repo_root / ".github" / "workflows",
+                self.repo_root / ".gitlab-ci.yml",
+                self.repo_root / "azure-pipelines.yml",
+                self.repo_root / "Jenkinsfile",
+            ]
+            needs_ci = risks.touches_release or any(m.exists() for m in ci_markers) or ("ci" in (task_text or "").lower())
+            if needs_ci and devops is not None:
+                ci_user = (
+                    f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                    f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
+                    f"TestReport:\n{report.model_dump_json()}\n\n"
+                    "Request:\n"
+                    "- 给出 CI 建议（缓存/门禁/命令），保持最小且可落地。\n"
+                )
+                ci_msgs = self._messages_with_memory(
+                    agent_id="devops",
+                    system=(
+                        "你是 DevOps。只输出 JSON 并严格匹配 CIPack schema：{notes: string[]}。\n"
+                        "不要额外 key；不要最外层包一层对象。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=ci_user,
+                )
+                ci_pack, _ = devops.chat_json(schema=packs.CIPack, messages=ci_msgs, user=ci_user)
+                ci_ptr = self.artifacts.put_json(ci_pack.model_dump(), suffix=".ci.json", kind="ci").to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="devops",
+                        type="CI_UPDATED",
+                        summary="CI notes prepared",
+                        branch_id=self.branch_id,
+                        pointers=[ci_ptr],
+                        meta={"route_level": route_level, "style": resolved_style},
+                    ),
+                    activated_agents=activated_agents,
+                )
+
+        if route_level == "L4":
+            if support_engineer is None:
+                raise RuntimeError("support_engineer must be activated for L4 routes")
+            rb_user = (
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"EnvSpec:\n{json.dumps({'commands': envspec_commands}, ensure_ascii=False)}\n\n"
+                f"ReleasePackPointer:\n{release_ptr or ''}\n\n"
+                "Request:\n"
+                "- 生成最小可用的运维/排障 Runbook 分节标题列表。\n"
+            )
+            rb_msgs = self._messages_with_memory(
+                agent_id="support_engineer",
+                system=(
+                    "你是运维支持工程师（support_engineer）。只输出 JSON 并严格匹配 RunbookPack schema：{sections: string[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=rb_user,
+            )
+            rb_pack, _ = support_engineer.chat_json(schema=packs.RunbookPack, messages=rb_msgs, user=rb_user)
+            runbook_ptr = self.artifacts.put_json(rb_pack.model_dump(), suffix=".runbook.json", kind="runbook").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="support_engineer",
+                    type="RUNBOOK_UPDATED",
+                    summary="Runbook prepared",
+                    branch_id=self.branch_id,
+                    pointers=[runbook_ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+
+            if risks.touches_migration:
+                if data_engineer is None:
+                    raise RuntimeError("data_engineer must be activated for migration tasks in L4")
+                mig_user = (
+                    f"Task:\n{task_text}\n\n"
+                    f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                    f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                    f"ContextPacket:\n{ctx.model_dump_json()}"
+                )
+                mig_msgs = self._messages_with_memory(
+                    agent_id="data_engineer",
+                    system=(
+                        "你是数据工程师（data_engineer）。输出迁移计划和回滚步骤。\n"
+                        "只输出 JSON 并严格匹配 MigrationPlan schema：{steps: string[], rollback_steps: string[]}。\n"
+                        "不要额外 key；不要最外层包一层对象。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=mig_user,
+                )
+                mig_plan, _ = data_engineer.chat_json(schema=packs.MigrationPlan, messages=mig_msgs, user=mig_user)
+                migration_ptr = self.artifacts.put_json(mig_plan.model_dump(), suffix=".migration.json", kind="migration").to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="data_engineer",
+                        type="DB_MIGRATION_PLANNED",
+                        summary="Migration plan prepared",
+                        branch_id=self.branch_id,
+                        pointers=[migration_ptr],
+                        meta={"route_level": route_level, "style": resolved_style},
+                    ),
+                    activated_agents=activated_agents,
+                )
+
         # Create green checkpoint
         artifacts: List[str] = []
-        artifacts.extend([p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr] if p])
+        artifacts.extend(
+            [
+                p
+                for p in [
+                    usecases_ptr,
+                    decisions_ptr,
+                    contract_ptr,
+                    review_ptr,
+                    security_ptr,
+                    compliance_ptr,
+                    perf_ptr,
+                    envspec_ptr,
+                    doc_ptr,
+                    release_ptr,
+                    ci_ptr,
+                    runbook_ptr,
+                    migration_ptr,
+                ]
+                if p
+            ]
+        )
         if change.patch_pointer:
             artifacts.append(change.patch_pointer)
         artifacts.extend(report.pointers)
@@ -1885,7 +2348,24 @@ class Orchestrator:
             artifacts=artifacts,
             green=True,
             restore_steps=restore_steps,
-            meta={"route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile, "style": resolved_style},
+            meta={
+                "route_level": route_level,
+                "requested_route_level": requested_route_level,
+                "agents": activated_agents_list,
+                "qa_profile": qa_profile,
+                "style": resolved_style,
+                "deliverables": {
+                    "envspec": envspec_ptr,
+                    "security": security_ptr,
+                    "compliance": compliance_ptr,
+                    "perf": perf_ptr,
+                    "docs": doc_ptr,
+                    "release": release_ptr,
+                    "ci": ci_ptr,
+                    "runbook": runbook_ptr,
+                    "migration": migration_ptr,
+                },
+            },
         )
         self._append_guarded(
             event=new_event(
@@ -1894,7 +2374,14 @@ class Orchestrator:
                 summary=f"Created green checkpoint {cp.id}",
                 branch_id=self.branch_id,
                 pointers=artifacts,
-                meta={"green": True, "repo_ref": repo_ref, "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
+                meta={
+                    "green": True,
+                    "repo_ref": repo_ref,
+                    "route_level": route_level,
+                    "requested_route_level": requested_route_level,
+                    "agents": activated_agents_list,
+                    "style": resolved_style,
+                },
             ),
             activated_agents=activated_agents,
         )

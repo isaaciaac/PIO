@@ -210,10 +210,6 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const agent = String(msg?.agent || "pm").trim();
           const style = String(msg?.style || "balanced").trim();
           if (!text) return;
-          if (route === "L3" || route === "L4") {
-            this.addMessage("system", `提示：当前版本未实现 ${route}，已自动降级为 L2（安全）执行。`, "系统");
-            route = "L2";
-          }
           await this.handleSend(root, text, mock, permissionMode, route, agent, style);
           return;
         }
@@ -568,6 +564,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     if (a.has("env_engineer")) stages.push({ key: "env", label: "环境/可运行性", types: ["ENV_PROBED", "ENV_UPDATED"] });
     stages.push({ key: "test", label: "测试", types: ["TEST_RUN", "TEST_PASSED", "TEST_FAILED"] });
     if (a.has("code_reviewer")) stages.push({ key: "review", label: "代码审查", types: ["REVIEW_PASSED", "REVIEW_BLOCKED"] });
+    if (a.has("security")) stages.push({ key: "security", label: "安全审查", types: ["SEC_REVIEW_PASSED", "SEC_REVIEW_BLOCKED", "SEC_FINDING"] });
+    if (a.has("compliance")) stages.push({ key: "compliance", label: "合规/隐私", types: ["COMPLIANCE_PASSED", "COMPLIANCE_BLOCKED"] });
+    if (a.has("performance")) stages.push({ key: "perf", label: "性能/资源", types: ["PERF_BENCH_RUN", "PERF_REGRESSION"] });
+    if (a.has("doc_writer")) stages.push({ key: "docs", label: "文档", types: ["DOC_UPDATED"] });
+    if (a.has("devops")) stages.push({ key: "ci", label: "CI/CD", types: ["CI_UPDATED"] });
+    if (a.has("release_manager")) stages.push({ key: "release", label: "发布", types: ["CHANGELOG_UPDATED", "RELEASE_TAGGED"] });
+    if (a.has("support_engineer")) stages.push({ key: "runbook", label: "运维/排障", types: ["RUNBOOK_UPDATED"] });
+    if (a.has("data_engineer")) stages.push({ key: "migration", label: "迁移", types: ["DB_MIGRATION_PLANNED", "DB_MIGRATION_APPLIED"] });
     stages.push({ key: "checkpoint", label: "创建检查点", types: ["CHECKPOINT_CREATED"] });
     return stages;
   }
@@ -1497,13 +1501,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
                 <option value="router">调度器（Router）</option>
               </select>
             </span>
-            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（当前版本仅实现 L0–L2，选择 L3/L4 会自动降级为 L2）">
+            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（L3/L4 会增加交付/合规/性能等门禁，耗时更长）">
               <option value="auto" selected>路由：自动</option>
               <option value="L0">路由：L0 快速</option>
               <option value="L1">路由：L1 简单 MVP</option>
               <option value="L2">路由：L2 多模块 MVP</option>
-              <option value="L3">路由：L3 可发布（未实现→降级 L2）</option>
-              <option value="L4">路由：L4 生产级（未实现→降级 L2）</option>
+              <option value="L3">路由：L3 可发布</option>
+              <option value="L4">路由：L4 生产级</option>
             </select>
             <select id="style" title="对话/方案的细致程度：自由发挥会更少追问、更多默认假设；细致严谨会更全面">
               <option value="balanced" selected>风格：平衡</option>

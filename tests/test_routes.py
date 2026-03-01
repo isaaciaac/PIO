@@ -117,3 +117,54 @@ def test_cli_run_mock_route_L2_runs_review_and_creates_green_checkpoint(tmp_path
     assert "USECASES_DEFINED" in types
     assert "ADR_ADDED" in types
     assert "REVIEW_PASSED" in types
+
+
+def test_cli_run_mock_route_L3_runs_security_docs_release_and_creates_green_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = runner.invoke(app, ["task", "add", "hello"])
+    assert r2.exit_code == 0, r2.output
+
+    r3 = runner.invoke(app, ["run", "--mock", "--route", "L3"])
+    assert r3.exit_code == 0, r3.output
+    ckpt_id = r3.output.strip()
+
+    cps = CheckpointsStore(tmp_path)
+    cp = cps.get(ckpt_id)
+    assert cp.green is True
+    assert cp.meta.get("route_level") == "L3"
+
+    types = _ledger_types(tmp_path)
+    assert "ENV_UPDATED" in types
+    assert "SEC_REVIEW_PASSED" in types
+    assert "DOC_UPDATED" in types
+    assert "CHANGELOG_UPDATED" in types
+
+
+def test_cli_run_mock_route_L4_runs_compliance_perf_runbook_and_creates_green_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    r2 = runner.invoke(app, ["task", "add", "hello"])
+    assert r2.exit_code == 0, r2.output
+
+    r3 = runner.invoke(app, ["run", "--mock", "--route", "L4"])
+    assert r3.exit_code == 0, r3.output
+    ckpt_id = r3.output.strip()
+
+    cps = CheckpointsStore(tmp_path)
+    cp = cps.get(ckpt_id)
+    assert cp.green is True
+    assert cp.meta.get("route_level") == "L4"
+
+    types = _ledger_types(tmp_path)
+    assert "COMPLIANCE_PASSED" in types
+    assert "PERF_BENCH_RUN" in types
+    assert "RUNBOOK_UPDATED" in types

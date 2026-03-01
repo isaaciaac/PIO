@@ -212,6 +212,8 @@ class ReleasePack(BaseModel):
 
 
 class PerfReport(BaseModel):
+    passed: bool = True
+    blockers: List[str] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
 
 

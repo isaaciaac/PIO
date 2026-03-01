@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from vibe.cli import app
 
 
-def test_run_route_L3_downgrades_to_L2_in_mvp(tmp_path: Path, monkeypatch) -> None:
+def test_run_route_L3_is_supported(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     os.environ["VIBE_MOCK_MODE"] = "1"
     runner = CliRunner()
@@ -31,5 +31,4 @@ def test_run_route_L3_downgrades_to_L2_in_mvp(tmp_path: Path, monkeypatch) -> No
     assert route_events, "expected ROUTE_SELECTED in ledger"
     last = route_events[-1]
     assert last.get("meta", {}).get("requested_route_level") == "L3"
-    assert last.get("meta", {}).get("route_level") == "L2"
-
+    assert last.get("meta", {}).get("route_level") == "L3"

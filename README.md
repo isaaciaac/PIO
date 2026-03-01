@@ -96,7 +96,7 @@ vibe run --mock --mock-writes
 - `--route L3`：可发布（交付/可复现；加 env/security/doc/release 门禁）
 - `--route L4`：生产级（高风险；含 perf/compliance/runbook/迁移回滚等门禁）
 
-> 说明：当前已实现 `L0/L1/L2`；选择 `L3/L4` 会自动降级为 `L2` 执行，但会在 ledger/checkpoint 里记录 `requested_route_level` 以便审计与后续回放。
+> 说明：`L3/L4` 已实现，但会显著增加门禁与耗时（环境/安全/合规/性能/运维等）。没有密钥时可用 `--mock` 先跑通闭环。
 
 ## 权限模式（允许 / 每次提示 / 仅聊天）
 
