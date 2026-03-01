@@ -205,6 +205,28 @@ class Orchestrator:
                 return True
         return False
 
+    def _agent_capabilities(self, agent_id: str) -> set[str]:
+        cfg = self.config.agents.get(agent_id)
+        caps = list(getattr(cfg, "capabilities", []) or []) if cfg is not None else []
+        out: set[str] = set()
+        for c in caps:
+            s = str(c).strip().lower()
+            if s:
+                out.add(s)
+        return out
+
+    def _api_key_available_for_agent(self, agent_id: str) -> bool:
+        cfg = self.config.agents.get(agent_id)
+        if cfg is None:
+            return False
+        prov = self.config.providers.get(cfg.provider)
+        if prov is None:
+            return False
+        env = getattr(prov, "api_key_env", None)
+        if not env:
+            return True
+        return bool(os.getenv(str(env)))
+
     def _select_primary_coder(self, *, task_text: str, risks: RiskSignals, activated_agents: Set[str]) -> str:
         # Prefer integrator for cross-module changes when available.
         if risks.cross_module and "integration_engineer" in activated_agents:
@@ -3020,6 +3042,57 @@ class Orchestrator:
                 auto_change: Optional[packs.CodeChange] = None
                 if blocker_source == "tests":
                     auto_change = self._auto_code_change_for_test_failure(report=report, blocker_text=blocker_text)
+
+                # Capability-gap fallback: consult an on-demand specialist for advice when
+                # the incident signals an area the current fix agent likely doesn't cover.
+                if auto_change is None and blocker_source == "tests" and incident is not None and "specialist" in self.config.agents:
+                    try:
+                        signal_caps = {"eslint", "typescript", "react", "vite", "db", "migration", "contract"}
+                        req_caps = [c for c in (incident.required_capabilities or []) if str(c).strip().lower() in signal_caps]
+                        fix_caps = self._agent_capabilities(fix_coder_id)
+                        missing = [c for c in req_caps if str(c).strip().lower() not in fix_caps]
+                        if missing and self._api_key_available_for_agent("specialist"):
+                            sp = self._agent("specialist")
+                            sp_system = (
+                                "你是 on-demand specialist：用于在工作流卡住时给出“可执行”的排障建议与约束，"
+                                "帮助主修复工种更快收敛。\n"
+                                "只输出 JSON（不要 markdown），并严格匹配 ChatReply schema："
+                                "{reply: string, suggested_actions: string[], pointers: string[]}。\n"
+                                "规则：\n"
+                                "- 必须基于 IncidentPack.evidence_pointers / blocker 文本提出建议；不要编造文件或命令。\n"
+                                "- 建议必须可落地（例如：改哪个脚本/补哪个依赖/在哪里加导出）。\n"
+                                "- reply 用中文，尽量短（<= 12 行）。\n\n"
+                                f"{workflow_hint}"
+                            )
+                            sp_user = (
+                                f"MissingCapabilities: {', '.join(missing)}\n\n"
+                                f"IncidentPack:\n{incident.model_dump_json()}\n\n"
+                                f"Blocker:\n{blocker_text}\n"
+                            )
+                            sp_msgs = self._messages_with_memory(agent_id="specialist", system=sp_system, user=sp_user)
+                            advice, _ = sp.chat_json(schema=packs.ChatReply, messages=sp_msgs, user=sp_user)
+                            advice_ptr = self.artifacts.put_json(advice.model_dump(), suffix=".specialist.json", kind="specialist").to_pointer()
+                            self._append_guarded(
+                                event=new_event(
+                                    agent="router",
+                                    type="STATE_TRANSITION",
+                                    summary=f"Fix-loop {loop}: consulted specialist",
+                                    branch_id=self.branch_id,
+                                    pointers=[advice_ptr],
+                                    meta={
+                                        "phase": "fix_loop",
+                                        "loop": loop,
+                                        "action": "consult_specialist",
+                                        "missing_capabilities": missing,
+                                        "route_level": route_level,
+                                        "style": resolved_style,
+                                    },
+                                ),
+                                activated_agents=activated_agents,
+                            )
+                            fix_user = f"{fix_user}\n\nSpecialistAdvice:\n{advice.model_dump_json()}\n\nSpecialistPointer: {advice_ptr}"
+                    except Exception:
+                        pass
 
                 fix_role = "Coder"
                 if fix_coder_id == "coder_frontend":

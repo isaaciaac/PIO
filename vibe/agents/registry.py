@@ -160,6 +160,13 @@ class SupportEngineerAgent(BaseAgent):
     default_model = "qwen-plus"
 
 
+class SpecialistAgent(BaseAgent):
+    agent_id = "specialist"
+    output_schema = packs.ChatReply
+    default_provider = "deepseek"
+    default_model = "deepseek-reasoner"
+
+
 AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     cls.agent_id: cls
     for cls in [
@@ -185,6 +192,6 @@ AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
         ComplianceAgent,
         DocWriterAgent,
         SupportEngineerAgent,
+        SpecialistAgent,
     ]
 }
-
