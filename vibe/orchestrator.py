@@ -660,6 +660,160 @@ class Orchestrator:
 
         return ""
 
+    def _auto_code_change_for_test_failure(
+        self, *, report: packs.TestReport, blocker_text: str
+    ) -> Optional[packs.CodeChange]:
+        """
+        Deterministic, low-risk auto-fixes for common scaffold failures.
+
+        This is intentionally conservative: only create missing *configuration/entry* files
+        when the error output clearly indicates they are absent.
+        """
+        text = (blocker_text or "").strip()
+        lower = text.lower()
+
+        def repo_has_any(paths: list[str]) -> bool:
+            for p in paths:
+                if (self.repo_root / p).exists():
+                    return True
+            return False
+
+        # 1) ESLint: missing config file
+        if "eslint couldn't find a configuration file" in lower or "eslint could not find a configuration file" in lower:
+            # If any config already exists, don't auto-create.
+            if repo_has_any(
+                [
+                    ".eslintrc",
+                    ".eslintrc.js",
+                    ".eslintrc.cjs",
+                    ".eslintrc.json",
+                    ".eslintrc.yaml",
+                    ".eslintrc.yml",
+                    "eslint.config.js",
+                    "eslint.config.cjs",
+                    "eslint.config.mjs",
+                ]
+            ):
+                return None
+
+            pkg_path = self.repo_root / "package.json"
+            if not pkg_path.exists():
+                return None
+            try:
+                pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                return None
+
+            # If eslintConfig exists in package.json, the missing-config error shouldn't happen.
+            if isinstance(pkg.get("eslintConfig"), dict):
+                return None
+
+            scripts = dict(pkg.get("scripts") or {})
+            lint_script = str(scripts.get("lint") or "")
+            if "eslint" not in lint_script:
+                return None
+
+            dev = dict(pkg.get("devDependencies") or {})
+            # These are required to parse TS/TSX in common setups.
+            if "@typescript-eslint/parser" not in dev:
+                dev["@typescript-eslint/parser"] = "^6.21.0"
+            if "@typescript-eslint/eslint-plugin" not in dev:
+                dev["@typescript-eslint/eslint-plugin"] = "^6.21.0"
+            pkg["devDependencies"] = dev
+
+            eslintrc = """module.exports = {
+  root: true,
+  env: {
+    es2020: true,
+    node: true,
+    browser: true,
+  },
+  parser: '@typescript-eslint/parser',
+  parserOptions: {
+    ecmaVersion: 2022,
+    sourceType: 'module',
+    ecmaFeatures: { jsx: true },
+  },
+  plugins: ['@typescript-eslint'],
+  extends: ['eslint:recommended'],
+  ignorePatterns: ['**/dist/**', '**/node_modules/**', '**/coverage/**'],
+  rules: {
+    'no-unused-vars': 'off',
+    '@typescript-eslint/no-unused-vars': 'off',
+    'no-undef': 'off',
+  },
+};
+"""
+
+            return packs.CodeChange(
+                kind="patch",
+                summary="auto-fix: add ESLint config",
+                writes=[
+                    packs.FileWrite(path=".eslintrc.cjs", content=eslintrc),
+                    packs.FileWrite(path="package.json", content=json.dumps(pkg, ensure_ascii=False, indent=2) + "\n"),
+                ],
+                files_changed=[".eslintrc.cjs", "package.json"],
+                blockers=[],
+            )
+
+        # 2) Vite: missing index.html at project root
+        if ("could not resolve entry module" in lower and "index.html" in lower) or ("entry module \"index.html\"" in lower):
+            for node_dir in self._find_node_project_dirs():
+                pkg_path = self.repo_root / node_dir / "package.json"
+                if not pkg_path.exists():
+                    continue
+                try:
+                    pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    continue
+
+                deps: dict[str, str] = {}
+                deps.update(dict(pkg.get("dependencies") or {}))
+                deps.update(dict(pkg.get("devDependencies") or {}))
+                scripts = dict(pkg.get("scripts") or {})
+                looks_like_vite = ("vite" in deps) or any("vite" in str(v).lower() for v in scripts.values())
+                if not looks_like_vite:
+                    continue
+
+                index_path = self.repo_root / node_dir / "index.html"
+                if index_path.exists():
+                    continue
+
+                # Pick the most likely entry file.
+                entry = None
+                for cand in ["src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js"]:
+                    if (self.repo_root / node_dir / cand).exists():
+                        entry = cand
+                        break
+                if not entry:
+                    entry = "src/main.tsx"
+
+                html = (
+                    "<!doctype html>\n"
+                    "<html lang=\"en\">\n"
+                    "  <head>\n"
+                    "    <meta charset=\"UTF-8\" />\n"
+                    "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n"
+                    "    <title>Vite App</title>\n"
+                    "  </head>\n"
+                    "  <body>\n"
+                    "    <div id=\"root\"></div>\n"
+                    f"    <script type=\"module\" src=\"/{entry}\"></script>\n"
+                    "  </body>\n"
+                    "</html>\n"
+                )
+
+                rel = (node_dir / "index.html").as_posix() if str(node_dir) not in {"", "."} else "index.html"
+                return packs.CodeChange(
+                    kind="patch",
+                    summary=f"auto-fix: add Vite {rel}",
+                    writes=[packs.FileWrite(path=rel, content=html)],
+                    files_changed=[rel],
+                    blockers=[],
+                )
+
+        return None
+
     def _compact_error_excerpt(self, text: str, *, max_lines: int = 60, max_chars: int = 1600) -> str:
         t = (text or "").strip()
         if not t:
@@ -672,6 +826,104 @@ class Orchestrator:
             tail = tail[-max_chars:]
             tail = "…（已截断）…\n" + tail
         return tail.strip()
+
+    def _validate_code_change(self, change: packs.CodeChange) -> None:
+        """
+        Hard, deterministic validation to prevent "writes that reference files that don't exist".
+
+        We intentionally keep this best-effort and scoped to *relative* imports in files the model
+        writes in this CodeChange, so we don't break existing repos with custom module resolution.
+        """
+        if not change.writes:
+            return
+
+        exts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".d.ts"]
+        js_like = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts"}
+
+        def norm(p: str) -> str:
+            return (p or "").replace("\\", "/").lstrip("/")
+
+        planned = {norm(w.path) for w in change.writes if (w.path or "").strip()}
+        planned_lower = {p.lower() for p in planned}
+
+        def extract_relative_specs(text: str) -> list[str]:
+            # Best-effort: cover common import styles. We only care about specs starting with '.'
+            t = text or ""
+            specs: list[str] = []
+            pat_from = re.compile(r"\b(?:import|export)\b[\s\S]*?\bfrom\s*(['\"])(\.[^'\"]+)\1", re.MULTILINE)
+            pat_side = re.compile(r"\bimport\s*(['\"])(\.[^'\"]+)\1", re.MULTILINE)
+            pat_req = re.compile(r"\brequire\s*\(\s*(['\"])(\.[^'\"]+)\1\s*\)", re.MULTILINE)
+            pat_dyn = re.compile(r"\bimport\s*\(\s*(['\"])(\.[^'\"]+)\1\s*\)", re.MULTILINE)
+            for pat in (pat_from, pat_side, pat_req, pat_dyn):
+                for m in pat.finditer(t):
+                    spec = (m.group(2) or "").strip()
+                    if spec.startswith("."):
+                        specs.append(spec)
+            # De-dup while preserving order.
+            seen: set[str] = set()
+            out: list[str] = []
+            for s in specs:
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
+
+        def resolve_candidates(importer_rel: str, spec: str) -> list[str]:
+            importer_abs = (self.repo_root / importer_rel).resolve()
+            target_abs = (importer_abs.parent / spec).resolve()
+            try:
+                rel = target_abs.relative_to(self.repo_root.resolve())
+            except Exception:
+                return []
+            rel_posix = rel.as_posix()
+
+            # If the spec already has an extension, check that exact path.
+            if Path(spec).suffix:
+                return [rel_posix]
+
+            cands: list[str] = []
+            for ext in exts:
+                cands.append(rel_posix + ext)
+            for ext in exts:
+                cands.append(f"{rel_posix}/index{ext}")
+            return cands
+
+        missing: list[tuple[str, str]] = []
+        for w in change.writes:
+            importer_rel = norm(w.path)
+            if not importer_rel:
+                continue
+            if Path(importer_rel).suffix.lower() not in js_like:
+                continue
+            for spec in extract_relative_specs(w.content):
+                cands = resolve_candidates(importer_rel, spec)
+                if not cands:
+                    continue
+                ok = False
+                for c in cands:
+                    c_rel = norm(c)
+                    if not c_rel:
+                        continue
+                    if c_rel.lower() in planned_lower:
+                        ok = True
+                        break
+                    if (self.repo_root / c_rel).exists():
+                        ok = True
+                        break
+                if not ok:
+                    missing.append((importer_rel, spec))
+                    if len(missing) >= 12:
+                        break
+            if len(missing) >= 12:
+                break
+
+        if missing:
+            lines = "\n".join([f"- {imp}: {spec}" for imp, spec in missing[:8]])
+            raise RuntimeError(
+                "Missing referenced modules in CodeChange.writes. "
+                "If you introduce a new relative import, you MUST also create that file in writes (or fix the import).\n"
+                f"{lines}"
+            )
 
     def _materialize_code_change(self, change: packs.CodeChange, *, actor_agent_id: str = "coder_backend") -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
@@ -789,6 +1041,7 @@ class Orchestrator:
         current = change
         for attempt in range(max_repairs + 1):
             try:
+                self._validate_code_change(current)
                 return self._materialize_code_change(current, actor_agent_id=actor_agent_id)
             except Exception as e:
                 last_err = e
@@ -801,6 +1054,7 @@ class Orchestrator:
                         "Refusing to apply patch with unsafe path",
                         "Failed to apply patch via git apply",
                         "is not in the subpath of",
+                        "Missing referenced modules in CodeChange.writes",
                     ]
                 )
                 if not repairable or attempt >= max_repairs:
@@ -808,13 +1062,14 @@ class Orchestrator:
 
                 prev = current.model_dump_json()
                 repair_user = (
-                    "你的上一个 CodeChange 无法在本地落地（被系统安全规则拒绝）。\n\n"
+                    "你的上一个 CodeChange 无法在本地落地（被系统校验拒绝）。\n\n"
                     f"错误：{msg}\n\n"
                     "修复要求：\n"
                     "- 所有写入路径必须是仓库根目录的相对路径。\n"
                     "- 严禁写入 `.vibe/` 或 `.git/`（这是系统内部目录）。\n"
                     "- 如果你要写文档，请写到 `docs/...` 或 `README.md`，不要写到 `.vibe/docs/...`。\n"
                     "- 优先使用 `writes` 给出完整文件内容；不要依赖 patch 指针。\n"
+                    "- 如果你新增了相对 import（例如 `../controllers/x`），必须在 writes 里创建对应文件（或改成指向已存在文件）。\n"
                     "- 保持原意不变：只修复路径/可落地性问题，不要引入大重构。\n\n"
                     "请只输出符合 CodeChange schema 的 JSON（不要 markdown，不要包裹对象）。\n\n"
                     f"上一个 CodeChange（供参考）：\n{prev}\n"
@@ -1342,7 +1597,9 @@ class Orchestrator:
                 "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
-                "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s)."
+                "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
+                "- If you add a Vite app, include `index.html` at that app root.\n"
+                "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
                 "\n"
                 "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
                 "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
@@ -1807,6 +2064,16 @@ class Orchestrator:
 
         if (not report.passed) or review_failed or security_failed or compliance_failed or perf_failed:
             max_loops = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
+            # New scaffolds commonly have multiple independent blockers (build/lint/test across workspaces).
+            # Keep bounded, but allow more retries for higher routes / multiple failing commands.
+            if route_level in {"L3", "L4"}:
+                max_loops = max(max_loops, 6)
+            try:
+                n_blockers = len([b for b in (report.blockers or []) if str(b).strip()])
+                if n_blockers > 1:
+                    max_loops = max(max_loops, min(12, 2 + n_blockers))
+            except Exception:
+                pass
             max_loops = max(1, min(max_loops, 12))
             loop = 0
             fix_history: list[str] = []
@@ -1923,6 +2190,10 @@ class Orchestrator:
                     if hint:
                         fix_user = f"{fix_user}\n\nAutoHint（硬逻辑，仅供参考，事实以 pointers 展开为准）：\n{hint}"
 
+                auto_change: Optional[packs.CodeChange] = None
+                if blocker_source == "tests":
+                    auto_change = self._auto_code_change_for_test_failure(report=report, blocker_text=blocker_text)
+
                 fix_role = "Coder"
                 if fix_coder_id == "coder_frontend":
                     fix_role = "Frontend Coder (React/TypeScript)"
@@ -1930,30 +2201,33 @@ class Orchestrator:
                     fix_role = "Integration Engineer (align frontend/backend/contracts)"
                 elif fix_coder_id == "coder_backend":
                     fix_role = "Backend Coder"
-                fix_msgs = self._messages_with_memory(
-                    agent_id=fix_coder_id,
-                    system=(
-                        f"You are {fix_role}. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
-                        "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
-                        "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
-                        "Hard rules:\n"
-                        "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
-                        "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
-                        "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
-                        "- Do not do architecture refactors during fix-loop.\n"
-                        "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
-                        f"{workflow_hint}"
-                    ),
-                    user=fix_user,
-                )
-                change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
-                change, write_pointers = self._materialize_code_change_with_repair(
-                    change=change,
-                    actor_agent_id=fix_coder_id,
-                    actor=fix_coder,
-                    actor_role=fix_role,
-                    workflow_hint=workflow_hint,
-                )
+                if auto_change is None:
+                    fix_msgs = self._messages_with_memory(
+                        agent_id=fix_coder_id,
+                        system=(
+                            f"You are {fix_role}. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
+                            "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                            "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
+                            "Hard rules:\n"
+                            "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                            "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
+                            "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
+                            "- Do not do architecture refactors during fix-loop.\n"
+                            "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
+                            f"{workflow_hint}"
+                        ),
+                        user=fix_user,
+                    )
+                    change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
+                    change, write_pointers = self._materialize_code_change_with_repair(
+                        change=change,
+                        actor_agent_id=fix_coder_id,
+                        actor=fix_coder,
+                        actor_role=fix_role,
+                        workflow_hint=workflow_hint,
+                    )
+                else:
+                    change, write_pointers = self._materialize_code_change(auto_change, actor_agent_id=fix_coder_id)
                 try:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
@@ -1961,6 +2235,9 @@ class Orchestrator:
                     fix_history.append(f"- loop {loop} {fix_coder_id}: {change.summary.strip()[:160]} | files: {files_short} | evidence: {evidence}")
                 except Exception:
                     pass
+                meta = {"blocker": blocker_text, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style}
+                if auto_change is not None:
+                    meta["auto_fix"] = True
                 self._append_guarded(
                     event=new_event(
                         agent=fix_coder_id,
@@ -1968,7 +2245,7 @@ class Orchestrator:
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
                         pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
-                        meta={"blocker": blocker_text, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style},
+                        meta=meta,
                     ),
                     activated_agents=activated_agents,
                 )
