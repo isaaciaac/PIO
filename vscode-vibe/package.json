@@ -2,7 +2,7 @@
   "name": "vibe-coding",
   "displayName": "Vibe Coding",
   "description": "Run the vibe multi-agent workflow from VS Code.",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
