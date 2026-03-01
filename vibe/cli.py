@@ -25,6 +25,30 @@ from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.style import normalize_style, style_prompt, style_temperature
 from vibe.secrets import apply_workspace_secrets
+from vibe.storage.artifacts import ArtifactsStore
+
+
+def _pointer_sha256(pointer: str) -> str:
+    if "@sha256:" not in pointer:
+        return ""
+    return pointer.split("@sha256:", 1)[1].strip()
+
+
+def _pointer_path(pointer: str) -> str:
+    return pointer.split("@sha256:", 1)[0].strip()
+
+
+def _guess_image_mime(path: str) -> str:
+    p = (path or "").lower()
+    if p.endswith(".png"):
+        return "image/png"
+    if p.endswith(".jpg") or p.endswith(".jpeg"):
+        return "image/jpeg"
+    if p.endswith(".webp"):
+        return "image/webp"
+    if p.endswith(".gif"):
+        return "image/gif"
+    return "image/png"
 
 app = typer.Typer(help="vibe coding / multi-agent orchestrator (MVP)")
 config_app = typer.Typer(help="Config commands")
@@ -527,6 +551,124 @@ def run(
     except PolicyDeniedError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=3)
+
+
+@app.command()
+def vision(
+    ctx: typer.Context,
+    artifact: str = typer.Option(..., "--artifact", help="Image artifact pointer (.vibe/artifacts/...@sha256:...)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Repo path (default: cwd)"),
+    model: str = typer.Option("qwen-vl-plus", "--model", help="DashScope vision model (OpenAI-compatible)"),
+    json_out: bool = typer.Option(False, "--json", help="Output VisionReport JSON"),
+) -> None:
+    """
+    Analyze an image artifact (vision/OCR) and return a structured VisionReport.
+
+    This command is designed for the VS Code extension's paste-to-analyze flow.
+    """
+    repo_root = find_repo_root(path or Path.cwd())
+    cfg_path = repo_root / ".vibe" / "vibe.yaml"
+    if not cfg_path.exists():
+        raise typer.Exit(code=2)
+    cfg = VibeConfig.load(cfg_path)
+    apply_workspace_secrets(repo_root, providers=cfg.providers)
+
+    store = ArtifactsStore(repo_root)
+    pointer_path = _pointer_path(artifact)
+    pointer_sha = _pointer_sha256(artifact)
+    if not pointer_path or not pointer_sha:
+        typer.echo("Invalid artifact pointer; expected .vibe/...@sha256:<digest>", err=True)
+        raise typer.Exit(code=2)
+    abs_path = (repo_root / pointer_path).resolve()
+    if not abs_path.exists():
+        typer.echo(f"Artifact not found: {pointer_path}", err=True)
+        raise typer.Exit(code=2)
+
+    data = abs_path.read_bytes()
+    import hashlib
+
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != pointer_sha:
+        typer.echo("Artifact sha256 mismatch; refusing to analyze corrupted pointer.", err=True)
+        raise typer.Exit(code=2)
+
+    # Mock mode: keep the workflow runnable without keys.
+    if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
+        report = packs.VisionReport(
+            summary="（mock）已接收图片，但未调用真实视觉模型。",
+            description=f"图片大小：{len(data)} bytes；mime={_guess_image_mime(pointer_path)}",
+            ocr_text="",
+            key_points=[],
+            pointers=[artifact],
+        )
+        ptr = store.put_json(report.model_dump(), suffix=".vision.json", kind="vision").to_pointer()
+        report = report.model_copy(update={"pointers": [artifact, ptr]})
+        if json_out:
+            typer.echo(report.model_dump_json(indent=2, ensure_ascii=False))
+        else:
+            typer.echo(report.summary)
+        return
+
+    # Use DashScope OpenAI-compatible endpoint.
+    prov = cfg.providers.get("dashscope")
+    if not prov:
+        typer.echo("Missing provider config: dashscope", err=True)
+        raise typer.Exit(code=2)
+    api_key_env = prov.api_key_env or "DASHSCOPE_API_KEY"
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        typer.echo(f"Missing env var {api_key_env} for provider dashscope", err=True)
+        raise typer.Exit(code=2)
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=prov.base_url)
+    mime = _guess_image_mime(pointer_path)
+    import base64
+
+    b64 = base64.b64encode(data).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+
+    system = (
+        "你是一个视觉分析与 OCR 工具。你必须只输出 JSON（不要 markdown），并严格匹配 VisionReport schema："
+        "{summary: string, description: string, ocr_text: string, key_points: string[], pointers: string[]}。\n"
+        "规则：\n"
+        "- summary：一句话总结图片内容（中文，<=80字）。\n"
+        "- description：更详细的客观描述（中文，<=300字），不要臆测看不见的信息。\n"
+        "- ocr_text：尽可能提取图片中的文字（保持原文，按行换行）。如果没有文字就留空字符串。\n"
+        "- key_points：3-8 条要点（中文，每条<=40字）。\n"
+        "- pointers：只放证据指针（至少包含输入图片指针）。\n"
+        "- 不要输出任何额外 key；不要把内容包在最外层对象里。"
+    )
+    user_text = "请识别并总结这张图片。"
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+    resp = client.chat.completions.create(model=model, messages=messages, temperature=0.0)
+    content = resp.choices[0].message.content or ""
+
+    from vibe.providers.base import _parse_json_to_schema
+
+    report = _parse_json_to_schema(content, schema=packs.VisionReport)
+    if not report.pointers:
+        report = report.model_copy(update={"pointers": [artifact]})
+    elif artifact not in report.pointers:
+        report = report.model_copy(update={"pointers": [artifact, *list(report.pointers)]})
+
+    ptr = store.put_json(report.model_dump(), suffix=".vision.json", kind="vision").to_pointer()
+    report = report.model_copy(update={"pointers": [*list(report.pointers), ptr]})
+
+    if json_out:
+        typer.echo(report.model_dump_json(indent=2, ensure_ascii=False))
+    else:
+        typer.echo(report.summary)
 
 
 @checkpoint_app.command("list")

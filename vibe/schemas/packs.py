@@ -136,6 +136,14 @@ class ChatReply(BaseModel):
     pointers: List[str] = Field(default_factory=list)
 
 
+class VisionReport(BaseModel):
+    summary: str
+    description: str = ""
+    ocr_text: str = ""
+    key_points: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+
 class RouteDecision(BaseModel):
     route_level: RouteLevel
     reasons: List[str] = Field(default_factory=list)

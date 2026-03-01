@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as crypto from "crypto";
 import { VibeRunError, runVibe, runVibeCapture } from "./vibeRunner";
 
 type ChatRole = "user" | "assistant" | "system";
@@ -158,6 +159,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private draftHinted = false;
   private workspaceRoot?: string;
   private persistTimer?: NodeJS.Timeout;
+  private pendingVisionContext: string[] = [];
 
   private static readonly CHAT_HISTORY_KEY = "vibe.chatHistory.v1";
   private static readonly CHAT_HISTORY_VERSION = 1;
@@ -201,6 +203,18 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           this.postState();
           return;
         }
+        if (msg?.type === "pasteImage") {
+          const dataUrl = String(msg?.dataUrl || "").trim();
+          const mime = String(msg?.mime || "").trim().toLowerCase();
+          const mode = String(msg?.mode || "chat_only").trim();
+          const agent = String(msg?.agent || "pm").trim();
+          if (!dataUrl.startsWith("data:") || !dataUrl.includes("base64,")) {
+            return;
+          }
+          if (this.running) return;
+          await this.handlePasteImage(root, { dataUrl, mime, mode, agent }, envOverrides);
+          return;
+        }
         if (msg?.type === "stop") {
           if (this.running) {
             this.setStatus("正在停止…");
@@ -228,7 +242,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const agent = String(msg?.agent || "pm").trim();
           const style = String(msg?.style || "balanced").trim();
           if (!text) return;
-          await this.handleSend(root, text, mock, permissionMode, route, agent, style);
+          const withVision = this.consumePendingVision(text);
+          await this.handleSend(root, withVision, mock, permissionMode, route, agent, style);
           return;
         }
         if (msg?.type === "init") {
@@ -263,6 +278,120 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     if (String(title || "").trim() !== "进度") {
       this.schedulePersist();
     }
+  }
+
+  private consumePendingVision(text: string): string {
+    const t = String(text || "").trim();
+    if (!t) return t;
+    if (!this.pendingVisionContext.length) return t;
+    const ctx = this.pendingVisionContext.join("\n\n").trim();
+    this.pendingVisionContext = [];
+    if (!ctx) return t;
+    return `${ctx}\n\n用户问题/需求：\n${t}`.trim();
+  }
+
+  private async handlePasteImage(
+    root: string,
+    opts: { dataUrl: string; mime: string; mode: string; agent: string },
+    envOverrides: NodeJS.ProcessEnv | undefined
+  ): Promise<void> {
+    this.setStatus("正在上传图片…");
+    this.addMessage("system", "已粘贴图片，正在识别…", "系统");
+    this.postState();
+
+    try {
+      const parts = opts.dataUrl.split(",", 2);
+      const b64 = parts.length === 2 ? parts[1] : "";
+      const bytes = Buffer.from(b64, "base64");
+      if (!bytes.length) {
+        this.addMessage("assistant", "图片解析失败：剪贴板为空或格式不支持。", "错误");
+        return;
+      }
+
+      const ext = this.extFromMime(opts.mime);
+      const pointer = await this.storeArtifactBytes(root, bytes, ext);
+
+      // Run vision via vibe CLI (DashScope Qwen-VL).
+      this.setStatus("正在识别图片…");
+      const res = await runVibeCapture(["vision", "--artifact", pointer, "--path", root, "--json"], {
+        cwd: root,
+        mock: false,
+        output: this.output,
+        title: "Vibe：识别图片",
+        envOverrides,
+      });
+
+      let payload: any = undefined;
+      try {
+        payload = JSON.parse(res.stdout);
+      } catch {
+        payload = undefined;
+      }
+      const summary = String(payload?.summary || "").trim();
+      const description = String(payload?.description || "").trim();
+      const ocr = String(payload?.ocr_text || "").trim();
+      const keyPoints = Array.isArray(payload?.key_points)
+        ? payload.key_points.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+        : [];
+
+      const lines: string[] = [];
+      lines.push(summary ? `图片识别：${summary}` : "图片识别完成。");
+      if (description) lines.push(`\n描述：\n${description}`);
+      if (keyPoints.length) lines.push(`\n要点：\n- ${keyPoints.join("\n- ")}`);
+      if (ocr) lines.push(`\nOCR：\n${ocr}`);
+      const text = lines.join("\n").trim();
+      this.addMessage("assistant", text || "图片识别完成。", "图片");
+
+      // Make the analysis available to the next chat/workflow turn (persisted via chat.jsonl by inclusion).
+      const ctx: string[] = [];
+      ctx.push("【图片识别结果】");
+      if (summary) ctx.push(`- 总结：${summary}`);
+      if (description) ctx.push(`- 描述：${description}`);
+      if (keyPoints.length) ctx.push(`- 要点：${keyPoints.join("；")}`);
+      if (ocr) ctx.push(`- OCR：\n${ocr}`);
+      this.pendingVisionContext.push(ctx.join("\n").trim());
+
+      // In authorized modes, the draft should include the vision context.
+      if (opts.mode && opts.mode !== "chat_only") {
+        this.draftParts.push(ctx.join("\n").trim());
+      }
+    } catch (e) {
+      if (e instanceof VibeRunError) {
+        const hint =
+          (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
+            ? "\n\n提示：请先设置 DashScope 密钥（DASHSCOPE_API_KEY）。"
+            : "";
+        this.addMessage("assistant", `${formatRunError(e)}${hint}`, "错误");
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        this.addMessage("assistant", message, "错误");
+      }
+    } finally {
+      this.setStatus("");
+      this.postState();
+    }
+  }
+
+  private extFromMime(mime: string): string {
+    const m = (mime || "").toLowerCase();
+    if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+    if (m.includes("webp")) return ".webp";
+    if (m.includes("gif")) return ".gif";
+    return ".png";
+  }
+
+  private async storeArtifactBytes(root: string, data: Buffer, ext: string): Promise<string> {
+    const digest = crypto.createHash("sha256").update(data).digest("hex");
+    const rel = path.join(".vibe", "artifacts", "sha256", digest.slice(0, 2), `${digest}${ext}`).replace(/\\/g, "/");
+    const abs = vscode.Uri.file(path.join(root, rel));
+    const dir = vscode.Uri.file(path.dirname(abs.fsPath));
+    await vscode.workspace.fs.createDirectory(dir);
+    try {
+      await vscode.workspace.fs.stat(abs);
+    } catch {
+      await vscode.workspace.fs.writeFile(abs, data);
+    }
+    return `${rel}@sha256:${digest}`;
   }
 
   private persistableMessages(): Array<{ role: ChatRole; title?: string; text: string; ts: number }> {
@@ -1688,6 +1817,24 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       }
 
       elSend.addEventListener('click', sendChat);
+      elInput.addEventListener('paste', (e) => {
+        try {
+          const items = (e.clipboardData && e.clipboardData.items) ? Array.from(e.clipboardData.items) : [];
+          const img = items.find((it) => it.kind === 'file' && it.type && it.type.startsWith('image/'));
+          if (!img) return;
+          const file = img.getAsFile();
+          if (!file) return;
+          e.preventDefault();
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = String(reader.result || '');
+            const mode = (elMode && elMode.value) ? elMode.value : 'chat_only';
+            const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
+            vscode.postMessage({ type: 'pasteImage', dataUrl, mime: img.type || file.type || 'image/png', mode, agent });
+          };
+          reader.readAsDataURL(file);
+        } catch {}
+      });
       elInput.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
           e.preventDefault();
