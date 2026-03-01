@@ -149,6 +149,25 @@ class RouteDecision(BaseModel):
     reasons: List[str] = Field(default_factory=list)
 
 
+class IncidentPack(BaseModel):
+    """
+    Deterministic incident capsule produced by the orchestrator when a workflow is blocked.
+
+    This is a *diagnosis/forensics* object: it should stay short, pointer-backed, and actionable.
+    """
+
+    source: Literal["tests", "review", "security", "compliance", "performance"]
+    category: str
+    summary: str
+    blocker: str
+    evidence_pointers: List[str] = Field(default_factory=list)
+    diagnosis: List[str] = Field(default_factory=list)
+    next_steps: List[str] = Field(default_factory=list)
+    required_capabilities: List[str] = Field(default_factory=list)
+    suggested_fix_agent: Optional[str] = None
+    autohint: Optional[str] = None
+
+
 class ReviewReport(BaseModel):
     passed: bool
     blockers: List[str] = Field(default_factory=list)

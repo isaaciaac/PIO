@@ -359,7 +359,9 @@ class Orchestrator:
             pinned = [s for s in (r.digest.pinned or [])][:3]
             pin = ("；".join(pinned))[:240] if pinned else ""
             ptrs = ", ".join(list(r.pointers or [])[:2])
-            lines.append(f"- {r.digest.summary.strip()[:200]}")
+            kind = str(getattr(r, "kind", "") or "").strip()
+            prefix = f"({kind}) " if kind and kind != "chat_digest" else ""
+            lines.append(f"- {prefix}{r.digest.summary.strip()[:200]}")
             if pin:
                 lines.append(f"  要点: {pin}")
             if ptrs:
@@ -730,6 +732,138 @@ class Orchestrator:
                 )
 
         return ""
+
+    def _incident_for_tests(
+        self,
+        *,
+        report: packs.TestReport,
+        blocker_text: str,
+        activated_agents: Set[str],
+    ) -> packs.IncidentPack:
+        """
+        Build a deterministic "incident capsule" for test/build/lint failures.
+
+        Goal: turn noisy error output into a small, auditable, pointer-backed brief so the
+        next agent can act without guessing.
+        """
+
+        text = (blocker_text or "").strip()
+        lower = text.lower()
+
+        failed_cmd = ""
+        cmd_dir = Path(".")
+        try:
+            for r in report.results:
+                if not r.passed:
+                    failed_cmd = r.command or ""
+                    cmd_dir = self._shell_cd_dir(failed_cmd)
+                    break
+        except Exception:
+            failed_cmd = ""
+            cmd_dir = Path(".")
+
+        suggested_fix_agent = self._select_fix_coder_for_tests(report=report, blocker_text=text, activated_agents=activated_agents)
+
+        evidence: list[str] = []
+        for p in list(report.pointers or [])[:24]:
+            s = str(p).strip()
+            if s and s not in evidence:
+                evidence.append(s)
+
+        # Add quick pointers to the local node workspace config when present.
+        try:
+            for rel in [
+                (cmd_dir / "package.json").as_posix(),
+                (cmd_dir / "tsconfig.json").as_posix(),
+                (cmd_dir / ".eslintrc.json").as_posix(),
+                (cmd_dir / ".eslintrc.js").as_posix(),
+                (cmd_dir / "eslint.config.js").as_posix(),
+                (cmd_dir / "eslint.config.mjs").as_posix(),
+            ]:
+                if rel == ".":
+                    continue
+                if not (self.repo_root / rel).exists():
+                    continue
+                rr = self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=220)
+                if rr.pointer and rr.pointer not in evidence:
+                    evidence.append(rr.pointer)
+        except Exception:
+            pass
+
+        category = "tests_failed"
+        summary = "测试/构建失败"
+        diagnosis: list[str] = []
+        next_steps: list[str] = []
+        required_caps: list[str] = []
+
+        autohint = self._fix_loop_autohint_for_tests(report=report, blocker_text=text) or None
+
+        # Windows + eslint glob quoting pitfall: single quotes become literal in cmd.exe / npm.
+        if ("eslint" in lower) and ("no files matching the pattern" in lower or "no matching files" in lower):
+            # Look for telltale "'...'" fragments in the error output.
+            if "\"'" in text or "pattern \"'" in lower or "pattern \"'\"" in lower or "pattern \"'server/" in lower:
+                category = "eslint_glob_quoting_windows"
+                summary = "ESLint glob 引号导致找不到文件（Windows）"
+                diagnosis.append("Windows 的 npm scripts 不会像 bash 那样处理单引号；单引号会作为字面量传给 eslint。")
+                diagnosis.append("因此 `eslint 'server/**/*.ts'` 可能匹配不到任何文件，表现为 `No files matching the pattern \"'...\"`。")
+                next_steps.append("把 npm scripts 里的 glob 改为双引号：`eslint \"server/**/*.ts\" ...`，避免单引号。")
+                next_steps.append("重新运行失败命令（lint/build/test）验证。")
+                required_caps.extend(["node", "eslint", "windows"])
+            else:
+                category = "eslint_no_matching_files"
+                summary = "ESLint 找不到匹配文件"
+                diagnosis.append("ESLint 报告没有匹配到文件；可能是脚本 glob 写错，或目录/扩展名与实际不一致。")
+                next_steps.append("对照 `package.json` 的 eslint 脚本与仓库目录结构，确认匹配模式与实际文件位置一致。")
+                required_caps.extend(["node", "eslint"])
+
+        elif "eslint" in lower:
+            category = "eslint_failed"
+            summary = "ESLint 失败"
+            diagnosis.append("lint 命令执行失败；通常是配置缺失/规则报错/依赖缺失。")
+            next_steps.append("优先查看失败命令输出中的第一条错误，确保 eslint 配置与依赖完整。")
+            required_caps.extend(["node", "eslint"])
+
+        elif any(k in lower for k in ["tsc", "error ts", "typescript", ".ts(", ".tsx("]):
+            category = "typescript_compile_failed"
+            summary = "TypeScript 编译失败"
+            diagnosis.append("TypeScript 编译未通过；常见原因：类型不一致、缺少模块、tsconfig 路径/别名配置错误。")
+            next_steps.append("以 `tsc` 报错的首个文件/行号为准，修复类型或 import；如引入新依赖需同步更新 package.json。")
+            required_caps.extend(["node", "typescript"])
+
+        elif "cannot find module" in lower or "module not found" in lower:
+            category = "missing_module_or_dep"
+            summary = "缺少依赖或 import 路径错误"
+            diagnosis.append("构建/测试失败日志提示缺少模块；要么依赖未安装/未声明，要么 import 路径指向不存在文件。")
+            next_steps.append("若是第三方包：补齐 dependencies/devDependencies，并确保 `npm install` 后可解析。")
+            next_steps.append("若是本地文件：修正相对路径或在代码变更中创建对应文件。")
+            required_caps.extend(["node", "deps"])
+
+        blocker_short = text
+        if len(blocker_short) > 1800:
+            blocker_short = blocker_short[:1800] + "…（已截断）…"
+
+        # De-duplicate capability tags.
+        caps: list[str] = []
+        seen: set[str] = set()
+        for c in required_caps:
+            s = str(c).strip().lower()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            caps.append(s)
+
+        return packs.IncidentPack(
+            source="tests",
+            category=category,
+            summary=summary,
+            blocker=blocker_short,
+            evidence_pointers=evidence[:32],
+            diagnosis=diagnosis[:8],
+            next_steps=next_steps[:8],
+            required_capabilities=caps[:12],
+            suggested_fix_agent=suggested_fix_agent,
+            autohint=autohint,
+        )
 
     def _auto_code_change_for_test_failure(
         self, *, report: packs.TestReport, blocker_text: str
@@ -1662,15 +1796,15 @@ class Orchestrator:
 
         raise RuntimeError(f"Failed to materialize CodeChange after repair attempts. Last error: {last_err}")
 
-    def _append_agent_lesson(self, *, agent_id: str, summary: str, pinned: list[str], pointers: list[str]) -> None:
-        """
-        Lightweight "eat a pit, grow wiser" mechanism:
-        append a structured digest into `.vibe/views/<agent>/memory.jsonl` so future prompts can reuse it.
-
-        This stays within the "derived info + pointers" rule: the digest contains conclusions and guardrails,
-        and the pointers reference the concrete evidence (artifacts / file pointers / commits).
-        """
-
+    def _append_agent_memory(
+        self,
+        *,
+        agent_id: str,
+        kind: str,
+        summary: str,
+        pinned: list[str],
+        pointers: list[str],
+    ) -> None:
         view_dir = self.repo_root / ".vibe" / "views" / agent_id
         mem_path = view_dir / "memory.jsonl"
         view_dir.mkdir(parents=True, exist_ok=True)
@@ -1682,8 +1816,21 @@ class Orchestrator:
             background=[],
             open_questions=[],
         )
-        record = MemoryRecord(ts=ts, agent_id=agent_id, kind="chat_digest", digest=digest, pointers=list(pointers or [])[:16])
+        record = MemoryRecord(
+            ts=ts,
+            agent_id=agent_id,
+            kind=kind,  # type: ignore[arg-type]
+            digest=digest,
+            pointers=list(pointers or [])[:16],
+        )
         append_memory_record(mem_path, record)
+
+    def _append_agent_lesson(self, *, agent_id: str, summary: str, pinned: list[str], pointers: list[str]) -> None:
+        """
+        "Eat a pit, grow wiser": persist a short, pointer-grounded lesson for future prompts.
+        """
+
+        self._append_agent_memory(agent_id=agent_id, kind="lesson", summary=summary, pinned=pinned, pointers=pointers)
 
     def _autofix_lesson_text(self, *, change_summary: str) -> tuple[str, list[str]]:
         s = (change_summary or "").strip()
@@ -2755,10 +2902,50 @@ class Orchestrator:
                     lines = [str(n).strip() for n in (blockers + notes) if str(n).strip()]
                     blocker_text = "\n".join(lines[:8]) or "Performance blocked"
 
+                incident: Optional[packs.IncidentPack] = None
+                incident_ptr: Optional[str] = None
+                if blocker_source == "tests":
+                    try:
+                        incident = self._incident_for_tests(report=report, blocker_text=blocker_text, activated_agents=activated_agents)
+                        incident_ptr = self.artifacts.put_json(
+                            incident.model_dump(), suffix=".incident.json", kind="incident"
+                        ).to_pointer()
+                        self._append_guarded(
+                            event=new_event(
+                                agent="router",
+                                type="INCIDENT_CREATED",
+                                summary=f"Incident: {incident.summary}",
+                                branch_id=self.branch_id,
+                                pointers=[incident_ptr],
+                                meta={
+                                    "source": incident.source,
+                                    "category": incident.category,
+                                    "suggested_fix_agent": incident.suggested_fix_agent,
+                                    "required_capabilities": incident.required_capabilities,
+                                    "loop": loop,
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+
+                        try:
+                            pinned: list[str] = []
+                            pinned.extend([str(x).strip() for x in (incident.diagnosis or [])[:2] if str(x).strip()])
+                            pinned.extend([str(x).strip() for x in (incident.next_steps or [])[:2] if str(x).strip()])
+                            ptrs = [p for p in [incident_ptr] if p] + list(incident.evidence_pointers or [])[:8]
+                            self._append_agent_memory(agent_id="router", kind="incident", summary=incident.summary, pinned=pinned, pointers=ptrs)
+                        except Exception:
+                            pass
+                    except Exception:
+                        incident = None
+                        incident_ptr = None
+
                 if blocker_source == "review":
                     fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=activated_agents)
                 elif blocker_source == "tests":
-                    fix_coder_id = self._select_fix_coder_for_tests(
+                    fix_coder_id = (incident.suggested_fix_agent if incident is not None else None) or self._select_fix_coder_for_tests(
                         report=report, blocker_text=blocker_text, activated_agents=activated_agents
                     )
                 else:
@@ -2825,6 +3012,10 @@ class Orchestrator:
                     hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text)
                     if hint:
                         fix_user = f"{fix_user}\n\nAutoHint（硬逻辑，仅供参考，事实以 pointers 展开为准）：\n{hint}"
+                    if incident is not None:
+                        fix_user = f"{fix_user}\n\nIncidentPack:\n{incident.model_dump_json()}"
+                        if incident_ptr:
+                            fix_user = f"{fix_user}\n\nIncidentPointer: {incident_ptr}"
 
                 auto_change: Optional[packs.CodeChange] = None
                 if blocker_source == "tests":

@@ -154,6 +154,7 @@ def default_config() -> VibeConfig:
                 "PLAN_CREATED",
                 "CONTEXT_PACKET_BUILT",
                 "STATE_TRANSITION",
+                "INCIDENT_CREATED",
                 "CHECKPOINT_CREATED",
                 "BRANCH_CREATED",
             ],
@@ -429,7 +430,7 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
     # Backward compatible defaults for older vibe.yaml files.
     router = cfg.agents.get("router")
     if router:
-        needed = {"ROUTE_SELECTED", "AGENTS_ACTIVATED"}
+        needed = {"ROUTE_SELECTED", "AGENTS_ACTIVATED", "INCIDENT_CREATED"}
         existing = set(router.memory_scope.ledger_write_types or [])
         if not needed.issubset(existing):
             router.memory_scope.ledger_write_types = sorted(existing | needed)

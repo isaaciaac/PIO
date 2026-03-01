@@ -5,7 +5,14 @@ from typing import List, Literal
 from pydantic import BaseModel, Field
 
 
-MemoryKind = Literal["chat_digest"]
+MemoryKind = Literal[
+    "chat_digest",
+    "lesson",
+    "incident",
+    "strategy",
+    "user_hint",
+    "postmortem",
+]
 
 
 class ChatDigest(BaseModel):
@@ -21,4 +28,3 @@ class MemoryRecord(BaseModel):
     kind: MemoryKind = "chat_digest"
     digest: ChatDigest
     pointers: List[str] = Field(default_factory=list)
-
