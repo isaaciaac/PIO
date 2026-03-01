@@ -22,6 +22,7 @@ from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route, detect_risks
 from vibe.routes import RiskSignals
 from vibe.context import effective_context_config, read_memory_records
+from vibe.delivery import augment_plan, augment_requirement_pack
 from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
 
@@ -1094,9 +1095,14 @@ class Orchestrator:
             pm_msgs = self._messages_with_memory(
                 agent_id="pm",
                 system=(
-                    "You are PM. Return JSON only for RequirementPack with fields: "
-                    "summary (string), acceptance (string[]), non_goals (string[]), constraints (string[]). "
-                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    "你是乙方产品经理（PM）：目标是把需求推进到“能交付、能跑起来、能验证”的状态。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 RequirementPack schema："
+                    "{summary: string, acceptance: string[], non_goals: string[], constraints: string[]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    "交付导向规则：\n"
+                    "- acceptance 必须包含可运行/可验证的交付标准（例如 README 写清楚安装/启动/最小验证步骤）。\n"
+                    "- 如果需求暗示“实时/价格/行情/外部数据”，默认规划可配置的真实数据源；若缺少 key/网络不可达，必须明确回退 mock，并在接口/界面标注 source=mock。\n"
+                    "- 信息不足时，不要停在追问：先做合理默认假设，并用 constraints 里的 'Assume:' 写出来。\n\n"
                     f"{workflow_hint}"
                 ),
                 user=pm_user,
@@ -1106,6 +1112,7 @@ class Orchestrator:
                 messages=pm_msgs,
                 user=task_text,
             )
+            req = augment_requirement_pack(req, task_text=task_text)
             self._append_guarded(
                 event=new_event(
                     agent="pm",
@@ -1225,8 +1232,13 @@ class Orchestrator:
         router_msgs = self._messages_with_memory(
             agent_id="router",
             system=(
-                "You are Router. Return JSON only for Plan: {tasks:[{id,title,agent,description}]}. "
-                "Keep tasks <= 5. No extra keys. No markdown.\n\n"
+                "你是调度器 Router：把需求拆成最多 5 个可执行任务。\n"
+                "只输出 JSON（不要 markdown），并严格匹配 Plan schema：{tasks:[{id,title,agent,description}]}。\n"
+                "不要额外 key；不要最外层包一层对象。\n\n"
+                "规划规则：\n"
+                "- tasks <= 5；每个 task 必须可落地、可验收。\n"
+                "- 交付导向：至少包含一个任务负责「README/运行方式/最小验证」的交付说明。\n"
+                "- 若需求暗示实时/价格/行情/外部数据：至少包含一个任务负责数据源落地（真实优先，失败回退 mock 并标注 source）。\n\n"
                 f"{workflow_hint}"
             ),
             user=plan_user,
@@ -1236,6 +1248,7 @@ class Orchestrator:
             messages=router_msgs,
             user=plan_user,
         )
+        plan = augment_plan(plan, req=req, task_text=task_text, activated_agents=activated_agents)
         self._append_guarded(
             event=new_event(
                 agent="router",
@@ -1297,6 +1310,10 @@ class Orchestrator:
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s)."
+                "\n"
+                "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
+                "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
+                "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
                 "\n\n"
                 f"{workflow_hint}"
             ),
