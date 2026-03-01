@@ -5,6 +5,7 @@ import os
 import importlib.util
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 from uuid import uuid4
@@ -21,8 +22,9 @@ from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
 from vibe.routes import DiffStats, decide_route, detect_risks
 from vibe.routes import RiskSignals
-from vibe.context import effective_context_config, read_memory_records
+from vibe.context import append_memory_record, effective_context_config, read_memory_records
 from vibe.delivery import augment_plan, augment_requirement_pack
+from vibe.schemas.memory import ChatDigest, MemoryRecord
 from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
 
@@ -1591,6 +1593,66 @@ class Orchestrator:
 
         raise RuntimeError(f"Failed to materialize CodeChange after repair attempts. Last error: {last_err}")
 
+    def _append_agent_lesson(self, *, agent_id: str, summary: str, pinned: list[str], pointers: list[str]) -> None:
+        """
+        Lightweight "eat a pit, grow wiser" mechanism:
+        append a structured digest into `.vibe/views/<agent>/memory.jsonl` so future prompts can reuse it.
+
+        This stays within the "derived info + pointers" rule: the digest contains conclusions and guardrails,
+        and the pointers reference the concrete evidence (artifacts / file pointers / commits).
+        """
+
+        view_dir = self.repo_root / ".vibe" / "views" / agent_id
+        mem_path = view_dir / "memory.jsonl"
+        view_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        digest = ChatDigest(
+            summary=str(summary or "").strip()[:200] or "（无摘要）",
+            pinned=[str(x).strip()[:200] for x in (pinned or []) if str(x).strip()][:8],
+            background=[],
+            open_questions=[],
+        )
+        record = MemoryRecord(ts=ts, agent_id=agent_id, kind="chat_digest", digest=digest, pointers=list(pointers or [])[:16])
+        append_memory_record(mem_path, record)
+
+    def _autofix_lesson_text(self, *, change_summary: str) -> tuple[str, list[str]]:
+        s = (change_summary or "").strip()
+        low = s.lower()
+        if "normalize eslint glob quoting" in low:
+            return (
+                "Windows 下 npm scripts 的单引号不会被当作引号剥离，可能导致 ESLint glob 变成字面量而找不到文件。",
+                [
+                    "npm scripts 里的 glob 尽量用双引号（\"...\") 或不加引号，避免单引号（'...'）。",
+                    "当 ESLint 报 `No files matching the pattern \"'...\"`，优先怀疑是引号问题而不是目录缺失。",
+                ],
+            )
+        if "add missing devdependency" in low:
+            return (
+                "Node 项目脚本里调用的工具（tsc/jest/eslint 等）必须在 package.json 依赖中可用，否则会在 CI/新机器上失败。",
+                [
+                    "如果 scripts 里直接用 `tsc`，确保 `devDependencies.typescript` 存在。",
+                    "如果 scripts 里直接用 `jest`/`eslint`/`vitest`，确保对应包在 devDependencies。",
+                ],
+            )
+        if "add cross-env" in low and "node_env" in low:
+            return (
+                "Windows cmd.exe 不支持 `NODE_ENV=...` 这种写法；需要 cross-env 或改写脚本。",
+                [
+                    "跨平台设置环境变量：用 `cross-env NODE_ENV=production ...`。",
+                    "避免在 npm scripts 里直接写 `NODE_ENV=...`（除非明确只跑在类 Unix shell）。",
+                ],
+            )
+        if "add eslint config" in low:
+            return (
+                "ESLint 缺少配置文件会直接失败；如果要启用 lint，需要一份可用的 ESLint 配置。",
+                [
+                    "当 ESLint 报 missing config：补 `.eslintrc.*` 或 `eslint.config.*`。",
+                    "TypeScript 项目 lint 通常还需要 `@typescript-eslint/parser` + plugin。",
+                ],
+            )
+        return ("", [])
+
     def _determine_test_commands(self, *, profile: str) -> List[str]:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
             return ["mock"]
@@ -2100,13 +2162,15 @@ class Orchestrator:
                 "- Do not import new npm packages unless you ALSO add them to the correct `package.json` (dependencies/devDependencies) in writes.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
-                "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
-                "- If you add a Vite app, include `index.html` at that app root.\n"
-                "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
-                "\n"
-                "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
-                "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
-                "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
+                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
+                 "- If you add a Vite app, include `index.html` at that app root.\n"
+                 "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
+                 "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                 "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n"
+                 "\n"
+                 "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
+                 "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
+                 "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
                 "\n\n"
                 f"{workflow_hint}"
             ),
@@ -2716,10 +2780,12 @@ class Orchestrator:
                             "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                         "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
                         "- Do not do architecture refactors during fix-loop.\n"
-                        "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
-                        "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
-                        f"{workflow_hint}"
-                    ),
+                            "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
+                            "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
+                            "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                            "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
+                            f"{workflow_hint}"
+                        ),
                     user=fix_user,
                 )
                     change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
@@ -2735,7 +2801,7 @@ class Orchestrator:
                 try:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
-                    files_short = ", ".join(files[:6]) + (" …" if len(files) > 6 else "")
+                    files_short = ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
                     fix_history.append(f"- loop {loop} {fix_coder_id}: {change.summary.strip()[:160]} | files: {files_short} | evidence: {evidence}")
                 except Exception:
                     pass
@@ -2753,6 +2819,25 @@ class Orchestrator:
                     ),
                     activated_agents=activated_agents,
                 )
+
+                # "Eat a pit, grow wiser": persist a short, pointer-grounded lesson when we applied
+                # a deterministic auto-fix so future runs (and future code generation) avoid it.
+                if auto_change is not None:
+                    try:
+                        lesson_summary, lesson_pinned = self._autofix_lesson_text(change_summary=change.summary)
+                        if lesson_summary:
+                            ptrs: list[str] = []
+                            try:
+                                ptrs.extend(list(report.pointers or [])[:6])
+                            except Exception:
+                                pass
+                            ptrs.extend([p for p in [change.patch_pointer, change.commit_hash] if p])
+                            ptrs.extend(list(write_pointers or [])[:10])
+                            self._append_agent_lesson(agent_id=fix_coder_id, summary=lesson_summary, pinned=lesson_pinned, pointers=ptrs)
+                            self._append_agent_lesson(agent_id="router", summary=lesson_summary, pinned=lesson_pinned, pointers=ptrs)
+                    except Exception:
+                        pass
+
                 qa_commands_loop = self._determine_test_commands(profile=qa_profile)
                 self._append_guarded(
                     event=new_event(
