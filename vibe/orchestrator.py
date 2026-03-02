@@ -2122,7 +2122,6 @@ class Orchestrator:
         if os.getenv("VIBE_MOCK_MODE", "").strip() == "1":
             return ["mock"]
 
-        is_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "tests").exists()
         node_dirs = self._find_node_project_dirs()
         is_node = bool(node_dirs)
         tests_dir = self.repo_root / "tests"
@@ -2131,7 +2130,21 @@ class Orchestrator:
             try:
                 has_py_tests = any(p.is_file() for p in tests_dir.rglob("test*.py"))
             except Exception:
-                has_py_tests = True
+                has_py_tests = False
+
+        # Python detection should be conservative: many Node/TS repos have a `tests/` folder.
+        # Only treat a repo as Python when we see real Python indicators.
+        py_markers = [
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.py",
+            "Pipfile",
+            "poetry.lock",
+            "uv.lock",
+            ".python-version",
+        ]
+        has_py_markers = any((self.repo_root / m).exists() for m in py_markers)
+        is_py = has_py_markers or has_py_tests
 
         p = profile.strip().lower()
         if p == "smoke":
