@@ -185,22 +185,88 @@ class Orchestrator:
     def _build_context_packet(self, *, task_evt: Optional[LedgerEvent] = None) -> tuple[packs.ContextPacket, str]:
         pointers: List[str] = []
         excerpts: List[str] = []
+
+        def add_repo_excerpt(rel: str, *, end_line: int = 200, include_excerpt: bool = True) -> None:
+            path = self.repo_root / rel
+            if not path.exists():
+                return
+            rr = self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=end_line)
+            pointers.append(rr.pointer)
+            if include_excerpt:
+                excerpts.append(f"<<< {rr.pointer} >>>\n{rr.content}\n")
+
+        excerpt_budget = 8
+
         for rel in [
             ".vibe/manifests/project_manifest.md",
             ".vibe/manifests/run_manifest.md",
             ".vibe/manifests/repo_overview.md",
             "README.md",
         ]:
-            path = self.repo_root / rel
-            if not path.exists():
-                continue
             try:
-                rr = self.toolbox.read_file(agent_id="router", path=rel, start_line=1, end_line=200)
-                pointers.append(rr.pointer)
-                excerpts.append(f"<<< {rr.pointer} >>>\n{rr.content}\n")
+                add_repo_excerpt(rel, end_line=200, include_excerpt=(len(excerpts) < excerpt_budget))
             except Exception:
                 # best-effort; context snippets are helpful but should not block the workflow
                 continue
+
+        # Grounding: include build/test/config “source of truth” snippets so coders don't invent scripts/configs.
+        # Keep excerpts small and bounded; pointers are still recorded even when excerpt budget is exceeded.
+        try:
+            node_dirs = self._find_node_project_dirs()
+            if node_dirs:
+                candidate_files: list[str] = []
+                for d in node_dirs[:4]:
+                    prefix = "" if d.as_posix() in {"", "."} else f"{d.as_posix().rstrip('/')}/"
+                    candidate_files.extend(
+                        [
+                            f"{prefix}package.json",
+                            f"{prefix}tsconfig.json",
+                            f"{prefix}eslint.config.js",
+                            f"{prefix}eslint.config.cjs",
+                            f"{prefix}.eslintrc",
+                            f"{prefix}.eslintrc.json",
+                            f"{prefix}.eslintrc.js",
+                            f"{prefix}.eslintrc.cjs",
+                            f"{prefix}jest.config.js",
+                            f"{prefix}jest.config.ts",
+                            f"{prefix}vitest.config.ts",
+                            f"{prefix}vite.config.ts",
+                            f"{prefix}tsconfig.eslint.json",
+                        ]
+                    )
+                # Root-level configs (monorepos / shared config).
+                candidate_files.extend(
+                    [
+                        "package.json",
+                        "tsconfig.json",
+                        "eslint.config.js",
+                        "eslint.config.cjs",
+                        ".eslintrc",
+                        ".eslintrc.json",
+                        ".eslintrc.js",
+                        ".eslintrc.cjs",
+                        "jest.config.js",
+                        "jest.config.ts",
+                        "vitest.config.ts",
+                        "vite.config.ts",
+                        "pnpm-workspace.yaml",
+                        ".npmrc",
+                    ]
+                )
+
+                seen: set[str] = set()
+                for rel in candidate_files:
+                    r = rel.replace("\\", "/").lstrip("/")
+                    if not r or r in seen:
+                        continue
+                    seen.add(r)
+                    try:
+                        add_repo_excerpt(r, end_line=220, include_excerpt=(len(excerpts) < excerpt_budget))
+                    except Exception:
+                        continue
+        except Exception:
+            # best-effort
+            pass
 
         recent = []
         for evt in self.ledger.iter_events(limit=20, reverse=True):
@@ -233,6 +299,13 @@ class Orchestrator:
                     ctx.constraints.append(f"用户提示（高优先级约束）：{h}")
             if hint_ptrs:
                 ctx.log_pointers.extend(hint_ptrs[:16])
+
+        # Delivery guardrails (deterministic, tool-driven): reduce "QA discovers everything" churn by grounding early.
+        if self._find_node_project_dirs():
+            ctx.constraints.append(
+                "实现约束：在修改/新增 Node/TS 代码前，先以 repo_pointers 中的 package.json / tsconfig / eslint / test 配置为事实源；"
+                "不要发明脚本/路径/依赖。新增 import 必须同步更新对应 package.json 依赖。"
+            )
 
         return ctx, ("\n".join(excerpts).strip() if excerpts else "")
 
@@ -1871,6 +1944,12 @@ class Orchestrator:
         route_level: Optional[packs.RouteLevel] = None,
         style: str = "",
     ) -> Tuple[packs.CodeChange, List[str]]:
+        def sanitize_content_for_path(path: str, content: str) -> str:
+            rel = (path or "").replace("\\", "/").lstrip("/")
+            if rel.endswith("package.json"):
+                return self._sanitize_package_json_text(content)
+            return content
+
         write_pointers: List[str] = []
         if change.writes:
             ptrs: list[Optional[str]] = [None for _ in list(change.writes)]
@@ -1882,7 +1961,8 @@ class Orchestrator:
                 if rel.startswith(".vibe/") or rel.startswith(".git/"):
                     raise RuntimeError(f"Refusing to write internal path: {w.path}")
                 try:
-                    ptrs[idx] = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=w.content)
+                    content = sanitize_content_for_path(w.path, w.content)
+                    ptrs[idx] = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=content)
                 except OwnershipDeniedError as e:
                     rid = str(getattr(e.rule, "id", "") or "ownership")
                     pending.setdefault(rid, []).append(idx)
@@ -1906,7 +1986,8 @@ class Orchestrator:
                         raise RuntimeError(f"Ownership approval denied for rule {rid}. {reason}".strip())
                     for i in idxs:
                         w = change.writes[i]
-                        ptrs[i] = self.toolbox.write_file(agent_id="router", path=w.path, content=w.content)
+                        content = sanitize_content_for_path(w.path, w.content)
+                        ptrs[i] = self.toolbox.write_file(agent_id="router", path=w.path, content=content)
 
             for p in ptrs:
                 if p:
@@ -2078,6 +2159,61 @@ class Orchestrator:
                 current, _ = actor.chat_json(schema=packs.CodeChange, messages=repair_msgs, user=repair_user)
 
         raise RuntimeError(f"Failed to materialize CodeChange after repair attempts. Last error: {last_err}")
+
+    def _sanitize_package_json_text(self, text: str) -> str:
+        """
+        Deterministic sanitization for common Windows pitfalls in npm scripts.
+
+        Primary target:
+        - Single quotes around glob patterns in scripts (e.g. `eslint 'src/**/*.ts'`), which often break on Windows
+          because single quotes are treated literally.
+        """
+
+        raw = text if isinstance(text, str) else str(text or "")
+        raw_stripped = raw.strip()
+        if not raw_stripped.startswith("{"):
+            return raw
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return raw
+
+        scripts = data.get("scripts")
+        if not isinstance(scripts, dict):
+            return raw
+
+        def sanitize_script_line(line: str) -> str:
+            s = line or ""
+            if "'" not in s:
+                return s
+            # Only rewrite when the quoted segment looks like a glob/file pattern.
+            if not re.search(r"\b(eslint|prettier|jest|vitest|vite|lint)\b", s, flags=re.IGNORECASE):
+                return s
+
+            def repl(m: re.Match) -> str:
+                inner = m.group(1)
+                return '"' + inner.replace('"', '\\"') + '"'
+
+            return re.sub(r"'([^'\r\n]*[\*\?\[\]\{\}][^'\r\n]*)'", repl, s)
+
+        changed = False
+        for k, v in list(scripts.items()):
+            if not isinstance(v, str):
+                continue
+            new_v = sanitize_script_line(v)
+            if new_v != v:
+                scripts[k] = new_v
+                changed = True
+
+        if not changed:
+            return raw
+
+        data["scripts"] = scripts
+        try:
+            return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        except Exception:
+            return raw
 
     def _append_agent_memory(
         self,

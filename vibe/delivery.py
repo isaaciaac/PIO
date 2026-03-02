@@ -38,7 +38,9 @@ _LIVE_DATA_HINTS = [
 def infer_delivery_needs(task_text: str) -> DeliveryNeeds:
     t = (task_text or "").strip()
     low = t.lower()
-    wants_live = any(h in t for h in _LIVE_DATA_HINTS if h and not h.isascii()) or any(h in low for h in _LIVE_DATA_HINTS if h and h.isascii())
+    wants_live = any(h in t for h in _LIVE_DATA_HINTS if h and not h.isascii()) or any(
+        h in low for h in _LIVE_DATA_HINTS if h and h.isascii()
+    )
     return DeliveryNeeds(wants_live_data=wants_live)
 
 
@@ -67,6 +69,7 @@ def augment_requirement_pack(req: packs.RequirementPack, *, task_text: str) -> p
     Deterministic post-processing to keep the workflow delivery-oriented.
     Avoids relying on the PM model to remember to include "how to run" / "data reality" requirements.
     """
+
     needs = infer_delivery_needs(task_text)
     out = req.model_copy(deep=True)
 
@@ -76,9 +79,9 @@ def augment_requirement_pack(req: packs.RequirementPack, *, task_text: str) -> p
 
     if needs.wants_live_data:
         if not _contains_any(out.acceptance, ["数据源", "source", "mock", "模拟", "真实", "third-party", "第三方", "api"]):
-            _add_unique(out.acceptance, "必须明确数据来源：是真实外部数据还是模拟数据；如果无法拿到真实数据，必须标注为模拟并说明如何切换")
+            _add_unique(out.acceptance, "必须明确数据来源：是真实外部数据还是模拟数据；如无法拿到真实数据，必须标注为 mock 并说明如何切换")
         if not _contains_any(out.constraints, ["assume", "假设", "fallback", "回退", "环境变量", "env", "key"]):
-            _add_unique(out.constraints, "Assume: 默认接入可配置的真实外部数据源；如缺少 API key/网络不可达则回退 mock，并在接口/界面标注 source=mock")
+            _add_unique(out.constraints, "Assume: 默认接入可配置的真实外部数据源；如缺少 API key/网络不可达则回退 mock，并在接口/UI 标注 source=mock")
 
     # Keep acceptance bounded.
     out.acceptance = list(out.acceptance or [])[:20]
@@ -91,6 +94,7 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
     """
     Ensure the plan includes delivery-critical items (docs + data source clarity) even if the Router forgets.
     """
+
     needs = infer_delivery_needs(task_text)
     out = plan.model_copy(deep=True)
     tasks = list(out.tasks or [])
@@ -123,10 +127,7 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
             # Merge into the last task to keep <= 5.
             last = tasks[-1]
             last = last.model_copy(
-                update={
-                    "description": (last.description or "").rstrip()
-                    + "\n\n交付补充：更新 README.md（安装/启动/最小验证步骤；关键配置）。"
-                }
+                update={"description": (last.description or "").rstrip() + "\n\n交付补充：更新 README.md（安装/启动/最小验证步骤；关键配置）。"}
             )
             tasks[-1] = last
 
@@ -137,16 +138,13 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
                     id="t_data_source",
                     title="数据源落地",
                     agent="coder_backend" if "coder_backend" in activated_agents else delivery_agent,
-                    description="实现可配置的数据源接入（真实外部数据优先；失败回退 mock，并在接口/界面标注 source）。",
+                    description="实现可配置的数据源接入（优先真实外部数据；失败回退 mock，并在接口/UI 标注 source）。",
                 )
             )
         else:
             last = tasks[-1]
             last = last.model_copy(
-                update={
-                    "description": (last.description or "").rstrip()
-                    + "\n\n数据源补充：实现可配置真实数据源；失败回退 mock，并标注 source。"
-                }
+                update={"description": (last.description or "").rstrip() + "\n\n数据源补充：实现可配置真实数据源；失败回退 mock，并标注 source。"}
             )
             tasks[-1] = last
 
