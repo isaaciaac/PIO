@@ -171,6 +171,21 @@ class Orchestrator:
             recent.append(packs.ContextEventRef(id=evt.id, summary=evt.summary, pointers=evt.pointers))
         ctx = packs.ContextPacket(repo_pointers=pointers, recent_events=recent)
 
+        # Deterministic scaffold hint: if we can't detect any runnable build/test configuration,
+        # tell Router/Coder to bootstrap a minimal project skeleton first.
+        try:
+            has_py = (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "setup.py").exists()
+            has_node = bool(self._find_node_project_dirs())
+            has_go = (self.repo_root / "go.mod").exists()
+            has_rust = (self.repo_root / "Cargo.toml").exists()
+            if not (has_py or has_node or has_go or has_rust):
+                ctx.constraints.append(
+                    "工程骨架提示：当前仓库未检测到可运行的 build/lint/test 配置（如 package.json/pyproject.toml）。"
+                    "若目标是从 0 搭建项目，请优先生成工程骨架与最小可验证命令，再继续实现功能。"
+                )
+        except Exception:
+            pass
+
         if task_evt is not None:
             try:
                 hints, hint_ptrs = self._collect_user_hints(task_evt=task_evt, limit=8)
@@ -2652,6 +2667,83 @@ class Orchestrator:
             _ptr, cmds = maybe_envspec(reason="No QA commands detected by heuristics", event_type="ENV_PROBED")
             if cmds:
                 qa_commands = cmds
+
+        # If we still can't detect any runnable verification commands, bootstrap a minimal
+        # project skeleton so QA has something real to execute (instead of "tests skipped").
+        #
+        # This avoids the awkward "PM asks the user to add package.json" loop: for write-enabled
+        # runs, we should try to make the repo runnable ourselves.
+        if (not mock_mode) and (not qa_commands) and route_level != "L0":
+            try:
+                activate_agent(primary_coder_id, reason="gate:bootstrap")
+                bootstrap_role = f"{coder_role} (bootstrap)"
+                bootstrap_user = (
+                    f"Task:\n{task_text}\n\n"
+                    f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                    f"Plan:\n{plan.model_dump_json()}\n\n"
+                    f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
+                    "Problem:\n"
+                    "- QA command discovery returned empty; the repo is not runnable/verifyable yet.\n"
+                    f"- QA profile (current) is {qa_profile} (required: {qa_required_profile})\n\n"
+                    "Request:\n"
+                    "- Bootstrap the minimal project skeleton consistent with the existing folder structure.\n"
+                    "- Add the missing build/test/lint scripts/config so at least one local verification command exists.\n"
+                    "- Prefer the smallest working setup; do not add optional tooling unless required to make `build` pass.\n"
+                    "- Windows compatibility matters for npm scripts (no single-quoted globs).\n"
+                    "- If this is a TypeScript/Node repo, ensure `package.json` + `tsconfig.json` exist in the correct project dir(s).\n"
+                    "- If this is a Python repo, ensure `pyproject.toml` and a minimal test/validation command exists.\n"
+                    "\n"
+                    "Return CodeChange JSON only."
+                )
+                if ctx_excerpts:
+                    bootstrap_user = f"{bootstrap_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                bootstrap_msgs = self._messages_with_memory(
+                    agent_id=primary_coder_id,
+                    system=(
+                        f"You are {bootstrap_role}. Return JSON only for CodeChange with fields: "
+                        "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                        "No extra keys. No wrapping object. No markdown.\n\n"
+                        "Hard rules:\n"
+                        "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                        "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
+                        "- Prefer 'writes' for file changes.\n"
+                        "- Do not import new npm packages unless you ALSO add them to the correct `package.json` in writes.\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=bootstrap_user,
+                )
+                boot_change, _ = primary_coder.chat_json(schema=packs.CodeChange, messages=bootstrap_msgs, user=bootstrap_user)
+                boot_change, boot_ptrs = self._materialize_code_change_with_repair(
+                    change=boot_change,
+                    actor_agent_id=primary_coder_id,
+                    actor=primary_coder,
+                    actor_role=bootstrap_role,
+                    workflow_hint=workflow_hint,
+                )
+                self._append_guarded(
+                    event=new_event(
+                        agent=primary_coder_id,
+                        type="PATCH_WRITTEN" if boot_change.kind == "patch" else "CODE_COMMIT",
+                        summary=f"bootstrap: {boot_change.summary}".strip(),
+                        branch_id=self.branch_id,
+                        pointers=[p for p in [boot_change.patch_pointer, boot_change.commit_hash] if p] + list(boot_ptrs or []),
+                        meta={"phase": "bootstrap", "files_changed": boot_change.files_changed, "route_level": route_level, "style": resolved_style},
+                    ),
+                    activated_agents=activated_agents,
+                )
+                try:
+                    if boot_change.patch_pointer:
+                        change.patch_pointer = boot_change.patch_pointer
+                    if boot_change.files_changed:
+                        change.files_changed = sorted(
+                            {*(list(change.files_changed or [])), *(list(boot_change.files_changed or []))}
+                        )
+                except Exception:
+                    pass
+                qa_commands = self._determine_test_commands(profile=qa_profile)
+            except Exception:
+                # Best-effort: if bootstrap fails, continue; the later qa_no_commands gate will create a non-green checkpoint.
+                pass
 
         def run_qa_step(*, phase: str) -> packs.TestReport:
             nonlocal qa_profile, qa_commands
