@@ -69,6 +69,40 @@ class Orchestrator:
             return branch
         return "main"
 
+    def _compute_fix_loop_max_loops(
+        self,
+        *,
+        base_max_loops: int,
+        route_level: packs.RouteLevel,
+        report: packs.TestReport,
+        started_smoke_preflight: bool,
+    ) -> int:
+        """
+        Compute a bounded fix-loop budget.
+
+        Key intuition:
+        - If we started with a smoke preflight but require a stronger QA profile (full/integration),
+          we must reserve some budget for blockers that only appear in the escalation step
+          (e.g. lint/test after build passes).
+        """
+
+        max_loops = int(base_max_loops or 3)
+        if route_level in {"L3", "L4"}:
+            max_loops = max(max_loops, 6)
+        try:
+            n_blockers = len([b for b in (report.blockers or []) if str(b).strip()])
+            if n_blockers > 1:
+                max_loops = max(max_loops, min(12, 2 + n_blockers))
+        except Exception:
+            pass
+
+        if started_smoke_preflight:
+            # Reserve a couple extra loops for blockers that only surface when we
+            # escalate from smoke (usually build-only) to full verification (lint/test).
+            max_loops = max_loops + 2
+
+        return max(1, min(max_loops, 12))
+
     def _agent(self, agent_id: str):
         cls = AGENT_REGISTRY.get(agent_id)
         if not cls:
@@ -3475,18 +3509,14 @@ class Orchestrator:
                 perf_failed = not perf_passed
 
         if (not report.passed) or review_failed or security_failed or compliance_failed or perf_failed:
-            max_loops = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
-            # New scaffolds commonly have multiple independent blockers (build/lint/test across workspaces).
-            # Keep bounded, but allow more retries for higher routes / multiple failing commands.
-            if route_level in {"L3", "L4"}:
-                max_loops = max(max_loops, 6)
-            try:
-                n_blockers = len([b for b in (report.blockers or []) if str(b).strip()])
-                if n_blockers > 1:
-                    max_loops = max(max_loops, min(12, 2 + n_blockers))
-            except Exception:
-                pass
-            max_loops = max(1, min(max_loops, 12))
+            base_max = int(getattr(self.config.behavior, "fix_loop_max_loops", 3) or 3)
+            started_smoke_preflight = (not mock_mode) and (qa_profile != qa_required_profile)
+            max_loops = self._compute_fix_loop_max_loops(
+                base_max_loops=base_max,
+                route_level=route_level,
+                report=report,
+                started_smoke_preflight=started_smoke_preflight,
+            )
             loop = 0
             fix_history: list[str] = []
             while loop < max_loops and ((not report.passed) or review_failed or security_failed or compliance_failed or perf_failed):
