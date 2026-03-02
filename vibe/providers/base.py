@@ -179,6 +179,106 @@ def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
     return data
 
 
+def _coerce_data_to_schema(data: Any, *, schema: Type[BaseModel]) -> Any:
+    """
+    Deterministic, schema-specific coercions for common partial outputs.
+
+    This is a safety net so the workflow can continue even when a model outputs
+    only a fragment of the expected schema (e.g. a single file write instead of a
+    full CodeChange object).
+    """
+
+    name = getattr(schema, "__name__", "")
+
+    if name == "CodeChange":
+        # Models sometimes return only a single file write: {path, content} (or {file, text}).
+        if isinstance(data, dict):
+            has_kind = isinstance(data.get("kind") or data.get("type"), str)
+            has_summary = isinstance(data.get("summary") or data.get("message"), str)
+            if has_kind and has_summary:
+                return data
+
+            path = None
+            for k in ("path", "file", "filepath", "filename", "name"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    path = v.strip()
+                    break
+
+            content = None
+            for k in ("content", "text", "contents", "body", "value"):
+                v = data.get(k)
+                if isinstance(v, str):
+                    content = v
+                    break
+
+            if path is not None and content is not None and "writes" not in data:
+                summary = (data.get("summary") or data.get("message") or f"Write {path}").strip()
+                return {
+                    "kind": "patch",
+                    "summary": summary[:240] if isinstance(summary, str) else f"Write {path}",
+                    "writes": [data],
+                    "files_changed": [path],
+                    "blockers": [],
+                }
+
+            # If it looks like a "writes" object but missing kind/summary, fill the minimum.
+            if "writes" in data and isinstance(data.get("writes"), list) and not has_kind:
+                summary = data.get("summary") or data.get("message") or "Apply file writes"
+                return {
+                    **data,
+                    "kind": "patch",
+                    "summary": str(summary)[:240],
+                }
+
+            if not has_summary and isinstance(data.get("title"), str):
+                return {**data, "summary": data.get("title")}
+
+        if isinstance(data, list):
+            # Treat a top-level list as writes[] when elements look like file writes.
+            looks_like_writes = True
+            paths: list[str] = []
+            for it in data[:20]:
+                if not isinstance(it, dict):
+                    looks_like_writes = False
+                    break
+                p = None
+                for k in ("path", "file", "filepath", "filename", "name"):
+                    v = it.get(k)
+                    if isinstance(v, str) and v.strip():
+                        p = v.strip()
+                        break
+                if not p:
+                    looks_like_writes = False
+                    break
+                paths.append(p)
+            if looks_like_writes:
+                summary = f"Write {len(paths)} file(s)"
+                if len(paths) == 1:
+                    summary = f"Write {paths[0]}"
+                return {"kind": "patch", "summary": summary, "writes": data, "files_changed": paths, "blockers": []}
+
+    if name == "Plan":
+        # Some models return tasks[] directly.
+        if isinstance(data, list):
+            return {"tasks": data}
+        # Some return {plan:{tasks:[...]}}.
+        if isinstance(data, dict) and "tasks" not in data:
+            v = data.get("plan")
+            if isinstance(v, dict) and "tasks" in v:
+                return v
+
+    if name == "RequirementPack":
+        # Allow summary aliases.
+        if isinstance(data, dict) and "summary" not in data:
+            for k in ("title", "overview", "scope"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    return {**data, "summary": v.strip()}
+
+    return data
+
+
 def _parse_json_to_schema(text: str, *, schema: Type[T]) -> T:
     """
     Parse and validate model output against a schema.
@@ -211,7 +311,13 @@ def _parse_json_to_schema(text: str, *, schema: Type[T]) -> T:
             continue
         try:
             data = _unwrap_schema_envelope(data, schema=schema)
-            return schema.model_validate(data)
+            try:
+                return schema.model_validate(data)
+            except ValidationError:
+                coerced = _coerce_data_to_schema(data, schema=schema)
+                if coerced is not data:
+                    return schema.model_validate(coerced)
+                raise
         except ValidationError as e:
             last_err = e
             continue

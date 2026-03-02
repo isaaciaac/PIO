@@ -40,3 +40,18 @@ def test_parse_json_to_schema_raises_when_no_json():
     with pytest.raises(Exception):
         _parse_json_to_schema("no json here", schema=DemoPack)
 
+
+class DemoCodeChange(BaseModel):
+    kind: str
+    summary: str
+    writes: list[dict] = []
+
+
+def test_parse_json_to_schema_coerces_single_write_to_codechange():
+    text = '{ "path": "src/x.txt", "content": "hi" }'
+    from vibe.schemas import packs
+
+    parsed = _parse_json_to_schema(text, schema=packs.CodeChange)
+    assert parsed.kind == "patch"
+    assert "src/x.txt" in parsed.summary
+    assert parsed.writes and parsed.writes[0].path == "src/x.txt"
