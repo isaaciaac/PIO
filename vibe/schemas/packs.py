@@ -21,6 +21,25 @@ class PlanTask(BaseModel):
     agent: str
     description: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        # Models frequently emit numeric ids (1,2,3) for tasks; accept and coerce.
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "id" in out and not isinstance(out.get("id"), str):
+            try:
+                out["id"] = str(out.get("id"))
+            except Exception:
+                pass
+        # Accept common variants.
+        if "title" not in out and isinstance(out.get("name"), str):
+            out["title"] = out.get("name")
+        if "description" not in out and isinstance(out.get("desc"), str):
+            out["description"] = out.get("desc")
+        return out
+
 
 class Plan(BaseModel):
     tasks: List[PlanTask] = Field(default_factory=list)
