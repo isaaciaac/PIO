@@ -771,7 +771,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private stagesForAgents(agents: string[]): { key: string; label: string; types: string[] }[] {
     const a = new Set((agents || []).map((x) => String(x).trim()).filter(Boolean));
     const stages: { key: string; label: string; types: string[] }[] = [
-      { key: "route", label: "路由选择", types: ["ROUTE_SELECTED", "AGENTS_ACTIVATED"] },
+      { key: "route", label: "策略判定", types: ["ROUTE_SELECTED", "AGENTS_ACTIVATED"] },
       { key: "context", label: "构建上下文", types: ["CONTEXT_PACKET_BUILT"] },
     ];
     if (a.has("pm")) stages.push({ key: "req", label: "需求/验收", types: ["AC_DEFINED", "REQ_CREATED", "REQ_UPDATED"] });
@@ -793,6 +793,22 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     if (a.has("data_engineer")) stages.push({ key: "migration", label: "迁移", types: ["DB_MIGRATION_PLANNED", "DB_MIGRATION_APPLIED"] });
     stages.push({ key: "checkpoint", label: "创建检查点", types: ["CHECKPOINT_CREATED"] });
     return stages;
+  }
+
+  private routeDisplayName(routeLevel: string): string {
+    const r = String(routeLevel || "").trim();
+    if (!r) return "";
+    return r === "L0"
+      ? "快速（草稿）"
+      : r === "L1"
+        ? "简单MVP"
+        : r === "L2"
+          ? "多模块MVP"
+          : r === "L3"
+            ? "可发布"
+            : r === "L4"
+              ? "生产级"
+              : r;
   }
 
   private startLedgerProgressWatcher(root: string, startLine: number): () => void {
@@ -849,7 +865,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         const evtType = String(last.type || "").trim();
         const s = String(last.summary || "").trim();
         const short = s.length > 60 ? `${s.slice(0, 60)}…` : s;
-        const routeText = routeLevel ? `（${routeLevel}）` : "";
+        // 路由等级用于门禁/审计，不作为主要 UI 信息展示。
+        const routeText = "";
         const detail = evtType ? ` · 最近：${who} ${evtType}${short ? `：${short}` : ""}` : "";
         const progressLine = `${stepText}${routeText}${detail}`.trim();
         // Keep the bottom status minimal; stream the detailed line into the chat timeline.
@@ -1040,20 +1057,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const e = events.find((x) => String(x.type || "").trim() === "ROUTE_SELECTED");
       routeLevel = String(e?.meta?.route_level || "").trim();
     }
-    const routeLabel =
-      routeLevel === "L0"
-        ? "L0 快速（草稿）"
-        : routeLevel === "L1"
-          ? "L1 简单 MVP"
-          : routeLevel === "L2"
-            ? "L2 多模块 MVP"
-            : routeLevel === "L3"
-              ? "L3 可发布"
-              : routeLevel === "L4"
-                ? "L4 生产级"
-                : routeLevel
-                  ? routeLevel
-                  : "（未知）";
+    const routeLabel = this.routeDisplayName(routeLevel) || "（未知）";
 
     const agentIds: string[] = Array.isArray(meta?.agents)
       ? meta.agents.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
@@ -1094,7 +1098,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const isDraft = Boolean(meta?.draft);
     const reasonText =
       isDraft
-        ? "这是 L0 草稿检查点，默认不标绿。"
+        ? "这是“快速（草稿）”检查点，默认不标绿。"
         : reasonRaw === "qa_no_commands"
           ? "未检测到可执行的测试/校验命令（因此不算绿灯）。"
           : reasonRaw === "fix_loop_blockers"
@@ -1114,7 +1118,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       lines.push(`已完成工作流：任务 ${taskId}。`);
     }
     lines.push(`检查点：${checkpointId}（绿灯：${green === undefined ? "未知" : green ? "是" : "否"}）。`);
-    lines.push(`路由：${routeLabel}${styleLabel ? `；风格：${styleLabel}` : ""}`);
+    lines.push(`策略：${routeLabel}${styleLabel ? `；风格：${styleLabel}` : ""}`);
     if (agentsText) lines.push(`启用角色：${agentsText}`);
     if (green === true && (hadTestFailed || hadReviewBlocked) && attempts <= 1) {
       const parts: string[] = [];
@@ -1169,14 +1173,14 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
     const suggestions: string[] = [];
     if (green === true) {
-      suggestions.push("可以继续补充需求或直接开始下一条任务；需要更严格门禁可把路由切到 L2/L3。");
+      suggestions.push("可以继续补充需求或直接开始下一条任务；需要更严格门禁可把策略升级到“多模块MVP/可发布”。");
     } else if (green === false) {
-      if (isDraft) suggestions.push("这是 L0 草稿路线，想要绿灯请改用 L1/L2 后重跑。");
+      if (isDraft) suggestions.push("这是“快速（草稿）”路线，想要绿灯请改用“简单MVP/多模块MVP”后重跑。");
       if (reasonRaw === "qa_no_commands") {
         suggestions.push("当前项目未识别到可运行的测试/校验命令：如果是 Python/Node，请确保存在 `pyproject.toml`/`package.json` 或 `tests/`；否则请先补一个最小 smoke 命令后再跑。");
       }
       if (reviewEvt && String(reviewEvt.type || "").trim() === "REVIEW_BLOCKED") {
-        suggestions.push("存在审查阻塞：我可以继续自动修复（再多尝试几轮 / 升级路由），直到通过或找到需要你确认的点。");
+        suggestions.push("存在审查阻塞：我可以继续自动修复（再多尝试几轮 / 升级策略），直到通过或找到需要你确认的点。");
       }
       if (qaEvt && String(qaEvt.type || "").trim() === "TEST_FAILED") {
         suggestions.push("存在测试阻塞：我会继续尝试自动修复；如果反复失败，优先打开失败命令的 artifacts 日志确认具体报错，再继续修。");
@@ -1729,13 +1733,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
                 <option value="router">调度器（Router）</option>
               </select>
             </span>
-            <select id="route" title="路由等级：自动由 RouteDecider 决定；更高等级会启用更多门禁（L3/L4 会增加交付/合规/性能等门禁，耗时更长）">
-              <option value="auto" selected>路由：自动</option>
-              <option value="L0">路由：L0 快速</option>
-              <option value="L1">路由：L1 简单 MVP</option>
-              <option value="L2">路由：L2 多模块 MVP</option>
-              <option value="L3">路由：L3 可发布</option>
-              <option value="L4">路由：L4 生产级</option>
+            <select id="route" title="策略：自动由系统判定；越高越严格（会启用更多门禁与角色，耗时更长）">
+              <option value="auto" selected>策略：自动</option>
+              <option value="L0">策略：快速（草稿）</option>
+              <option value="L1">策略：简单MVP</option>
+              <option value="L2">策略：多模块MVP</option>
+              <option value="L3">策略：可发布</option>
+              <option value="L4">策略：生产级</option>
             </select>
             <select id="style" title="对话/方案的细致程度：自由发挥会更少追问、更多默认假设；细致严谨会更全面">
               <option value="balanced" selected>风格：平衡</option>
