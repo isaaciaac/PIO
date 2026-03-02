@@ -401,6 +401,17 @@ def default_config() -> VibeConfig:
             ledger_write_types=["RUNBOOK_UPDATED"],
             tools_allowed=["read_file", "write_file"],
         ),
+        "ops_engineer": agent(
+            "ops_engineer",
+            enabled=False,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Reproduce, diagnose, and propose fixes for workflow blockers",
+            capabilities=["ops", "triage", "debug"],
+            io_schema="vibe.schemas.packs.FixPlanPack",
+            ledger_write_types=[],
+            tools_allowed=["read_file", "read_artifact", "search", "run_cmd"],
+        ),
         "specialist": agent(
             "specialist",
             enabled=False,
@@ -518,6 +529,7 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
         "qa": ["qa", "tests", "triage", "node", "python"],
         "code_reviewer": ["review", "quality"],
         "security": ["security", "threat_model"],
+        "ops_engineer": ["ops", "triage", "debug"],
         "compliance": ["compliance", "privacy"],
         "performance": ["performance", "bench"],
         "doc_writer": ["docs", "handoff"],
@@ -536,5 +548,11 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
     if "specialist" not in cfg.agents:
         try:
             cfg.agents["specialist"] = default_config().agents["specialist"]
+        except Exception:
+            pass
+
+    if "ops_engineer" not in cfg.agents:
+        try:
+            cfg.agents["ops_engineer"] = default_config().agents["ops_engineer"]
         except Exception:
             pass

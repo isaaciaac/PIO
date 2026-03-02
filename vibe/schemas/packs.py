@@ -168,6 +168,22 @@ class IncidentPack(BaseModel):
     autohint: Optional[str] = None
 
 
+class FixPlanPack(BaseModel):
+    """
+    Human-readable but structured troubleshooting plan used to guide fix-loop.
+
+    This is produced by an "ops/triage" agent. It MUST stay short and actionable.
+    Facts must be pointer-backed (from repo excerpts, artifacts, git refs).
+    """
+
+    summary: str
+    root_causes: List[str] = Field(default_factory=list)
+    repro_steps: List[str] = Field(default_factory=list)
+    proposed_fixes: List[str] = Field(default_factory=list)
+    files_to_check: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+
 class ReviewReport(BaseModel):
     passed: bool
     blockers: List[str] = Field(default_factory=list)
@@ -214,6 +230,9 @@ class UXCopyPack(BaseModel):
 
 class DecisionPack(BaseModel):
     adrs: List[Dict[str, Any]] = Field(default_factory=list)
+    # Cross-role shared conventions/parameters so downstream agents stay aligned.
+    # Keep this concise and stable (ports/dirs/env vars/commands/naming).
+    shared_context: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ContractPack(BaseModel):

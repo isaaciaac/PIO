@@ -2033,7 +2033,7 @@ class Orchestrator:
         # This avoids failures like "cannot find module" on fresh checkouts.
         try:
             node_dirs: list[Path] = []
-            for c in report_cmds:
+            for c in cmds:
                 if not isinstance(c, str):
                     continue
                 lower = c.lower()
@@ -2234,6 +2234,7 @@ class Orchestrator:
         doc_writer = self._agent("doc_writer") if "doc_writer" in self.config.agents else None
         release_manager = self._agent("release_manager") if "release_manager" in self.config.agents else None
         support_engineer = self._agent("support_engineer") if "support_engineer" in self.config.agents else None
+        ops_engineer = self._agent("ops_engineer") if "ops_engineer" in self.config.agents else None
         specialist = self._agent("specialist") if "specialist" in self.config.agents else None
 
         ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
@@ -2296,6 +2297,13 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
+        needs_arch = route_level in {"L2", "L3", "L4"}
+        try:
+            if route_level == "L1" and any("工程骨架提示" in str(c) for c in (ctx.constraints or [])):
+                needs_arch = True
+        except Exception:
+            needs_arch = needs_arch
+
         if route_level in {"L2", "L3", "L4"}:
             activate_agent("requirements_analyst", reason="gate:usecases")
             if req_analyst is None:
@@ -2327,9 +2335,10 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
-            activate_agent("architect", reason="gate:adr")
+        if needs_arch:
+            activate_agent("architect", reason="gate:architecture")
             if architect is None:
-                raise RuntimeError("architect is required for L2+ routes")
+                raise RuntimeError("architect is required for architecture gate")
             adr_user = (
                 f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
                 f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
@@ -2339,9 +2348,17 @@ class Orchestrator:
             adr_msgs = self._messages_with_memory(
                 agent_id="architect",
                 system=(
-                    "You are Architect. Produce an ADR-lite. Return JSON only for DecisionPack with fields: "
-                    "adrs (list[object]). Each adr should include at least: title, context, decision, consequences. "
-                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    "你是架构师（architect）。你要先把“整体架构 + 跨角色共享约定”讲清楚，避免后续靠 QA 失败倒逼修。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 DecisionPack schema："
+                    "{adrs: list[object], shared_context: object}。\n"
+                    "规则：\n"
+                    "- adrs：至少 1 条 ADR-lite；每条至少包含 title/context/decision/consequences。\n"
+                    "- shared_context：必须包含以下 key（即使为空也要给出）：repo_layout、commands、env_vars。\n"
+                    "  - repo_layout：说明关键目录（如 client/backend）、包管理与构建产物目录等。\n"
+                    "  - commands：给出安装/开发/构建/测试的推荐命令（存在则引用现有脚本；不存在则说明需要补齐）。\n"
+                    "  - env_vars：列出需要的环境变量（如 API key、DB 连接等）。\n"
+                    "- 不要发散到实现细节；目标是让 Router 能拆任务、Coder 能落地、QA 能验证。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
                     f"{workflow_hint}"
                 ),
                 user=adr_user,
@@ -2360,39 +2377,84 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
-            if risks.contract_change or risks.touches_external_api:
-                activate_agent("api_confirm", reason="gate:contract")
-                if api_confirm is None:
-                    raise RuntimeError("api_confirm is required for contract/external API changes")
-                contract_user = (
-                    f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
-                    f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
-                )
-                if ctx_excerpts:
-                    contract_user = f"{contract_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-                contract_msgs = self._messages_with_memory(
-                    agent_id="api_confirm",
-                    system=(
-                        "You are API/Contract confirmer. Return JSON only for ContractPack with fields: "
-                        "contracts (list[object]). Use minimal, stable contracts: endpoints/schemas/examples when applicable. "
-                        "No extra keys. No wrapping object. No markdown.\n\n"
-                        f"{workflow_hint}"
-                    ),
-                    user=contract_user,
-                )
-                contract, _ = api_confirm.chat_json(schema=packs.ContractPack, messages=contract_msgs, user=contract_user)
-                contract_ptr = self.artifacts.put_json(contract.model_dump(), suffix=".contract.json", kind="contract").to_pointer()
-                self._append_guarded(
-                    event=new_event(
-                        agent="api_confirm",
-                        type="CONTRACT_CONFIRMED",
-                        summary="Contract confirmed",
-                        branch_id=self.branch_id,
-                        pointers=[contract_ptr],
-                        meta={"route_level": route_level, "style": resolved_style},
-                    ),
-                    activated_agents=activated_agents,
-                )
+            # Completeness gate: require a minimal shared_context contract so coders stay aligned.
+            missing_keys: list[str] = []
+            try:
+                sc = dict(decisions.shared_context or {})
+            except Exception:
+                sc = {}
+            for k in ["repo_layout", "commands", "env_vars"]:
+                if k not in sc:
+                    missing_keys.append(k)
+            if not list(decisions.adrs or []):
+                missing_keys.append("adrs")
+
+            if missing_keys:
+                try:
+                    adr_user2 = (
+                        f"{adr_user}\n\nPreviousDecisionPack:\n{decisions.model_dump_json()}\n\n"
+                        f"MissingFields:\n- " + "\n- ".join(missing_keys[:8]) + "\n\n"
+                        "Request:\n- 仅补齐缺失字段；不要删除已有内容。\n- shared_context 必须包含 repo_layout/commands/env_vars。\n"
+                    )
+                    adr_msgs2 = self._messages_with_memory(
+                        agent_id="architect",
+                        system=(
+                            "你是架构师（architect）。你需要补齐上一轮 DecisionPack 的缺失字段。\n"
+                            "只输出 DecisionPack JSON；不要额外 key；不要 markdown。\n\n"
+                            f"{workflow_hint}"
+                        ),
+                        user=adr_user2,
+                    )
+                    decisions2, _ = architect.chat_json(schema=packs.DecisionPack, messages=adr_msgs2, user=adr_user2)
+                    decisions = decisions2
+                    decisions_ptr = self.artifacts.put_json(decisions.model_dump(), suffix=".adr.json", kind="adr").to_pointer()
+                    self._append_guarded(
+                        event=new_event(
+                            agent="architect",
+                            type="ARCH_UPDATED",
+                            summary="Architecture clarified",
+                            branch_id=self.branch_id,
+                            pointers=[decisions_ptr],
+                            meta={"route_level": route_level, "style": resolved_style, "missing_fields": missing_keys},
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                except Exception:
+                    pass
+
+        if route_level in {"L2", "L3", "L4"} and (risks.contract_change or risks.touches_external_api):
+            activate_agent("api_confirm", reason="gate:contract")
+            if api_confirm is None:
+                raise RuntimeError("api_confirm is required for contract/external API changes")
+            contract_user = (
+                f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                contract_user = f"{contract_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            contract_msgs = self._messages_with_memory(
+                agent_id="api_confirm",
+                system=(
+                    "You are API/Contract confirmer. Return JSON only for ContractPack with fields: "
+                    "contracts (list[object]). Use minimal, stable contracts: endpoints/schemas/examples when applicable. "
+                    "No extra keys. No wrapping object. No markdown.\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=contract_user,
+            )
+            contract, _ = api_confirm.chat_json(schema=packs.ContractPack, messages=contract_msgs, user=contract_user)
+            contract_ptr = self.artifacts.put_json(contract.model_dump(), suffix=".contract.json", kind="contract").to_pointer()
+            self._append_guarded(
+                event=new_event(
+                    agent="api_confirm",
+                    type="CONTRACT_CONFIRMED",
+                    summary="Contract confirmed",
+                    branch_id=self.branch_id,
+                    pointers=[contract_ptr],
+                    meta={"route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
 
         plan_user = (
             f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
@@ -2415,6 +2477,8 @@ class Orchestrator:
                 "不要额外 key；不要最外层包一层对象。\n\n"
                 "规划规则：\n"
                 "- tasks <= 5；每个 task 必须可落地、可验收。\n"
+                "- tasks 按顺序执行：先补齐工程骨架/可运行验证，再实现核心功能，最后补文档/收尾。\n"
+                "- task.agent 尽量选择可落地写文件的工种（coder_backend/coder_frontend/integration_engineer）；不要把 pm/qa/reviewer/security 当成 plan task（它们由 gate 触发）。\n"
                 "- 交付导向：至少包含一个任务负责「README/运行方式/最小验证」的交付说明。\n"
                 "- 若需求暗示实时/价格/行情/外部数据：至少包含一个任务负责数据源落地（真实优先，失败回退 mock 并标注 source）。\n\n"
                 f"{workflow_hint}"
@@ -2447,42 +2511,46 @@ class Orchestrator:
             primary_coder_id = "coder_backend"
         activate_agent(primary_coder_id, reason="gate:implement")
 
-        primary_coder = (
-            coder_frontend
-            if primary_coder_id == "coder_frontend" and coder_frontend is not None
-            else integrator
-            if primary_coder_id == "integration_engineer" and integrator is not None
-            else coder_backend
-        )
+        # If the repo appears to be a "from-scratch" scaffold (no build/test config),
+        # ensure the plan starts with a bootstrap task so we don't rely on QA failures
+        # to discover missing project plumbing.
+        try:
+            needs_bootstrap = any("工程骨架提示" in str(c) for c in (ctx.constraints or []))
+        except Exception:
+            needs_bootstrap = False
+        if needs_bootstrap:
+            try:
+                blob = "\n".join([f"{t.title}\n{t.description}" for t in list(plan.tasks or [])]).lower()
+            except Exception:
+                blob = ""
+            has_bootstrap = any(k in blob for k in ["工程骨架", "scaffold", "package.json", "pyproject", "tsconfig", "初始化", "bootstrap"])
+            if not has_bootstrap:
+                boot = packs.PlanTask(
+                    id="t_bootstrap",
+                    title="工程骨架",
+                    agent=primary_coder_id,
+                    description="补齐最小工程骨架（build/lint/test/README 运行说明），确保至少有一条可执行的本地验证命令。",
+                )
+                plan.tasks = [boot] + list(plan.tasks or [])[:4]
 
-        coder_user = (
-            f"RequirementPack:\n{req.model_dump_json()}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
-            if req is not None
-            else f"Task:\n{task_text}\n\nPlan:\n{plan.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
-        )
-        if ctx_excerpts:
-            coder_user = f"{coder_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-        if usecases is not None:
-            coder_user = f"{coder_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
-        if decisions is not None:
-            coder_user = f"{coder_user}\n\nDecisionPack:\n{decisions.model_dump_json()}"
-        if contract is not None:
-            coder_user = f"{coder_user}\n\nContractPack:\n{contract.model_dump_json()}"
-        coder_role = "Coder"
-        if primary_coder_id == "coder_frontend":
-            coder_role = "Frontend Coder (React/TypeScript)"
-        elif primary_coder_id == "integration_engineer":
-            coder_role = "Integration Engineer (align frontend/backend/contracts)"
-        elif primary_coder_id == "coder_backend":
-            coder_role = "Backend Coder"
+        def coder_actor(agent_id: str):
+            if agent_id == "coder_frontend" and coder_frontend is not None:
+                return coder_frontend, "Frontend Coder (React/TypeScript)"
+            if agent_id == "integration_engineer" and integrator is not None:
+                return integrator, "Integration Engineer (align frontend/backend/contracts)"
+            return coder_backend, "Backend Coder"
 
-        coder_msgs = self._messages_with_memory(
-            agent_id=primary_coder_id,
-            system=(
-                f"You are {coder_role}. Return JSON only for CodeChange with fields: "
+        primary_coder, coder_role = coder_actor(primary_coder_id)
+
+        def coder_system(*, role: str, task: packs.PlanTask) -> str:
+            return (
+                f"You are {role}. Return JSON only for CodeChange with fields: "
                 "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
                 "Each writes item must include the full file content. No extra keys. No markdown.\n\n"
+                "Focus:\n"
+                f"- Implement ONLY this PlanTask ({task.id}): {task.title}\n"
+                "- Do not implement other plan tasks yet; keep changes minimal and coherent.\n\n"
                 "Hard rules:\n"
                 "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
                 "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
@@ -2490,40 +2558,157 @@ class Orchestrator:
                 "- Do not import new npm packages unless you ALSO add them to the correct `package.json` (dependencies/devDependencies) in writes.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
-                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
-                 "- If you add a Vite app, include `index.html` at that app root.\n"
-                 "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
-                 "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
-                 "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n"
-                 "\n"
-                 "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
-                 "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
-                 "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
+                "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
+                "- If you add a Vite app, include `index.html` at that app root.\n"
+                "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
+                "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n"
+                "\n"
+                "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
+                "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
+                "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
                 "\n\n"
                 f"{workflow_hint}"
-            ),
-            user=coder_user,
-        )
-        change, _change_meta = primary_coder.chat_json(schema=packs.CodeChange, messages=coder_msgs, user=coder_user)
-        change, write_pointers = self._materialize_code_change_with_repair(
-            change=change,
-            actor_agent_id=primary_coder_id,
-            actor=primary_coder,
-            actor_role=coder_role,
-            workflow_hint=workflow_hint,
-        )
+            )
 
-        self._append_guarded(
-            event=new_event(
-                agent=primary_coder_id,
-                type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
-                summary=change.summary,
-                branch_id=self.branch_id,
-                pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
-                meta={"files_changed": change.files_changed, "route_level": route_level, "style": resolved_style},
-            ),
-            activated_agents=activated_agents,
-        )
+        def task_user_text(*, task: packs.PlanTask) -> str:
+            base = (
+                f"Task:\n{task_text}\n\n"
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"PlanTask:\n{task.model_dump_json()}\n\n"
+                f"FullPlan:\n{plan.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if usecases is not None:
+                base = f"{base}\n\nUseCasePack:\n{usecases.model_dump_json()}"
+            if ctx_excerpts:
+                base = f"{base}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            return base
+
+        # Execute plan tasks sequentially. This avoids the "QA drives progress" anti-pattern:
+        # we first complete the planned work, then validate.
+        plan_changes: list[packs.CodeChange] = []
+        all_write_pointers: list[str] = []
+
+        code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
+        for t in list(plan.tasks or [])[:5]:
+            agent_id = (t.agent or "").strip() or primary_coder_id
+            if agent_id not in code_agents:
+                agent_id = primary_coder_id
+            if agent_id == "coder_frontend" and coder_frontend is None:
+                agent_id = "coder_backend"
+            if agent_id == "integration_engineer" and integrator is None:
+                agent_id = "coder_backend"
+
+            activate_agent(agent_id, reason=f"plan_task:{t.id}")
+            actor, role = coder_actor(agent_id)
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="STATE_TRANSITION",
+                    summary=f"Implement: {t.id} -> {agent_id}",
+                    branch_id=self.branch_id,
+                    pointers=[],
+                    meta={
+                        "phase": "implement",
+                        "plan_task_id": t.id,
+                        "plan_task_title": t.title,
+                        "agent": agent_id,
+                        "route_level": route_level,
+                        "style": resolved_style,
+                    },
+                ),
+                activated_agents=activated_agents,
+            )
+
+            user_text = task_user_text(task=t)
+            msgs = self._messages_with_memory(
+                agent_id=agent_id,
+                system=coder_system(role=role, task=t),
+                user=user_text,
+            )
+            task_change, _ = actor.chat_json(schema=packs.CodeChange, messages=msgs, user=user_text)
+            task_change, write_ptrs = self._materialize_code_change_with_repair(
+                change=task_change,
+                actor_agent_id=agent_id,
+                actor=actor,
+                actor_role=role,
+                workflow_hint=workflow_hint,
+            )
+
+            # Keep prompts downstream small: we only need patch evidence + file list.
+            task_change = task_change.model_copy(update={"writes": []})
+
+            meta = {"files_changed": task_change.files_changed, "route_level": route_level, "style": resolved_style, "plan_task_id": t.id}
+            if task_change.blockers:
+                meta["blockers"] = list(task_change.blockers)[:8]
+            self._append_guarded(
+                event=new_event(
+                    agent=agent_id,
+                    type="PATCH_WRITTEN" if task_change.kind == "patch" else "CODE_COMMIT",
+                    summary=f"{t.title}: {task_change.summary}",
+                    branch_id=self.branch_id,
+                    pointers=[p for p in [task_change.patch_pointer, task_change.commit_hash] if p] + write_ptrs,
+                    meta=meta,
+                ),
+                activated_agents=activated_agents,
+            )
+            plan_changes.append(task_change)
+            all_write_pointers.extend(write_ptrs)
+
+            # Keep manifests/index fresh so subsequent tasks can ground in new repo state.
+            try:
+                self.toolbox.scan_repo(agent_id="router", reason=f"plan_task:{t.id}")
+            except PolicyDeniedError:
+                pass
+            except Exception:
+                pass
+
+            # Refresh ContextPacket excerpts so later tasks and gates see updated README/manifests.
+            try:
+                ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
+            except Exception:
+                pass
+
+        # Aggregate evidence for downstream gates (review/security) without embedding full file contents.
+        files_changed: list[str] = []
+        seen_files: set[str] = set()
+        for c in plan_changes:
+            for p in list(c.files_changed or [])[:200]:
+                s = str(p).strip()
+                if not s or s in seen_files:
+                    continue
+                seen_files.add(s)
+                files_changed.append(s)
+
+        summary_parts = [str(c.summary or "").strip() for c in plan_changes if str(c.summary or "").strip()]
+        summary = "；".join(summary_parts)[:240] if summary_parts else (req.summary if req is not None else task_text.strip().splitlines()[0][:120])
+        change = packs.CodeChange(kind=("patch" if any(c.kind == "patch" for c in plan_changes) else "noop"), summary=summary, files_changed=files_changed)
+        write_pointers = []
+        try:
+            if self.toolbox.git_is_repo(agent_id="router"):
+                diff = self.toolbox.git_diff(agent_id="router")
+                if diff.stdout:
+                    change.kind = "patch"
+                    change.patch_pointer = diff.stdout
+        except Exception:
+            pass
+        if not change.patch_pointer:
+            for c in reversed(plan_changes):
+                if c.patch_pointer:
+                    change.patch_pointer = c.patch_pointer
+                    break
+
+        # Deduplicate write pointers.
+        seen_ptrs: set[str] = set()
+        for p in all_write_pointers:
+            s = str(p).strip()
+            if not s or s in seen_ptrs:
+                continue
+            seen_ptrs.add(s)
+            write_pointers.append(s)
 
         if self.policy.mode == "chat_only":
             checkpoint_id = f"ckpt_{uuid4().hex[:12]}"
@@ -3201,6 +3386,68 @@ class Orchestrator:
                     else coder_backend
                 )
 
+                fix_plan: Optional[packs.FixPlanPack] = None
+                fix_plan_ptr: Optional[str] = None
+                try:
+                    can_triage = ops_engineer is not None and (mock_mode or self._api_key_available_for_agent("ops_engineer"))
+                except Exception:
+                    can_triage = False
+                if can_triage and ops_engineer is not None:
+                    try:
+                        activate_agent("ops_engineer", reason="gate:triage")
+                        triage_user = (
+                            f"BlockerSource: {blocker_source}\n"
+                            f"Blocker:\n{blocker_text}\n\n"
+                            f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                            f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\n"
+                            f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                            f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                            f"ReviewReport:\n{review.model_dump_json() if review is not None else '{}'}\n\n"
+                            f"SecurityReport:\n{security_report.model_dump_json() if security_report is not None else '{}'}\n\n"
+                            f"ComplianceReport:\n{compliance_report.model_dump_json() if compliance_report is not None else '{}'}\n\n"
+                            f"PerfReport:\n{perf_report.model_dump_json() if perf_report is not None else '{}'}\n\n"
+                            f"TestReport:\n{report.model_dump_json()}\n\n"
+                            f"ContextPacket:\n{ctx.model_dump_json()}"
+                        )
+                        if ctx_excerpts:
+                            triage_user = f"{triage_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                        if blocker_source == "tests":
+                            failure_excerpts = self._repo_excerpts_for_test_failure(report)
+                            if failure_excerpts:
+                                triage_user = f"{triage_user}\n\nFailureRepoExcerpts:\n{failure_excerpts}"
+
+                        triage_msgs = self._messages_with_memory(
+                            agent_id="ops_engineer",
+                            system=(
+                                "你是运维/排障工程师（ops_engineer）。目标：复现/诊断当前阻塞，并给出最小修复方案，指导 coder 一次修一个 blocker。\n"
+                                "只输出 JSON（不要 markdown），并严格匹配 FixPlanPack schema："
+                                "{summary: string, root_causes: string[], repro_steps: string[], proposed_fixes: string[], files_to_check: string[], pointers: string[]}。\n"
+                                "不要额外 key；不要最外层包一层对象。\n\n"
+                                "规则：\n"
+                                "- 只基于提供的错误信息/RepoExcerpts/FailureRepoExcerpts/pointers 做判断；不允许凭空编造文件/命令。\n"
+                                "- repro_steps 要可执行且尽量少（1–4 条）；proposed_fixes 要具体可落地（指向文件/配置/依赖）。\n"
+                                "- 不要让用户去做工程杂活；优先给出系统内部可自动完成的修复建议。\n\n"
+                                f"{workflow_hint}"
+                            ),
+                            user=triage_user,
+                        )
+                        fix_plan, _ = ops_engineer.chat_json(schema=packs.FixPlanPack, messages=triage_msgs, user=triage_user)
+                        fix_plan_ptr = self.artifacts.put_json(fix_plan.model_dump(), suffix=".fixplan.json", kind="fixplan").to_pointer()
+                        self._append_guarded(
+                            event=new_event(
+                                agent="router",
+                                type="STATE_TRANSITION",
+                                summary=f"Fix-loop {loop}: triage ops_engineer",
+                                branch_id=self.branch_id,
+                                pointers=[fix_plan_ptr],
+                                meta={"loop": loop, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style},
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                    except Exception:
+                        fix_plan = None
+                        fix_plan_ptr = None
+
                 # Audit: record which agent is handling this fix-loop step.
                 self._append_guarded(
                     event=new_event(
@@ -3244,6 +3491,11 @@ class Orchestrator:
 
                 if fix_history:
                     fix_user = f"{fix_user}\n\nFixLoopHistory（已尝试的修复，避免重复）：\n" + "\n".join(fix_history[-6:])
+
+                if fix_plan is not None:
+                    fix_user = f"{fix_user}\n\nOpsFixPlan（运维排障建议；事实以 pointers 展开为准）：\n{fix_plan.model_dump_json()}"
+                    if fix_plan_ptr:
+                        fix_user = f"{fix_user}\n\nOpsFixPlanPointer: {fix_plan_ptr}"
 
                 if blocker_source == "tests":
                     hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text)
@@ -3354,6 +3606,8 @@ class Orchestrator:
                 except Exception:
                     pass
                 meta = {"blocker": blocker_text, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style}
+                if fix_plan_ptr:
+                    meta["fix_plan"] = fix_plan_ptr
                 if auto_change is not None:
                     meta["auto_fix"] = True
                 self._append_guarded(

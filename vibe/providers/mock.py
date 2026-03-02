@@ -137,6 +137,15 @@ class MockProvider:
             out = schemas.CIPack(notes=[])
         elif schema is schemas.ReleasePack:
             out = schemas.ReleasePack(version="0.0.0", changelog=[])
+        elif schema is schemas.FixPlanPack:
+            out = schemas.FixPlanPack(
+                summary="mock: triage plan",
+                root_causes=["mock: unknown"],
+                repro_steps=["mock: re-run the failing command"],
+                proposed_fixes=["mock: apply the suggested patch and re-run tests"],
+                files_to_check=[],
+                pointers=[],
+            )
         elif schema is schemas.ReviewReport:
             out = schemas.ReviewReport(passed=True, blockers=[], nits=[], pointers=[])
         elif schema is schemas.RiskRegister:
