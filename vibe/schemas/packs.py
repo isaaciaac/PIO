@@ -136,6 +136,13 @@ class ChatReply(BaseModel):
     pointers: List[str] = Field(default_factory=list)
 
 
+class OwnershipDecisionPack(BaseModel):
+    approved: bool
+    reason: str = ""
+    required_followups: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+
 class VisionReport(BaseModel):
     summary: str
     description: str = ""

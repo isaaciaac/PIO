@@ -13,6 +13,7 @@ from vibe.tools.git import GitCommitResult, GitTool
 from vibe.tools.search import SearchTool
 from vibe.text import decode_bytes
 from vibe.scan import scan_is_stale, write_scan_outputs
+from vibe.ownership import OwnershipDeniedError, match_ownership_rule, normalize_relpath
 
 
 def _is_internal_path(path: str) -> bool:
@@ -53,6 +54,17 @@ class Toolbox:
 
     def write_file(self, *, agent_id: str, path: str, content: str) -> str:
         if not _is_internal_path(path):
+            # Ownership/authority gate: critical files require owner approval.
+            try:
+                if getattr(getattr(self.config, "governance", None), "ownership", None) and self.config.governance.ownership.enabled:
+                    rel = normalize_relpath(path)
+                    rule = match_ownership_rule(path=rel, rules=self.config.governance.ownership.rules)
+                else:
+                    rule = None
+            except Exception:
+                rule = None
+            if rule and list(rule.owners or []) and agent_id not in set(rule.owners) and agent_id != "router":
+                raise OwnershipDeniedError(agent_id=agent_id, path=path, rule=rule)
             self._require_tool_allowed(agent_id=agent_id, tool="write_file")
             self.policy.check(agent_id=agent_id, tool="write_file", detail=f"write {path} (bytes={len(content.encode('utf-8'))})")
         return self.fs.write_file(path, content)

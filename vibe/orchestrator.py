@@ -4,6 +4,7 @@ import json
 import os
 import importlib.util
 import re
+import difflib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ from vibe.delivery import augment_plan, augment_requirement_pack
 from vibe.schemas.memory import ChatDigest, MemoryRecord
 from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
+from vibe.ownership import OwnershipDeniedError
 
 
 @dataclass(frozen=True)
@@ -1692,15 +1694,189 @@ class Orchestrator:
                 f"{lines}"
             )
 
-    def _materialize_code_change(self, change: packs.CodeChange, *, actor_agent_id: str = "coder_backend") -> Tuple[packs.CodeChange, List[str]]:
+    def _request_ownership_approval(
+        self,
+        *,
+        actor_agent_id: str,
+        rule: Any,
+        writes: list[packs.FileWrite],
+        activated_agents: Optional[Set[str]],
+        activate_agent: Optional[Any],
+        route_level: Optional[packs.RouteLevel],
+        style: str,
+    ) -> packs.OwnershipDecisionPack:
+        owners = [o for o in list(getattr(rule, "owners", []) or []) if o in self.config.agents]
+        approver_id = owners[0] if owners else ""
+        if not approver_id:
+            return packs.OwnershipDecisionPack(approved=True, reason="No owners configured; allowing write")
+
+        if activate_agent and activated_agents is not None:
+            try:
+                activate_agent(approver_id, reason=f"ownership:{getattr(rule, 'id', 'rule')}")
+            except Exception:
+                pass
+
+        diffs: list[str] = []
+        file_list: list[str] = []
+        for w in list(writes or [])[:24]:
+            rel = (w.path or "").replace("\\", "/").lstrip("/")
+            if not rel:
+                continue
+            file_list.append(rel)
+            old_text = ""
+            abs_path = (self.repo_root / rel).resolve()
+            if abs_path.exists():
+                try:
+                    old_text = abs_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    old_text = ""
+            new_text = w.content or ""
+            diff_lines = difflib.unified_diff(
+                old_text.splitlines(),
+                new_text.splitlines(),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+                lineterm="",
+            )
+            diffs.append("\n".join(diff_lines))
+
+        diff_text = "\n\n".join([d for d in diffs if d.strip()]) or "(no textual diff)"
+        diff_ptr = self.artifacts.put_text(diff_text, suffix=".ownership.diff", kind="ownership").to_pointer()
+
+        if activated_agents is not None:
+            try:
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="OWNERSHIP_CHANGE_REQUESTED",
+                        summary=f"Ownership approval requested: {getattr(rule, 'id', 'rule')} ({len(file_list)} file(s))",
+                        branch_id=self.branch_id,
+                        pointers=[diff_ptr],
+                        meta={
+                            "rule_id": getattr(rule, "id", ""),
+                            "actor": actor_agent_id,
+                            "approver": approver_id,
+                            "owners": owners,
+                            "files": file_list,
+                            "route_level": route_level,
+                            "style": style,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                pass
+
+        excerpt = diff_text
+        max_chars = 9000
+        if len(excerpt) > max_chars:
+            excerpt = excerpt[:max_chars] + "\n…(diff truncated)…\n"
+
+        approval_system = (
+            "你是仓库关键资产（契约/类型/ADR 等）的 Owner 审批人。\n"
+            "任务：对本次对受保护文件的修改做拍板：批准/拒绝。\n\n"
+            "输出要求：只输出符合 OwnershipDecisionPack 的 JSON：\n"
+            "- approved: bool\n"
+            "- reason: string\n"
+            "- required_followups: string[]\n"
+            "- pointers: string[]\n"
+            "不要输出 markdown、不要包裹对象。"
+        )
+        approval_user = (
+            f"变更请求：非 Owner 工种 `{actor_agent_id}` 试图修改受保护文件（rule={getattr(rule, 'id', '')}）。\n"
+            f"Owner 候选：{', '.join(owners) if owners else '(none)'}；当前审批人：{approver_id}\n"
+            f"文件列表（相对路径）：\n" + "\n".join([f"- {p}" for p in file_list]) + "\n\n"
+            f"Diff（节选）：\n{excerpt}\n\n"
+            f"DiffPointer（完整 diff 在 artifacts，可审计）：{diff_ptr}\n"
+        )
+
+        approver = self._agent(approver_id)
+        msgs = self._messages_with_memory(agent_id=approver_id, system=approval_system, user=approval_user)
+        decision, _ = approver.chat_json(schema=packs.OwnershipDecisionPack, messages=msgs, user=approval_user)
+        decision_ptr = self.artifacts.put_json(decision.model_dump(), suffix=".ownership.decision.json", kind="ownership").to_pointer()
+
+        if activated_agents is not None:
+            try:
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="OWNERSHIP_CHANGE_APPROVED" if decision.approved else "OWNERSHIP_CHANGE_DENIED",
+                        summary=(
+                            f"Ownership change approved: {getattr(rule, 'id', 'rule')}"
+                            if decision.approved
+                            else f"Ownership change denied: {getattr(rule, 'id', 'rule')}"
+                        ),
+                        branch_id=self.branch_id,
+                        pointers=[decision_ptr, diff_ptr],
+                        meta={
+                            "rule_id": getattr(rule, "id", ""),
+                            "actor": actor_agent_id,
+                            "approver": approver_id,
+                            "owners": owners,
+                            "files": file_list,
+                            "approved": bool(decision.approved),
+                            "reason": str(getattr(decision, "reason", "") or "")[:400],
+                            "route_level": route_level,
+                            "style": style,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                pass
+
+        return decision
+
+    def _materialize_code_change(
+        self,
+        change: packs.CodeChange,
+        *,
+        actor_agent_id: str = "coder_backend",
+        activated_agents: Optional[Set[str]] = None,
+        activate_agent: Optional[Any] = None,
+        route_level: Optional[packs.RouteLevel] = None,
+        style: str = "",
+    ) -> Tuple[packs.CodeChange, List[str]]:
         write_pointers: List[str] = []
         if change.writes:
-            for w in change.writes:
+            ptrs: list[Optional[str]] = [None for _ in list(change.writes)]
+            pending: dict[str, list[int]] = {}
+            rules: dict[str, Any] = {}
+
+            for idx, w in enumerate(list(change.writes)):
                 rel = (w.path or "").replace("\\", "/").lstrip("/")
                 if rel.startswith(".vibe/") or rel.startswith(".git/"):
                     raise RuntimeError(f"Refusing to write internal path: {w.path}")
-                ptr = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=w.content)
-                write_pointers.append(ptr)
+                try:
+                    ptrs[idx] = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=w.content)
+                except OwnershipDeniedError as e:
+                    rid = str(getattr(e.rule, "id", "") or "ownership")
+                    pending.setdefault(rid, []).append(idx)
+                    rules[rid] = e.rule
+
+            # Approval + apply protected writes as router (executor), so non-owners can't drift contracts in fix-loops.
+            if pending:
+                for rid, idxs in pending.items():
+                    rule = rules.get(rid)
+                    decision = self._request_ownership_approval(
+                        actor_agent_id=actor_agent_id,
+                        rule=rule,
+                        writes=[change.writes[i] for i in idxs],
+                        activated_agents=activated_agents,
+                        activate_agent=activate_agent,
+                        route_level=route_level,
+                        style=style,
+                    )
+                    if not decision.approved:
+                        reason = str(getattr(decision, "reason", "") or "").strip()
+                        raise RuntimeError(f"Ownership approval denied for rule {rid}. {reason}".strip())
+                    for i in idxs:
+                        w = change.writes[i]
+                        ptrs[i] = self.toolbox.write_file(agent_id="router", path=w.path, content=w.content)
+
+            for p in ptrs:
+                if p:
+                    write_pointers.append(p)
 
             if not change.files_changed:
                 change.files_changed = [w.path for w in change.writes if w.path]
@@ -1715,14 +1891,12 @@ class Orchestrator:
                 patch_ptr = None
 
             if not patch_ptr:
-                patch_ptr = self.artifacts.put_json(
-                    {
-                        "kind": "writes",
-                        "files": [{"path": w.path, "pointer": p} for w, p in zip(change.writes, write_pointers)],
-                    },
-                    suffix=".writes.json",
-                    kind="patch",
-                ).to_pointer()
+                files: list[dict[str, str]] = []
+                for w, p in zip(change.writes, ptrs):
+                    if not w.path or not p:
+                        continue
+                    files.append({"path": w.path, "pointer": p})
+                patch_ptr = self.artifacts.put_json({"kind": "writes", "files": files}, suffix=".writes.json", kind="patch").to_pointer()
 
             change.kind = "patch"
             change.patch_pointer = patch_ptr
@@ -1796,6 +1970,10 @@ class Orchestrator:
         actor: Any,
         actor_role: str,
         workflow_hint: str,
+        activated_agents: Optional[Set[str]] = None,
+        activate_agent: Optional[Any] = None,
+        route_level: Optional[packs.RouteLevel] = None,
+        style: str = "",
         max_repairs: int = 2,
     ) -> Tuple[packs.CodeChange, List[str]]:
         """
@@ -1809,7 +1987,14 @@ class Orchestrator:
         for attempt in range(max_repairs + 1):
             try:
                 self._validate_code_change(current)
-                return self._materialize_code_change(current, actor_agent_id=actor_agent_id)
+                return self._materialize_code_change(
+                    current,
+                    actor_agent_id=actor_agent_id,
+                    activated_agents=activated_agents,
+                    activate_agent=activate_agent,
+                    route_level=route_level,
+                    style=style,
+                )
             except Exception as e:
                 last_err = e
                 msg = str(e)
@@ -1823,6 +2008,8 @@ class Orchestrator:
                         "is not in the subpath of",
                         "Missing referenced modules in CodeChange.writes",
                         "Missing npm dependencies for imports in CodeChange.writes",
+                        "Ownership denied:",
+                        "Ownership approval denied",
                     ]
                 )
                 if not repairable or attempt >= max_repairs:
@@ -2636,6 +2823,10 @@ class Orchestrator:
                 actor=actor,
                 actor_role=role,
                 workflow_hint=workflow_hint,
+                activated_agents=activated_agents,
+                activate_agent=activate_agent,
+                route_level=route_level,
+                style=resolved_style,
             )
 
             # Keep prompts downstream small: we only need patch evidence + file list.
@@ -2904,6 +3095,10 @@ class Orchestrator:
                     actor=primary_coder,
                     actor_role=bootstrap_role,
                     workflow_hint=workflow_hint,
+                    activated_agents=activated_agents,
+                    activate_agent=activate_agent,
+                    route_level=route_level,
+                    style=resolved_style,
                 )
                 self._append_guarded(
                     event=new_event(
@@ -3595,9 +3790,20 @@ class Orchestrator:
                         actor=fix_coder,
                         actor_role=fix_role,
                         workflow_hint=workflow_hint,
+                        activated_agents=activated_agents,
+                        activate_agent=activate_agent,
+                        route_level=route_level,
+                        style=resolved_style,
                     )
                 else:
-                    change, write_pointers = self._materialize_code_change(auto_change, actor_agent_id=fix_coder_id)
+                    change, write_pointers = self._materialize_code_change(
+                        auto_change,
+                        actor_agent_id=fix_coder_id,
+                        activated_agents=activated_agents,
+                        activate_agent=activate_agent,
+                        route_level=route_level,
+                        style=resolved_style,
+                    )
                 try:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]

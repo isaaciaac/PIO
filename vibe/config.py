@@ -76,12 +76,37 @@ class RoutesConfig(BaseModel):
     levels: Dict[RouteLevel, RouteProfile] = Field(default_factory=dict)
 
 
+class OwnershipRule(BaseModel):
+    """
+    File ownership / authority rule.
+
+    If a path matches any of `patterns`, only the configured `owners` (and the
+    orchestrator router) may directly write the file. Other agents must escalate
+    for approval.
+    """
+
+    id: str
+    description: str = ""
+    patterns: List[str] = Field(default_factory=list)
+    owners: List[str] = Field(default_factory=list)
+
+
+class OwnershipConfig(BaseModel):
+    enabled: bool = True
+    rules: List[OwnershipRule] = Field(default_factory=list)
+
+
+class GovernanceConfig(BaseModel):
+    ownership: OwnershipConfig = Field(default_factory=OwnershipConfig)
+
+
 class VibeConfig(BaseModel):
     version: str = "0.1"
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     routes: RoutesConfig = Field(default_factory=RoutesConfig)
+    governance: GovernanceConfig = Field(default_factory=GovernanceConfig)
     providers: Dict[str, ProviderConfig]
     agents: Dict[str, AgentConfig]
 
@@ -159,6 +184,9 @@ def default_config() -> VibeConfig:
                 "CONTEXT_PACKET_BUILT",
                 "STATE_TRANSITION",
                 "INCIDENT_CREATED",
+                "OWNERSHIP_CHANGE_REQUESTED",
+                "OWNERSHIP_CHANGE_APPROVED",
+                "OWNERSHIP_CHANGE_DENIED",
                 "CHECKPOINT_CREATED",
                 "BRANCH_CREATED",
             ],
@@ -425,7 +453,36 @@ def default_config() -> VibeConfig:
         ),
     }
 
-    return VibeConfig(providers=providers, agents=agents, routes=default_routes(list(agents.keys())))
+    governance = GovernanceConfig(
+        ownership=OwnershipConfig(
+            enabled=True,
+            rules=[
+                OwnershipRule(
+                    id="contract_and_architecture",
+                    description="Core contracts/types and architecture decisions require architect/API confirmation approval.",
+                    patterns=[
+                        # Domain/contract types (keep narrow; adjust per-repo in vibe.yaml)
+                        "src/types.ts",
+                        "src/types/**",
+                        "**/contracts/**",
+                        "**/schemas/**",
+                        "openapi.*",
+                        "**/*.proto",
+                        # Architecture decisions/docs
+                        "docs/adr/**",
+                    ],
+                    owners=["architect", "api_confirm"],
+                )
+            ],
+        )
+    )
+
+    return VibeConfig(
+        providers=providers,
+        agents=agents,
+        routes=default_routes(list(agents.keys())),
+        governance=governance,
+    )
 
 
 def write_default_config(repo_root: Path, cfg: VibeConfig) -> None:
@@ -477,7 +534,14 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
     # Backward compatible defaults for older vibe.yaml files.
     router = cfg.agents.get("router")
     if router:
-        needed = {"ROUTE_SELECTED", "AGENTS_ACTIVATED", "INCIDENT_CREATED"}
+        needed = {
+            "ROUTE_SELECTED",
+            "AGENTS_ACTIVATED",
+            "INCIDENT_CREATED",
+            "OWNERSHIP_CHANGE_REQUESTED",
+            "OWNERSHIP_CHANGE_APPROVED",
+            "OWNERSHIP_CHANGE_DENIED",
+        }
         existing = set(router.memory_scope.ledger_write_types or [])
         if not needed.issubset(existing):
             router.memory_scope.ledger_write_types = sorted(existing | needed)
@@ -556,3 +620,16 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
             cfg.agents["ops_engineer"] = default_config().agents["ops_engineer"]
         except Exception:
             pass
+
+    # Governance/ownership: older configs won't have it; add safe defaults when missing.
+    try:
+        defaults = default_config().governance.ownership.rules
+    except Exception:
+        defaults = []
+    try:
+        ownership = cfg.governance.ownership
+    except Exception:
+        cfg.governance = default_config().governance
+        return
+    if ownership.enabled and not list(ownership.rules or []) and defaults:
+        ownership.rules = defaults

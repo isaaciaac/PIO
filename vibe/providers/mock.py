@@ -54,6 +54,13 @@ class MockProvider:
                 suggested_actions=actions,
                 pointers=[],
             )
+        elif schema is schemas.OwnershipDecisionPack:
+            out = schemas.OwnershipDecisionPack(
+                approved=True,
+                reason="mock: approved ownership change",
+                required_followups=[],
+                pointers=[],
+            )
         elif schema is schemas.Plan:
             out = schemas.Plan(
                 tasks=[
