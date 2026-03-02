@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
@@ -30,6 +31,12 @@ class ProviderResult:
 
 
 def _extract_json(text: str) -> Any:
+    """
+    Backward-compatible JSON extraction.
+
+    Prefer using `_parse_json_to_schema()` which can try multiple candidate JSON
+    fragments and validate against a schema.
+    """
     text = text.strip()
     if text.startswith("```"):
         # Best-effort strip fenced block
@@ -47,6 +54,85 @@ def _extract_json(text: str) -> Any:
         if start != -1 and end != -1 and end > start:
             return json.loads(text[start : end + 1])
         raise
+
+
+def _extract_fenced_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    for m in re.finditer(r"```(?:json)?\s*(?P<body>[\s\S]*?)```", text, flags=re.IGNORECASE):
+        body = (m.group("body") or "").strip()
+        if body:
+            blocks.append(body)
+    return blocks
+
+
+def _iter_balanced_json_substrings(text: str, *, max_candidates: int = 20) -> list[str]:
+    """
+    Extract balanced JSON object/array substrings from a larger text blob.
+
+    This is intentionally permissive: models sometimes emit a valid JSON object
+    followed by extra prose, or multiple JSON objects.
+    """
+    out: list[str] = []
+    if not text:
+        return out
+
+    # Limit scanning to keep worst-case runtime bounded.
+    scan = text if len(text) <= 200_000 else text[:200_000]
+    starts: list[int] = []
+    for i, ch in enumerate(scan):
+        if ch in "{[":
+            starts.append(i)
+            if len(starts) >= 80:
+                break
+
+    for start in starts:
+        opener = scan[start]
+        stack: list[str] = [opener]
+        in_str = False
+        esc = False
+        for j in range(start + 1, len(scan)):
+            c = scan[j]
+            if in_str:
+                if esc:
+                    esc = False
+                    continue
+                if c == "\\":
+                    esc = True
+                    continue
+                if c == '"':
+                    in_str = False
+                continue
+
+            if c == '"':
+                in_str = True
+                continue
+            if c in "{[":
+                stack.append(c)
+                continue
+            if c in "}]":
+                if not stack:
+                    break
+                open_ch = stack.pop()
+                if (open_ch == "{" and c != "}") or (open_ch == "[" and c != "]"):
+                    break
+                if not stack:
+                    frag = scan[start : j + 1].strip()
+                    if frag:
+                        out.append(frag)
+                    break
+
+        if len(out) >= max_candidates:
+            break
+
+    # De-dup (preserve order).
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    return uniq
 
 
 def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
@@ -94,9 +180,45 @@ def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
 
 
 def _parse_json_to_schema(text: str, *, schema: Type[T]) -> T:
-    data = _extract_json(text)
-    data = _unwrap_schema_envelope(data, schema=schema)
-    return schema.model_validate(data)
+    """
+    Parse and validate model output against a schema.
+
+    Models are expected to output a single JSON object, but in practice they may:
+    - wrap the payload under a schema name
+    - include extra commentary before/after JSON
+    - emit multiple JSON objects
+    This function tries multiple candidates deterministically and returns the
+    first one that validates.
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        raise json.JSONDecodeError("Empty content", raw, 0)
+
+    candidates: list[str] = []
+    candidates.append(raw)
+    candidates.extend(_extract_fenced_blocks(raw))
+    candidates.extend(_iter_balanced_json_substrings(raw))
+
+    last_err: Exception | None = None
+    for cand in candidates[:60]:
+        if not cand:
+            continue
+        try:
+            data = json.loads(cand)
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+        try:
+            data = _unwrap_schema_envelope(data, schema=schema)
+            return schema.model_validate(data)
+        except ValidationError as e:
+            last_err = e
+            continue
+
+    if last_err is not None:
+        raise last_err
+    raise json.JSONDecodeError("No JSON candidates found", raw, 0)
 
 
 class OpenAICompatProvider:
