@@ -2010,7 +2010,9 @@ class Orchestrator:
         results: List[packs.TestResult] = []
         blockers: List[str] = []
         pointers: List[str] = []
-        report_cmds: List[str] = list(cmds)
+        # Report what we actually executed (fail-fast). This reduces noise and helps
+        # fix-loop converge on the *first causal* failure.
+        report_cmds: List[str] = []
 
         # Best-effort: for Node projects, ensure deps exist before running build/lint/test.
         # This avoids failures like "cannot find module" on fresh checkouts.
@@ -2061,11 +2063,11 @@ class Orchestrator:
                         blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}")
                     else:
                         blockers.append(f"Command failed: {install_cmd}")
-                    report_cmds = pre_cmds + report_cmds
+                    report_cmds = [x.command for x in results]
                     return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
 
             if pre_cmds:
-                report_cmds = pre_cmds + report_cmds
+                report_cmds.extend(pre_cmds)
         except Exception:
             pass
 
@@ -2076,6 +2078,7 @@ class Orchestrator:
                 packs.TestResult(command=cmd, returncode=r.returncode, passed=passed, stdout=r.stdout, stderr=r.stderr, meta=r.meta)
             )
             pointers.extend([r.stdout, r.stderr, r.meta])
+            report_cmds.append(cmd)
             if not passed:
                 stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
                 stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
@@ -2084,6 +2087,7 @@ class Orchestrator:
                     blockers.append(f"Command failed: {cmd}\n\n{excerpt}")
                 else:
                     blockers.append(f"Command failed: {cmd}")
+                break
 
         return packs.TestReport(commands=report_cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
@@ -2535,7 +2539,15 @@ class Orchestrator:
             return RunResult(checkpoint_id=cp.id, green=False)
 
         # QA
-        qa_profile = "smoke" if route_level == "L0" else ("unit" if route_level == "L1" else "full")
+        #
+        # Rationale:
+        # - For higher routes (L2+), start with a "smoke" preflight to avoid running a full
+        #   suite on a broken scaffold. Only after the repo is runnable do we escalate to
+        #   the required profile (usually "full").
+        qa_required_profile = "smoke" if route_level == "L0" else ("unit" if route_level == "L1" else "full")
+        qa_profile = qa_required_profile
+        if route_level in {"L2", "L3", "L4"}:
+            qa_profile = "smoke"
         mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
         qa_commands = self._determine_test_commands(profile=qa_profile)
 
@@ -2556,7 +2568,7 @@ class Orchestrator:
                     f"Plan:\n{plan.model_dump_json()}\n\n"
                     f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
                     "Problem:\n"
-                    f"- QA profile is {qa_profile}\n"
+                    f"- QA profile (current) is {qa_profile} (required: {qa_required_profile})\n"
                     f"- Reason: {reason}\n\n"
                     "Request:\n"
                     "- Propose 1–4 shell commands that can be run locally to verify the repo is runnable (prefer build/lint/test).\n"
@@ -2641,45 +2653,72 @@ class Orchestrator:
             if cmds:
                 qa_commands = cmds
 
-        if mock_mode:
-            test_run_summary = "mock: tests skipped"
-        elif not qa_commands:
-            test_run_summary = "No QA commands detected; skipping tests"
-        else:
-            test_run_summary = f"Running tests ({qa_profile})"
-        self._append_guarded(
-            event=new_event(
-                agent="qa",
-                type="TEST_RUN",
-                summary=test_run_summary,
-                branch_id=self.branch_id,
-                pointers=[],
-                meta={"profile": qa_profile, "commands": qa_commands, "route_level": route_level, "style": resolved_style},
-            ),
-            activated_agents=activated_agents,
-        )
-        report = self._run_tests(profile=qa_profile, commands=qa_commands)
-        self._append_guarded(
-            event=new_event(
-                agent="qa",
-                type="TEST_PASSED" if report.passed else "TEST_FAILED",
-                summary=(
-                    "No QA commands detected; tests skipped"
-                    if (not mock_mode and not report.commands)
-                    else ("Tests passed" if report.passed else "Tests failed")
+        def run_qa_step(*, phase: str) -> packs.TestReport:
+            nonlocal qa_profile, qa_commands
+
+            if mock_mode:
+                test_run_summary = "mock: tests skipped"
+            elif not qa_commands:
+                test_run_summary = "No QA commands detected; skipping tests"
+            else:
+                test_run_summary = f"Running tests ({qa_profile})"
+
+            self._append_guarded(
+                event=new_event(
+                    agent="qa",
+                    type="TEST_RUN",
+                    summary=test_run_summary,
+                    branch_id=self.branch_id,
+                    pointers=[],
+                    meta={
+                        "profile": qa_profile,
+                        "phase": phase,
+                        "commands": qa_commands,
+                        "route_level": route_level,
+                        "style": resolved_style,
+                    },
                 ),
-                branch_id=self.branch_id,
-                pointers=report.pointers,
-                meta={
-                    "blockers": report.blockers,
-                    "profile": qa_profile,
-                    "commands": report.commands,
-                    "route_level": route_level,
-                    "style": resolved_style,
-                },
-            ),
-            activated_agents=activated_agents,
-        )
+                activated_agents=activated_agents,
+            )
+            report = self._run_tests(profile=qa_profile, commands=qa_commands)
+            self._append_guarded(
+                event=new_event(
+                    agent="qa",
+                    type="TEST_PASSED" if report.passed else "TEST_FAILED",
+                    summary=(
+                        "No QA commands detected; tests skipped"
+                        if (not mock_mode and not report.commands)
+                        else ("Tests passed" if report.passed else "Tests failed")
+                    ),
+                    branch_id=self.branch_id,
+                    pointers=report.pointers,
+                    meta={
+                        "blockers": report.blockers,
+                        "profile": qa_profile,
+                        "phase": phase,
+                        "commands": report.commands,
+                        "route_level": route_level,
+                        "style": resolved_style,
+                    },
+                ),
+                activated_agents=activated_agents,
+            )
+            return report
+
+        # Phase 1: preflight / minimal verification.
+        report = run_qa_step(phase="preflight" if qa_profile != qa_required_profile else "final")
+
+        # Phase 2 (L2+): if preflight passed, escalate to the required profile for full verification.
+        if (not mock_mode) and report.passed and qa_profile != qa_required_profile:
+            qa_profile = qa_required_profile
+            qa_commands = self._determine_test_commands(profile=qa_profile)
+            if (not qa_commands) and envspec_commands:
+                qa_commands = list(envspec_commands)
+            if (not qa_commands) and env_engineer is not None:
+                _ptr, cmds = maybe_envspec(reason="No QA commands detected for final verification", event_type="ENV_PROBED")
+                if cmds:
+                    qa_commands = cmds
+            report = run_qa_step(phase="final")
 
         if route_level == "L0":
             # L0 never produces green checkpoints.
@@ -2696,7 +2735,13 @@ class Orchestrator:
                 artifacts=artifacts,
                 green=False,
                 restore_steps=["L0(draft): re-run with L1+ to get green"],
-                meta={"draft": True, "route_level": route_level, "agents": activated_agents_list, "qa_profile": qa_profile},
+                meta={
+                    "draft": True,
+                    "route_level": route_level,
+                    "agents": activated_agents_list,
+                    "qa_profile": qa_profile,
+                    "qa_required_profile": qa_required_profile,
+                },
             )
             self._append_guarded(
                 event=new_event(
@@ -2730,6 +2775,7 @@ class Orchestrator:
                     "route_level": route_level,
                     "agents": activated_agents_list,
                     "qa_profile": qa_profile,
+                    "qa_required_profile": qa_required_profile,
                     "reason": "qa_no_commands",
                     "style": resolved_style,
                 },
@@ -3280,6 +3326,51 @@ class Orchestrator:
                     activated_agents=activated_agents,
                 )
 
+                # If we started with a smoke preflight (L2+), only consider the repo "passing"
+                # after we also pass the required QA profile (usually "full").
+                if (not mock_mode) and report.passed and qa_profile != qa_required_profile:
+                    qa_profile = qa_required_profile
+                    qa_commands_escalate = self._determine_test_commands(profile=qa_profile)
+                    if (not qa_commands_escalate) and envspec_commands:
+                        qa_commands_escalate = list(envspec_commands)
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_RUN",
+                            summary=f"Fix-loop {loop}: escalating verification ({qa_profile})",
+                            branch_id=self.branch_id,
+                            pointers=[],
+                            meta={
+                                "profile": qa_profile,
+                                "phase": "final",
+                                "commands": qa_commands_escalate,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    report = self._run_tests(profile=qa_profile, commands=qa_commands_escalate)
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_PASSED" if report.passed else "TEST_FAILED",
+                            summary="Tests passed" if report.passed else "Tests failed",
+                            branch_id=self.branch_id,
+                            pointers=report.pointers,
+                            meta={
+                                "blockers": report.blockers,
+                                "commands": report.commands,
+                                "loop": loop,
+                                "profile": qa_profile,
+                                "phase": "final",
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+
                 review_failed = False
                 review = None
                 review_ptr = None
@@ -3368,6 +3459,7 @@ class Orchestrator:
                         "route_level": route_level,
                         "agents": activated_agents_list,
                         "qa_profile": qa_profile,
+                        "qa_required_profile": qa_required_profile,
                         "reason": "fix_loop_blockers",
                         "blockers": blockers[:20],
                         "style": resolved_style,
@@ -3634,6 +3726,7 @@ class Orchestrator:
                 "requested_route_level": requested_route_level,
                 "agents": activated_agents_list,
                 "qa_profile": qa_profile,
+                "qa_required_profile": qa_required_profile,
                 "style": resolved_style,
                 "deliverables": {
                     "envspec": envspec_ptr,
