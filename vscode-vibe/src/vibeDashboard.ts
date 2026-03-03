@@ -500,6 +500,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const raw = String(text || "").trim();
     if (!raw) return true;
 
+    // If the user is explicitly asking to fix/resolve, treat as actionable (not pure "inspection").
+    const actionWords = ["修复", "解决", "排错", "排查", "排障", "修一下", "修下", "修一修", "搞定", "弄好"];
+    if (actionWords.some((w) => raw.includes(w))) return false;
+
     if (/[?？]$/.test(raw)) return true;
 
     const compact = raw.replace(/[，,。.;；!！?？\s]+/g, "").toLowerCase();
@@ -549,6 +553,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const strongRunHints = [
       "实现",
       "修复",
+      "解决",
+      "排错",
+      "排查",
+      "排障",
       "创建",
       "生成",
       "搭建",
@@ -569,6 +577,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       "改成",
       "调整",
       "改一下",
+      "修一下",
+      "修下",
+      "修一修",
+      "弄好",
+      "搞定",
     ];
     if (strongRunHints.some((h) => raw.includes(h))) return true;
 
@@ -600,6 +613,10 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     const strongRunHints = [
       "实现",
       "修复",
+      "解决",
+      "排错",
+      "排查",
+      "排障",
       "创建",
       "生成",
       "搭建",
@@ -620,6 +637,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       "支持",
       "加上",
       "加一个",
+      "修一下",
+      "修下",
+      "修一修",
+      "弄好",
+      "搞定",
     ];
     if (strongRunHints.some((h) => raw.includes(h))) return true;
 
