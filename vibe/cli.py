@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -312,6 +313,176 @@ def _force_scan_for_chat(message: str) -> bool:
     return False
 
 
+def _extract_ports_from_text(text: str) -> list[str]:
+    ports: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\b(?P<p>\d{2,5})\b", text or ""):
+        try:
+            p = int(m.group("p"))
+        except Exception:
+            continue
+        if p <= 0 or p > 65535:
+            continue
+        s = str(p)
+        if s in seen:
+            continue
+        seen.add(s)
+        ports.append(s)
+        if len(ports) >= 4:
+            break
+    return ports
+
+
+def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: Path, message: str, repo_pointers: list[str], repo_chunks: list[str]) -> None:
+    """
+    Chat grounding should not rely only on README/manifests.
+
+    When the user is troubleshooting (ports/localhost/404/errors), we add small excerpts of
+    *actual* config/code that likely explains the behavior (package.json scripts, referenced
+    script files, Hugo config, etc). This makes chat answers verifiable and reduces guesswork.
+    """
+
+    # Keep bounded to avoid flooding the prompt.
+    max_total_chunks = 10
+
+    def add_excerpt(rel: str, *, max_lines: int = 220) -> None:
+        nonlocal repo_pointers, repo_chunks
+        if len(repo_chunks) >= max_total_chunks:
+            return
+        try:
+            rr = tools.read_file(agent_id=agent_id, path=rel, start_line=1, end_line=max_lines)
+        except Exception:
+            return
+        if rr.pointer not in repo_pointers:
+            repo_pointers.append(rr.pointer)
+        repo_chunks.append(f"<<< {rr.pointer} >>>\n{rr.content}\n")
+
+    def exists(rel: str) -> bool:
+        try:
+            return (repo_root / rel).exists()
+        except Exception:
+            return False
+
+    text = (message or "").strip()
+    low = text.lower()
+    ports = _extract_ports_from_text(text)
+    looks_like_troubleshooting = any(k in low for k in ["localhost", "127.0.0.1", "404", "打不开", "没这个", "无法", "报错", "error", "failed"])
+    if ports:
+        looks_like_troubleshooting = True
+
+    # Always include scan_state: it contains detected node projects/scripts (fast + small).
+    if exists(".vibe/manifests/scan_state.json"):
+        add_excerpt(".vibe/manifests/scan_state.json", max_lines=240)
+
+    # If node projects exist, include their package.json (scripts are often the truth source).
+    node_pkg_paths: list[str] = []
+    try:
+        scan_state_path = repo_root / ".vibe" / "manifests" / "scan_state.json"
+        if scan_state_path.exists():
+            data = json.loads(scan_state_path.read_text(encoding="utf-8", errors="replace"))
+            for np in list((data.get("node_projects") or []))[:6]:
+                p = str((np or {}).get("package_json") or "").strip()
+                if p and p not in node_pkg_paths:
+                    node_pkg_paths.append(p)
+    except Exception:
+        node_pkg_paths = []
+    for p in node_pkg_paths[:3]:
+        if exists(p):
+            add_excerpt(p, max_lines=220)
+
+    # Hugo/static site common configs (when present).
+    for rel in ["hugo.toml", "hugo.yaml", "hugo.yml", "config.toml", "config.yaml", "config.yml", "config.json"]:
+        if exists(rel):
+            add_excerpt(rel, max_lines=240)
+
+    if not looks_like_troubleshooting:
+        return
+
+    # If a package.json start/dev script references a local script file, include it.
+    try:
+        pkg_paths = node_pkg_paths[:3] or (["package.json"] if exists("package.json") else [])
+        for pkg_rel in pkg_paths:
+            pkg_path = repo_root / pkg_rel
+            if not pkg_path.exists():
+                continue
+            pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+            scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+            if not isinstance(scripts, dict):
+                continue
+            for k in ["start", "dev", "serve", "preview", "build", "test"]:
+                v = scripts.get(k)
+                if not isinstance(v, str):
+                    continue
+                # Grab a couple likely local file references.
+                for m in re.finditer(r"(?P<path>(?:scripts/)?[A-Za-z0-9_./-]+\.(?:js|ts|cjs|mjs|json|toml|ya?ml))", v):
+                    rel = (m.group("path") or "").strip().lstrip("./")
+                    # Resolve relative to the package.json dir.
+                    base = str(Path(pkg_rel).parent.as_posix())
+                    full = (Path(base) / rel).as_posix().lstrip("./")
+                    if full and exists(full):
+                        add_excerpt(full, max_lines=260)
+                        if len(repo_chunks) >= max_total_chunks:
+                            return
+    except Exception:
+        pass
+
+    # Ground by searching for ports/localhost/baseURL in code/config, then include a few matching files.
+    try:
+        store = ArtifactsStore(repo_root)
+        queries: list[str] = []
+        if ports:
+            queries.extend(ports[:3])
+        if "localhost" in low or "127.0.0.1" in low:
+            queries.append("localhost")
+        queries.extend(["baseurl", "baseURL", "hugo server", "server --port", "port:"])
+        seen_q: set[str] = set()
+        q_final: list[str] = []
+        for q in queries:
+            s = str(q).strip()
+            if not s or s in seen_q:
+                continue
+            seen_q.add(s)
+            q_final.append(s)
+            if len(q_final) >= 5:
+                break
+
+        files: list[str] = []
+        seen_f: set[str] = set()
+        for q in q_final:
+            if len(repo_chunks) >= max_total_chunks:
+                break
+            try:
+                r = tools.ripgrep(agent_id=agent_id, query=q, timeout_s=15)
+            except Exception:
+                continue
+            try:
+                raw = store.read_bytes(r.stdout).decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            for line in raw.splitlines()[:80]:
+                # ripgrep: path:line:match
+                parts = line.split(":", 2)
+                if len(parts) < 2:
+                    continue
+                rel = parts[0].strip().replace("\\", "/")
+                if not rel or rel.startswith(".vibe/") or rel.startswith(".git/"):
+                    continue
+                if rel in seen_f:
+                    continue
+                seen_f.add(rel)
+                files.append(rel)
+                if len(files) >= 4:
+                    break
+
+        for rel in files[:4]:
+            if exists(rel):
+                add_excerpt(rel, max_lines=260)
+                if len(repo_chunks) >= max_total_chunks:
+                    break
+    except Exception:
+        pass
+
+
 @app.command()
 def chat(
     ctx: typer.Context,
@@ -426,6 +597,7 @@ def chat(
         for rel in [
             ".vibe/manifests/vibe_system.md",
             ".vibe/manifests/repo_overview.md",
+            ".vibe/manifests/scan_state.json",
             ".vibe/manifests/run_manifest.md",
             ".vibe/manifests/project_manifest.md",
             "README.md",
@@ -440,6 +612,15 @@ def chat(
                 continue
             except Exception:
                 continue
+
+        # Extra grounding for troubleshooting questions: include small excerpts from
+        # real scripts/config/code (not only README) so the agent can answer based on facts.
+        try:
+            _maybe_add_chat_repo_grounding(
+                tools=tools, agent_id=agent_id, repo_root=repo_root, message=message, repo_pointers=repo_pointers, repo_chunks=repo_chunks
+            )
+        except Exception:
+            pass
 
     ledger_lines: list[str] = []
     try:
