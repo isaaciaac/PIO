@@ -3919,92 +3919,96 @@ class Orchestrator:
 
         # Execute plan tasks sequentially. This avoids the "QA drives progress" anti-pattern:
         # we first complete the planned work, then validate.
+        #
+        # Resume mode MUST NOT re-run PLAN/IMPLEMENT. It should continue from
+        # QA + fix-loop to converge on the remaining blockers.
         plan_changes: list[packs.CodeChange] = []
         all_write_pointers: list[str] = []
 
-        code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
-        for t in list(plan.tasks or [])[:5]:
-            agent_id = (t.agent or "").strip() or primary_coder_id
-            if agent_id not in code_agents:
-                agent_id = primary_coder_id
-            if agent_id == "coder_frontend" and coder_frontend is None:
-                agent_id = "coder_backend"
-            if agent_id == "integration_engineer" and integrator is None:
-                agent_id = "coder_backend"
+        if not resume_mode:
+            code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
+            for t in list(plan.tasks or [])[:5]:
+                agent_id = (t.agent or "").strip() or primary_coder_id
+                if agent_id not in code_agents:
+                    agent_id = primary_coder_id
+                if agent_id == "coder_frontend" and coder_frontend is None:
+                    agent_id = "coder_backend"
+                if agent_id == "integration_engineer" and integrator is None:
+                    agent_id = "coder_backend"
 
-            activate_agent(agent_id, reason=f"plan_task:{t.id}")
-            actor, role = coder_actor(agent_id)
-            self._append_guarded(
-                event=new_event(
-                    agent="router",
-                    type="STATE_TRANSITION",
-                    summary=f"Implement: {t.id} -> {agent_id}",
-                    branch_id=self.branch_id,
-                    pointers=[],
-                    meta={
-                        "phase": "implement",
-                        "plan_task_id": t.id,
-                        "plan_task_title": t.title,
-                        "agent": agent_id,
-                        "route_level": route_level,
-                        "style": resolved_style,
-                    },
-                ),
-                activated_agents=activated_agents,
-            )
+                activate_agent(agent_id, reason=f"plan_task:{t.id}")
+                actor, role = coder_actor(agent_id)
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="STATE_TRANSITION",
+                        summary=f"Implement: {t.id} -> {agent_id}",
+                        branch_id=self.branch_id,
+                        pointers=[],
+                        meta={
+                            "phase": "implement",
+                            "plan_task_id": t.id,
+                            "plan_task_title": t.title,
+                            "agent": agent_id,
+                            "route_level": route_level,
+                            "style": resolved_style,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
 
-            user_text = task_user_text(task=t)
-            msgs = self._messages_with_memory(
-                agent_id=agent_id,
-                system=coder_system(role=role, task=t),
-                user=user_text,
-            )
-            task_change, _ = actor.chat_json(schema=packs.CodeChange, messages=msgs, user=user_text)
-            task_change, write_ptrs = self._materialize_code_change_with_repair(
-                change=task_change,
-                actor_agent_id=agent_id,
-                actor=actor,
-                actor_role=role,
-                workflow_hint=workflow_hint,
-                activated_agents=activated_agents,
-                activate_agent=activate_agent,
-                route_level=route_level,
-                style=resolved_style,
-            )
+                user_text = task_user_text(task=t)
+                msgs = self._messages_with_memory(
+                    agent_id=agent_id,
+                    system=coder_system(role=role, task=t),
+                    user=user_text,
+                )
+                task_change, _ = actor.chat_json(schema=packs.CodeChange, messages=msgs, user=user_text)
+                task_change, write_ptrs = self._materialize_code_change_with_repair(
+                    change=task_change,
+                    actor_agent_id=agent_id,
+                    actor=actor,
+                    actor_role=role,
+                    workflow_hint=workflow_hint,
+                    activated_agents=activated_agents,
+                    activate_agent=activate_agent,
+                    route_level=route_level,
+                    style=resolved_style,
+                )
 
-            # Keep prompts downstream small: we only need patch evidence + file list.
-            task_change = task_change.model_copy(update={"writes": []})
+                # Keep prompts downstream small: we only need patch evidence + file list.
+                task_change = task_change.model_copy(update={"writes": []})
 
-            meta = {"files_changed": task_change.files_changed, "route_level": route_level, "style": resolved_style, "plan_task_id": t.id}
-            if task_change.blockers:
-                meta["blockers"] = list(task_change.blockers)[:8]
-            self._append_guarded(
-                event=new_event(
-                    agent=agent_id,
-                    type="PATCH_WRITTEN" if task_change.kind == "patch" else "CODE_COMMIT",
-                    summary=f"{t.title}: {task_change.summary}",
-                    branch_id=self.branch_id,
-                    pointers=[p for p in [task_change.patch_pointer, task_change.commit_hash] if p] + write_ptrs,
-                    meta=meta,
-                ),
-                activated_agents=activated_agents,
-            )
-            plan_changes.append(task_change)
-            all_write_pointers.extend(write_ptrs)
+                meta = {"files_changed": task_change.files_changed, "route_level": route_level, "style": resolved_style, "plan_task_id": t.id}
+                if task_change.blockers:
+                    meta["blockers"] = list(task_change.blockers)[:8]
+                self._append_guarded(
+                    event=new_event(
+                        agent=agent_id,
+                        type="PATCH_WRITTEN" if task_change.kind == "patch" else "CODE_COMMIT",
+                        summary=f"{t.title}: {task_change.summary}",
+                        branch_id=self.branch_id,
+                        pointers=[p for p in [task_change.patch_pointer, task_change.commit_hash] if p] + write_ptrs,
+                        meta=meta,
+                    ),
+                    activated_agents=activated_agents,
+                )
+                plan_changes.append(task_change)
+                all_write_pointers.extend(write_ptrs)
 
-            # Keep manifests/index fresh so subsequent tasks can ground in new repo state.
-            try:
-                self.toolbox.scan_repo(agent_id="router", reason=f"plan_task:{t.id}")
-            except PolicyDeniedError:
-                pass
-            except Exception:
-                pass
+                # Keep manifests/index fresh so subsequent tasks can ground in new repo state.
+                try:
+                    self.toolbox.scan_repo(agent_id="router", reason=f"plan_task:{t.id}")
+                except PolicyDeniedError:
+                    pass
+                except Exception:
+                    pass
 
-            # Refresh ContextPacket excerpts so later tasks and gates see updated README/manifests.
-            try:
-                ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
-            except Exception:
-                pass
+                # Refresh ContextPacket excerpts so later tasks and gates see updated README/manifests.
+                try:
+                    ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
+                except Exception:
+                    pass
 
         # Aggregate evidence for downstream gates (review/security) without embedding full file contents.
         files_changed: list[str] = []

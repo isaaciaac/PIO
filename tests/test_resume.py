@@ -60,11 +60,17 @@ def test_cli_run_resume_skips_spec_and_plan(tmp_path: Path, monkeypatch) -> None
     ledger = Ledger(tmp_path)
     ac_count_1 = sum(1 for _ in ledger.iter_events(types={"AC_DEFINED"}))
     plan_count_1 = sum(1 for _ in ledger.iter_events(types={"PLAN_CREATED"}))
+    implement_count_1 = sum(
+        1
+        for e in ledger.iter_events(types={"STATE_TRANSITION"})
+        if (e.meta or {}).get("phase") == "implement"
+    )
     assert ac_count_1 == 1
     assert plan_count_1 == 1
+    assert implement_count_1 >= 1
 
     # Second run (default resume=True): should continue from the non-green checkpoint
-    # and MUST NOT recreate spec/plan.
+    # and MUST NOT recreate spec/plan/implement.
     r4 = runner.invoke(app, ["run", "--route", "L1"])
     assert r4.exit_code == 0, r4.output
     ckpt2 = r4.output.strip()
@@ -75,6 +81,11 @@ def test_cli_run_resume_skips_spec_and_plan(tmp_path: Path, monkeypatch) -> None
 
     ac_count_2 = sum(1 for _ in ledger.iter_events(types={"AC_DEFINED"}))
     plan_count_2 = sum(1 for _ in ledger.iter_events(types={"PLAN_CREATED"}))
+    implement_count_2 = sum(
+        1
+        for e in ledger.iter_events(types={"STATE_TRANSITION"})
+        if (e.meta or {}).get("phase") == "implement"
+    )
     assert ac_count_2 == 1
     assert plan_count_2 == 1
-
+    assert implement_count_2 == implement_count_1
