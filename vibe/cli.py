@@ -578,6 +578,7 @@ def run(
     mock_writes: bool = typer.Option(False, "--mock-writes", help="In mock mode, enable deterministic file writes"),
     route: str = typer.Option("auto", "--route", help="Route level: auto|L0|L1|L2|L3|L4"),
     style: Optional[str] = typer.Option(None, "--style", help="Workflow style: free|balanced|detailed (overrides vibe.yaml)"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume from the latest non-green checkpoint for this task"),
 ) -> None:
     if mock:
         os.environ["VIBE_MOCK_MODE"] = "1"
@@ -590,7 +591,7 @@ def run(
             cfg = VibeConfig.load(cfg_path)
             apply_workspace_secrets(repo_root, providers=cfg.providers)
         orch = Orchestrator(repo_root, policy_mode=(ctx.obj or {}).get("policy"))
-        result = orch.run(task_id=task, route=route, style=style)
+        result = orch.run(task_id=task, route=route, style=style, resume=resume)
         typer.echo(result.checkpoint_id)
     except PolicyDeniedError as e:
         typer.echo(str(e), err=True)

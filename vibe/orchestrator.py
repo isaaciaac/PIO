@@ -17,7 +17,7 @@ from vibe.policy import PolicyDeniedError, ToolPolicy, resolve_policy_mode
 from vibe.schemas import packs
 from vibe.schemas.events import LedgerEvent, new_event
 from vibe.storage.artifacts import ArtifactsStore
-from vibe.storage.checkpoints import CheckpointsStore
+from vibe.storage.checkpoints import CheckpointsStore, Checkpoint
 from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
@@ -755,6 +755,228 @@ class Orchestrator:
         if os.name == "nt":
             return f'cd /d "{d}" && {cmd}'
         return f'cd "{d}" && {cmd}'
+
+    def _node_external_pkg_name(self, spec: str) -> Optional[str]:
+        s = (spec or "").strip()
+        if not s:
+            return None
+        if s.startswith(("node:", "bun:")):
+            return None
+        if s.startswith((".", "/", "\\")):
+            return None
+        # Common TS path aliases.
+        if s.startswith(("@/", "#/", "~/")):
+            return None
+        # Strip query/hash fragments.
+        s = s.split("?", 1)[0].split("#", 1)[0].strip()
+        if not s:
+            return None
+
+        # Scoped packages keep '@scope/name'.
+        if s.startswith("@"):
+            parts = [p for p in s.split("/") if p]
+            if len(parts) >= 2:
+                return "/".join(parts[:2])
+            return s
+        return s.split("/", 1)[0]
+
+    def _doctor_node_missing_deps(
+        self,
+        *,
+        node_dir: Path,
+        declared: set[str],
+        max_packages: int = 4,
+        max_files: int = 80,
+    ) -> list[dict[str, Any]]:
+        """
+        Static scan: find external import packages that are not declared in package.json.
+
+        Returns a small list of findings with evidence pointers (best-effort).
+        """
+        base = (self.repo_root / node_dir).resolve()
+        if not base.exists():
+            return []
+
+        # Node built-ins (subset; good enough to avoid common false positives).
+        builtins = {
+            "assert",
+            "buffer",
+            "child_process",
+            "crypto",
+            "events",
+            "fs",
+            "http",
+            "https",
+            "net",
+            "os",
+            "path",
+            "stream",
+            "timers",
+            "tls",
+            "url",
+            "util",
+            "zlib",
+        }
+
+        # Prefer scanning src/, but fall back to repo root of the node project.
+        scan_root = base / "src"
+        if not scan_root.exists():
+            scan_root = base
+
+        import_re = re.compile(
+            r"(?:\bimport\b[\s\S]{0,120}?\bfrom\s*[\"'](?P<a>[^\"']+)[\"']|\bexport\b[\s\S]{0,120}?\bfrom\s*[\"'](?P<b>[^\"']+)[\"']|\brequire\s*\(\s*[\"'](?P<c>[^\"']+)[\"']\s*\)|\bimport\s*\(\s*[\"'](?P<d>[^\"']+)[\"']\s*\))",
+            flags=re.IGNORECASE,
+        )
+
+        findings: list[dict[str, Any]] = []
+        seen_pkg: set[str] = set()
+
+        def should_skip(path: Path) -> bool:
+            try:
+                rel = path.relative_to(base)
+            except Exception:
+                return True
+            if rel.parts and rel.parts[0] in {"node_modules", "dist", "build", ".vibe", ".git"}:
+                return True
+            return False
+
+        count_files = 0
+        try:
+            for path in scan_root.rglob("*"):
+                if count_files >= max_files or len(findings) >= max_packages:
+                    break
+                if not path.is_file():
+                    continue
+                if should_skip(path):
+                    continue
+                if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                count_files += 1
+                for m in import_re.finditer(text):
+                    if len(findings) >= max_packages:
+                        break
+                    spec = m.group("a") or m.group("b") or m.group("c") or m.group("d") or ""
+                    pkg = self._node_external_pkg_name(spec)
+                    if not pkg or pkg in seen_pkg:
+                        continue
+                    if pkg in builtins:
+                        continue
+                    if pkg in declared:
+                        continue
+                    seen_pkg.add(pkg)
+                    line = text[: m.start()].count("\n") + 1
+                    rel_repo = path.relative_to(self.repo_root).as_posix()
+                    ptr: Optional[str] = None
+                    try:
+                        rr = self.toolbox.read_file(
+                            agent_id="router",
+                            path=rel_repo,
+                            start_line=max(1, line - 2),
+                            end_line=line + 2,
+                        )
+                        ptr = rr.pointer
+                    except Exception:
+                        ptr = None
+                    findings.append({"package": pkg, "file": rel_repo, "line": line, "pointer": ptr})
+        except Exception:
+            return findings
+
+        return findings
+
+    def _doctor_preflight(self, *, max_findings: int = 6) -> tuple[Optional[str], str]:
+        """
+        Lightweight static preflight to reduce "QA discovers everything" churn.
+
+        Returns (doctor_report_pointer, short_summary).
+        """
+        node_dirs = self._find_node_project_dirs()
+        if not node_dirs:
+            return None, ""
+
+        findings: list[dict[str, Any]] = []
+        for node_dir in node_dirs[:3]:
+            pkg_path = (self.repo_root / node_dir / "package.json").resolve()
+            if not pkg_path.exists():
+                continue
+            try:
+                pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+
+            scripts = dict(pkg.get("scripts") or {})
+            deps: dict[str, str] = dict(pkg.get("dependencies") or {})
+            dev_deps: dict[str, str] = dict(pkg.get("devDependencies") or {})
+            declared = set(deps.keys()) | set(dev_deps.keys())
+
+            pkg_ptr: Optional[str] = None
+            try:
+                rel_pkg = pkg_path.relative_to(self.repo_root).as_posix()
+                rr = self.toolbox.read_file(agent_id="router", path=rel_pkg, start_line=1, end_line=220)
+                pkg_ptr = rr.pointer
+            except Exception:
+                pkg_ptr = None
+
+            # Windows pitfall: single-quoted globs in npm scripts.
+            if os.name == "nt":
+                for name, cmd in list(scripts.items())[:30]:
+                    s = str(cmd or "")
+                    if re.search(r"'[^']*\\*\\*[^']*'", s):
+                        findings.append(
+                            {
+                                "kind": "npm_script_single_quote_glob",
+                                "severity": "medium",
+                                "title": f"npm script `{name}` 可能在 Windows 下因单引号 glob 失败",
+                                "detail": s[:240],
+                                "pointers": [p for p in [pkg_ptr] if p],
+                            }
+                        )
+                        break
+                    if re.search(r"(^|\\s)[A-Z_]+=[^\\s]+", s) and "cross-env" not in s:
+                        findings.append(
+                            {
+                                "kind": "npm_script_env_assignment",
+                                "severity": "low",
+                                "title": f"npm script `{name}` 可能在 Windows 下因环境变量写法失败（建议 cross-env）",
+                                "detail": s[:240],
+                                "pointers": [p for p in [pkg_ptr] if p],
+                            }
+                        )
+                        break
+
+            # Missing deps (static scan).
+            missing = self._doctor_node_missing_deps(node_dir=node_dir, declared=declared, max_packages=4, max_files=80)
+            for it in missing[: max(0, max_findings - len(findings))]:
+                pkg_name = str(it.get("package") or "").strip()
+                if not pkg_name:
+                    continue
+                ptrs = [p for p in [pkg_ptr, it.get("pointer")] if p]
+                findings.append(
+                    {
+                        "kind": "missing_dependency",
+                        "severity": "high",
+                        "title": f"代码引用了未声明的依赖：{pkg_name}",
+                        "detail": f"{it.get('file')}:{it.get('line')}",
+                        "pointers": ptrs[:4],
+                    }
+                )
+                if len(findings) >= max_findings:
+                    break
+            if len(findings) >= max_findings:
+                break
+
+        if not findings:
+            return None, ""
+
+        report = {"version": 1, "scope": "preflight", "findings": findings}
+        ptr = self.artifacts.put_json(report, suffix=".doctor.json", kind="doctor").to_pointer()
+
+        titles = [str(f.get("title") or "").strip() for f in findings if str(f.get("title") or "").strip()]
+        summary = "；".join(titles[:3])[:200]
+        return ptr, summary
 
     def _artifact_tail_text(self, pointer: str, *, max_bytes: int = 16000) -> str:
         """
@@ -3019,24 +3241,106 @@ class Orchestrator:
 
         return packs.TestReport(commands=report_cmds, results=results, passed=all(x.passed for x in results), blockers=blockers, pointers=pointers)
 
-    def run(self, *, task_id: Optional[str] = None, route: Optional[str] = None, style: Optional[str] = None) -> RunResult:
+    def _find_resume_checkpoint(self, *, task_evt: LedgerEvent, task_text: str) -> Optional[Checkpoint]:
+        """
+        Find the latest non-green checkpoint for the current branch+task.
+
+        This enables "continue fixing" runs (resume) without re-running PM/ADR/PLAN
+        and re-implementing tasks from scratch.
+        """
+        try:
+            checkpoints = list(self.checkpoints.list())
+        except Exception:
+            return None
+        if not checkpoints:
+            return None
+
+        # 1) Exact match (preferred): task_id + branch_id.
+        for cp in reversed(checkpoints):
+            if cp.green:
+                continue
+            meta = dict(cp.meta or {})
+            if str(meta.get("branch_id") or "main") != self.branch_id:
+                continue
+            if str(meta.get("task_id") or "") == str(task_evt.id or ""):
+                return cp
+
+        # 2) Heuristic fallback: match by label similarity (older checkpoints may not have task_id).
+        head = (task_text or "").strip().splitlines()[0][:120].lower()
+        if not head:
+            return None
+        for cp in reversed(checkpoints):
+            if cp.green:
+                continue
+            meta = dict(cp.meta or {})
+            if str(meta.get("branch_id") or "main") != self.branch_id:
+                continue
+            reason = str(meta.get("reason") or "").strip()
+            if reason not in {"fix_loop_blockers", "qa_no_commands"}:
+                continue
+            label = (cp.label or "").strip().lower()
+            if not label:
+                continue
+            if head in label or label in head:
+                return cp
+            try:
+                if difflib.SequenceMatcher(None, head, label).ratio() >= 0.72:
+                    return cp
+            except Exception:
+                continue
+        return None
+
+    def run(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        route: Optional[str] = None,
+        style: Optional[str] = None,
+        resume: bool = True,
+    ) -> RunResult:
         task_evt = self._find_task(task_id)
         task_text = str(task_evt.meta.get("text") or task_evt.summary)
 
-        resolved_style = normalize_style(style or os.getenv("VIBE_STYLE") or getattr(self.config.behavior, "style", "balanced"))
+        resume_cp: Optional[Checkpoint] = None
+        if resume and self.policy.mode != "chat_only":
+            try:
+                resume_cp = self._find_resume_checkpoint(task_evt=task_evt, task_text=task_text)
+            except Exception:
+                resume_cp = None
+
+        style_seed = style or os.getenv("VIBE_STYLE") or getattr(self.config.behavior, "style", "balanced")
+        if (not style) and (not os.getenv("VIBE_STYLE")) and resume_cp is not None:
+            prev_style = str((resume_cp.meta or {}).get("style") or "").strip()
+            if prev_style:
+                style_seed = prev_style
+
+        resolved_style = normalize_style(style_seed)
         workflow_hint = style_workflow_hint(resolved_style)
 
         diff = self._git_diff_stats_best_effort()
         risks = detect_risks(task_text, diff=diff)
+        requested_level = route
+        if resume_cp is not None and (not route or str(route).strip().lower() in {"auto", "default"}):
+            prev_level = str((resume_cp.meta or {}).get("route_level") or "").strip().upper()
+            if prev_level in {"L0", "L1", "L2", "L3", "L4"}:
+                requested_level = prev_level
         decision = decide_route(
             task_text=task_text,
             diff=diff,
             recent_test_fail_count=self._recent_test_fail_count(),
-            requested_level=route,
+            requested_level=requested_level,
         )
         requested_route_level = decision.route_level
         route_level = requested_route_level
         route_reasons = list(decision.reasons or [])
+
+        resume_from: Optional[str] = None
+        resume_reason: Optional[str] = None
+        if resume_cp is not None:
+            meta = dict(resume_cp.meta or {})
+            if not resume_cp.green and str(meta.get("reason") or "").strip() in {"fix_loop_blockers", "qa_no_commands"}:
+                resume_from = resume_cp.id
+                resume_reason = str(meta.get("reason") or "").strip()
 
         agent_pool_list = self._agent_pool_for_route(route_level)
         agent_pool: Set[str] = set(agent_pool_list)
@@ -3062,6 +3366,8 @@ class Orchestrator:
                     "requested_route_level": requested_route_level,
                     "reasons": route_reasons,
                     "style": resolved_style,
+                    "resume_from": resume_from,
+                    "resume_reason": resume_reason,
                     "diff": {
                         "files": diff.file_count,
                         "loc_added": diff.loc_added,
@@ -3085,6 +3391,7 @@ class Orchestrator:
                     "agent_pool": agent_pool_list,
                     "agents": activated_agents_list,
                     "style": resolved_style,
+                    "resume_from": resume_from,
                 },
             ),
             activated_agents=activated_agents,
@@ -3158,19 +3465,106 @@ class Orchestrator:
                 summary="Built ContextPacket",
                 branch_id=self.branch_id,
                 pointers=ctx.repo_pointers,
-                meta={"route_level": route_level, "style": resolved_style},
+                meta={"route_level": route_level, "style": resolved_style, "resume_from": resume_from},
             ),
             activated_agents=activated_agents,
         )
 
         req: packs.RequirementPack | None = None
+        req_ptr: Optional[str] = None
         usecases: Optional[packs.UseCasePack] = None
         usecases_ptr: Optional[str] = None
         decisions: Optional[packs.DecisionPack] = None
         decisions_ptr: Optional[str] = None
         contract: Optional[packs.ContractPack] = None
         contract_ptr: Optional[str] = None
-        if route_level != "L0":
+        plan: Optional[packs.Plan] = None
+        plan_ptr: Optional[str] = None
+
+        resume_mode = bool(resume_from)
+        if resume_mode:
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="STATE_TRANSITION",
+                    summary=f"Resuming from checkpoint {resume_from}",
+                    branch_id=self.branch_id,
+                    pointers=[],
+                    meta={"phase": "resume", "from_checkpoint": resume_from, "route_level": route_level, "style": resolved_style},
+                ),
+                activated_agents=activated_agents,
+            )
+            try:
+                meta = dict((resume_cp.meta or {}) if resume_cp is not None else {})
+            except Exception:
+                meta = {}
+
+            def _load(ptr: Optional[str], schema):
+                if not ptr:
+                    return None
+                try:
+                    raw = self.artifacts.read_bytes(ptr)
+                    data = json.loads(raw.decode("utf-8", errors="replace"))
+                    return schema.model_validate(data)
+                except Exception:
+                    return None
+
+            req_ptr = str(meta.get("req_ptr") or "").strip() or None
+            plan_ptr = str(meta.get("plan_ptr") or "").strip() or None
+            usecases_ptr = str(meta.get("usecases_ptr") or "").strip() or None
+            decisions_ptr = str(meta.get("decisions_ptr") or "").strip() or None
+            contract_ptr = str(meta.get("contract_ptr") or "").strip() or None
+
+            req = _load(req_ptr, packs.RequirementPack) if req_ptr else None
+            plan = _load(plan_ptr, packs.Plan) if plan_ptr else None
+            usecases = _load(usecases_ptr, packs.UseCasePack) if usecases_ptr else None
+            decisions = _load(decisions_ptr, packs.DecisionPack) if decisions_ptr else None
+            contract = _load(contract_ptr, packs.ContractPack) if contract_ptr else None
+
+            if req is None and route_level != "L0":
+                req = packs.RequirementPack(
+                    summary=(task_text.strip().splitlines()[0][:120] or "Resume task"),
+                    acceptance=[],
+                    non_goals=[],
+                    constraints=["Assume: resuming from previous non-green checkpoint; reusing prior spec/plan unless updated."],
+                )
+            if plan is None:
+                # Resume should not re-run PLAN/IMPLEMENT. Keep an empty Plan for
+                # downstream prompts (envspec/review) without triggering work.
+                plan = packs.Plan(tasks=[])
+
+        doctor_ptr: Optional[str] = None
+        if route_level != "L0" and (resume_mode or route_level in {"L2", "L3", "L4"}):
+            try:
+                doctor_ptr, doctor_summary = self._doctor_preflight(max_findings=6)
+                if doctor_ptr:
+                    # Feed doctor findings into the shared ContextPacket (short, pointer-backed).
+                    ctx.log_pointers.append(doctor_ptr)
+                    if doctor_summary:
+                        ctx.constraints.append(f"Doctor预检：{doctor_summary}（详见 {doctor_ptr}）")
+                    self._append_guarded(
+                        event=new_event(
+                            agent="router",
+                            type="INCIDENT_CREATED",
+                            summary="Doctor preflight findings",
+                            branch_id=self.branch_id,
+                            pointers=[doctor_ptr],
+                            meta={
+                                "category": "doctor_preflight",
+                                "route_level": route_level,
+                                "style": resolved_style,
+                                "task_id": task_evt.id,
+                                "resume_from": resume_from,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+            except PolicyDeniedError:
+                pass
+            except Exception:
+                pass
+
+        if (not resume_mode) and route_level != "L0":
             activate_agent("pm", reason="gate:requirements")
             if not pm:
                 raise RuntimeError("pm is required for L1+ routes")
@@ -3198,6 +3592,21 @@ class Orchestrator:
                 user=task_text,
             )
             req = augment_requirement_pack(req, task_text=task_text)
+            try:
+                req_ptr = self.artifacts.put_json(req.model_dump(), suffix=".req.json", kind="req").to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="pm",
+                        type="REQ_UPDATED",
+                        summary="RequirementPack updated",
+                        branch_id=self.branch_id,
+                        pointers=[req_ptr],
+                        meta={"task_id": task_evt.id, "route_level": route_level, "style": resolved_style},
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                req_ptr = None
             self._append_guarded(
                 event=new_event(
                     agent="pm",
@@ -3205,7 +3614,7 @@ class Orchestrator:
                     summary="Acceptance criteria defined",
                     branch_id=self.branch_id,
                     pointers=[],
-                    meta={"acceptance": req.acceptance, "route_level": route_level, "style": resolved_style},
+                    meta={"acceptance": req.acceptance, "route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
                 ),
                 activated_agents=activated_agents,
             )
@@ -3217,7 +3626,7 @@ class Orchestrator:
         except Exception:
             needs_arch = needs_arch
 
-        if route_level in {"L2", "L3", "L4"}:
+        if (not resume_mode) and route_level in {"L2", "L3", "L4"}:
             activate_agent("requirements_analyst", reason="gate:usecases")
             if req_analyst is None:
                 raise RuntimeError("requirements_analyst is required for L2+ routes")
@@ -3243,12 +3652,12 @@ class Orchestrator:
                     summary="Use cases defined",
                     branch_id=self.branch_id,
                     pointers=[usecases_ptr],
-                    meta={"route_level": route_level, "style": resolved_style},
+                    meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
                 ),
                 activated_agents=activated_agents,
             )
 
-        if needs_arch:
+        if (not resume_mode) and needs_arch:
             activate_agent("architect", reason="gate:architecture")
             if architect is None:
                 raise RuntimeError("architect is required for architecture gate")
@@ -3285,7 +3694,7 @@ class Orchestrator:
                     summary="ADR-lite added",
                     branch_id=self.branch_id,
                     pointers=[decisions_ptr],
-                    meta={"route_level": route_level, "style": resolved_style},
+                    meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
                 ),
                 activated_agents=activated_agents,
             )
@@ -3335,7 +3744,7 @@ class Orchestrator:
                 except Exception:
                     pass
 
-        if route_level in {"L2", "L3", "L4"} and (risks.contract_change or risks.touches_external_api):
+        if (not resume_mode) and route_level in {"L2", "L3", "L4"} and (risks.contract_change or risks.touches_external_api):
             activate_agent("api_confirm", reason="gate:contract")
             if api_confirm is None:
                 raise RuntimeError("api_confirm is required for contract/external API changes")
@@ -3364,57 +3773,65 @@ class Orchestrator:
                     summary="Contract confirmed",
                     branch_id=self.branch_id,
                     pointers=[contract_ptr],
-                    meta={"route_level": route_level, "style": resolved_style},
+                    meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
                 ),
                 activated_agents=activated_agents,
             )
 
-        plan_user = (
-            f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
-            if req is not None
-            else f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
-        )
-        if ctx_excerpts:
-            plan_user = f"{plan_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-        if usecases is not None:
-            plan_user = f"{plan_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
-        if decisions is not None:
-            plan_user = f"{plan_user}\n\nDecisionPack:\n{decisions.model_dump_json()}"
-        if contract is not None:
-            plan_user = f"{plan_user}\n\nContractPack:\n{contract.model_dump_json()}"
-        router_msgs = self._messages_with_memory(
-            agent_id="router",
-            system=(
-                "你是调度器 Router：把需求拆成最多 5 个可执行任务。\n"
-                "只输出 JSON（不要 markdown），并严格匹配 Plan schema：{tasks:[{id,title,agent,description}]}。\n"
-                "不要额外 key；不要最外层包一层对象。\n\n"
-                "规划规则：\n"
-                "- tasks <= 5；每个 task 必须可落地、可验收。\n"
-                "- tasks 按顺序执行：先补齐工程骨架/可运行验证，再实现核心功能，最后补文档/收尾。\n"
-                "- task.agent 尽量选择可落地写文件的工种（coder_backend/coder_frontend/integration_engineer）；不要把 pm/qa/reviewer/security 当成 plan task（它们由 gate 触发）。\n"
-                "- 交付导向：至少包含一个任务负责「README/运行方式/最小验证」的交付说明。\n"
-                "- 若需求暗示实时/价格/行情/外部数据：至少包含一个任务负责数据源落地（真实优先，失败回退 mock 并标注 source）。\n\n"
-                f"{workflow_hint}"
-            ),
-            user=plan_user,
-        )
-        plan, _plan_meta = router.chat_json(
-            schema=packs.Plan,
-            messages=router_msgs,
-            user=plan_user,
-        )
-        plan = augment_plan(plan, req=req, task_text=task_text, activated_agents=activated_agents)
-        self._append_guarded(
-            event=new_event(
-                agent="router",
-                type="PLAN_CREATED",
-                summary=f"Planned {len(plan.tasks)} tasks",
-                branch_id=self.branch_id,
-                pointers=[],
-                meta={"route_level": route_level, "style": resolved_style},
-            ),
-            activated_agents=activated_agents,
-        )
+        if not resume_mode:
+            plan_user = (
+                f"RequirementPack:\n{req.model_dump_json()}\n\nContextPacket:\n{ctx.model_dump_json()}"
+                if req is not None
+                else f"Task:\n{task_text}\n\nContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                plan_user = f"{plan_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            if usecases is not None:
+                plan_user = f"{plan_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
+            if decisions is not None:
+                plan_user = f"{plan_user}\n\nDecisionPack:\n{decisions.model_dump_json()}"
+            if contract is not None:
+                plan_user = f"{plan_user}\n\nContractPack:\n{contract.model_dump_json()}"
+            router_msgs = self._messages_with_memory(
+                agent_id="router",
+                system=(
+                    "你是调度器 Router：把需求拆成最多 5 个可执行任务。\n"
+                    "只输出 JSON（不要 markdown），并严格匹配 Plan schema：{tasks:[{id,title,agent,description}]}。\n"
+                    "不要额外 key；不要最外层包一层对象。\n\n"
+                    "规划规则：\n"
+                    "- tasks <= 5；每个 task 必须可落地、可验收。\n"
+                    "- tasks 按顺序执行：先补齐工程骨架/可运行验证，再实现核心功能，最后补文档/收尾。\n"
+                    "- task.agent 尽量选择可落地写文件的工种（coder_backend/coder_frontend/integration_engineer）；不要把 pm/qa/reviewer/security 当成 plan task（它们由 gate 触发）。\n"
+                    "- 交付导向：至少包含一个任务负责「README/运行方式/最小验证」的交付说明。\n"
+                    "- 若需求暗示实时/价格/行情/外部数据：至少包含一个任务负责数据源落地（真实优先，失败回退 mock 并标注 source）。\n\n"
+                    f"{workflow_hint}"
+                ),
+                user=plan_user,
+            )
+            plan, _plan_meta = router.chat_json(
+                schema=packs.Plan,
+                messages=router_msgs,
+                user=plan_user,
+            )
+            plan = augment_plan(plan, req=req, task_text=task_text, activated_agents=activated_agents)
+            try:
+                plan_ptr = self.artifacts.put_json(plan.model_dump(), suffix=".plan.json", kind="plan").to_pointer()
+            except Exception:
+                plan_ptr = None
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="PLAN_CREATED",
+                    summary=f"Planned {len(plan.tasks)} tasks",
+                    branch_id=self.branch_id,
+                    pointers=[p for p in [plan_ptr] if p],
+                    meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
+                ),
+                activated_agents=activated_agents,
+            )
+
+        if plan is None:
+            plan = packs.Plan(tasks=[])
 
         available_agents: Set[str] = set(self.config.agents.keys())
         primary_coder_id = self._select_primary_coder(task_text=task_text, risks=risks, activated_agents=available_agents)
@@ -3431,7 +3848,7 @@ class Orchestrator:
             needs_bootstrap = any("工程骨架提示" in str(c) for c in (ctx.constraints or []))
         except Exception:
             needs_bootstrap = False
-        if needs_bootstrap:
+        if (not resume_mode) and needs_bootstrap:
             try:
                 blob = "\n".join([f"{t.title}\n{t.description}" for t in list(plan.tasks or [])]).lower()
             except Exception:
@@ -3602,6 +4019,8 @@ class Orchestrator:
 
         summary_parts = [str(c.summary or "").strip() for c in plan_changes if str(c.summary or "").strip()]
         summary = "；".join(summary_parts)[:240] if summary_parts else (req.summary if req is not None else task_text.strip().splitlines()[0][:120])
+        if resume_mode and not summary_parts and resume_from:
+            summary = f"resume: continue from {resume_from}"
         change = packs.CodeChange(kind=("patch" if any(c.kind == "patch" for c in plan_changes) else "noop"), summary=summary, files_changed=files_changed)
         write_pointers = []
         try:
@@ -3640,7 +4059,22 @@ class Orchestrator:
                 artifacts=artifacts,
                 green=False,
                 restore_steps=["policy(chat_only): no restore steps recorded"],
-                meta={"reason": "chat_only", "route_level": route_level, "agents": activated_agents_list, "style": resolved_style},
+                meta={
+                    "reason": "chat_only",
+                    "branch_id": self.branch_id,
+                    "task_id": task_evt.id,
+                    "route_level": route_level,
+                    "requested_route_level": requested_route_level,
+                    "agents": activated_agents_list,
+                    "style": resolved_style,
+                    "req_ptr": req_ptr,
+                    "plan_ptr": plan_ptr,
+                    "usecases_ptr": usecases_ptr,
+                    "decisions_ptr": decisions_ptr,
+                    "contract_ptr": contract_ptr,
+                    "resume_from": resume_from,
+                    "doctor_ptr": doctor_ptr,
+                },
             )
             self._append_guarded(
                 event=new_event(
@@ -3935,10 +4369,21 @@ class Orchestrator:
                 restore_steps=["L0(draft): re-run with L1+ to get green"],
                 meta={
                     "draft": True,
+                    "branch_id": self.branch_id,
+                    "task_id": task_evt.id,
                     "route_level": route_level,
+                    "requested_route_level": requested_route_level,
                     "agents": activated_agents_list,
                     "qa_profile": qa_profile,
                     "qa_required_profile": qa_required_profile,
+                    "style": resolved_style,
+                    "req_ptr": req_ptr,
+                    "plan_ptr": plan_ptr,
+                    "usecases_ptr": usecases_ptr,
+                    "decisions_ptr": decisions_ptr,
+                    "contract_ptr": contract_ptr,
+                    "resume_from": resume_from,
+                    "doctor_ptr": doctor_ptr,
                 },
             )
             self._append_guarded(
@@ -3970,12 +4415,22 @@ class Orchestrator:
                 green=False,
                 restore_steps=["QA: no test commands detected; configure tests/lint then re-run"],
                 meta={
+                    "branch_id": self.branch_id,
+                    "task_id": task_evt.id,
                     "route_level": route_level,
+                    "requested_route_level": requested_route_level,
                     "agents": activated_agents_list,
                     "qa_profile": qa_profile,
                     "qa_required_profile": qa_required_profile,
                     "reason": "qa_no_commands",
                     "style": resolved_style,
+                    "req_ptr": req_ptr,
+                    "plan_ptr": plan_ptr,
+                    "usecases_ptr": usecases_ptr,
+                    "decisions_ptr": decisions_ptr,
+                    "contract_ptr": contract_ptr,
+                    "resume_from": resume_from,
+                    "doctor_ptr": doctor_ptr,
                 },
             )
             self._append_guarded(
@@ -4957,13 +5412,23 @@ class Orchestrator:
                     green=False,
                     restore_steps=restore_steps,
                     meta={
+                        "branch_id": self.branch_id,
+                        "task_id": task_evt.id,
                         "route_level": route_level,
+                        "requested_route_level": requested_route_level,
                         "agents": activated_agents_list,
                         "qa_profile": qa_profile,
                         "qa_required_profile": qa_required_profile,
                         "reason": "fix_loop_blockers",
                         "blockers": blockers[:20],
                         "style": resolved_style,
+                        "req_ptr": req_ptr,
+                        "plan_ptr": plan_ptr,
+                        "usecases_ptr": usecases_ptr,
+                        "decisions_ptr": decisions_ptr,
+                        "contract_ptr": contract_ptr,
+                        "resume_from": resume_from,
+                        "doctor_ptr": doctor_ptr,
                     },
                 )
                 self._append_guarded(
@@ -5223,12 +5688,21 @@ class Orchestrator:
             green=True,
             restore_steps=restore_steps,
             meta={
+                "branch_id": self.branch_id,
+                "task_id": task_evt.id,
                 "route_level": route_level,
                 "requested_route_level": requested_route_level,
                 "agents": activated_agents_list,
                 "qa_profile": qa_profile,
                 "qa_required_profile": qa_required_profile,
                 "style": resolved_style,
+                "req_ptr": req_ptr,
+                "plan_ptr": plan_ptr,
+                "usecases_ptr": usecases_ptr,
+                "decisions_ptr": decisions_ptr,
+                "contract_ptr": contract_ptr,
+                "resume_from": resume_from,
+                "doctor_ptr": doctor_ptr,
                 "deliverables": {
                     "envspec": envspec_ptr,
                     "security": security_ptr,
