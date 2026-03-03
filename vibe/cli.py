@@ -521,6 +521,9 @@ def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: 
     # Always include scan_state: it contains detected node projects/scripts (fast + small).
     if exists(".vibe/manifests/scan_state.json"):
         add_excerpt(".vibe/manifests/scan_state.json", end_line=240)
+    # repo_index includes a small sample of paths; useful to validate "does file/page exist" claims.
+    if exists(".vibe/manifests/repo_index.json"):
+        add_excerpt(".vibe/manifests/repo_index.json", end_line=260)
 
     # If node projects exist, include their package.json (scripts are often the truth source).
     node_pkg_paths: list[str] = []
@@ -760,6 +763,7 @@ def chat(
             ".vibe/manifests/vibe_system.md",
             ".vibe/manifests/repo_overview.md",
             ".vibe/manifests/scan_state.json",
+            ".vibe/manifests/repo_index.json",
             ".vibe/manifests/run_manifest.md",
             ".vibe/manifests/project_manifest.md",
             "README.md",
