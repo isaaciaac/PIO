@@ -333,24 +333,140 @@ def _extract_ports_from_text(text: str) -> list[str]:
     return ports
 
 
+def _extract_repo_paths_from_text(text: str) -> list[tuple[str, Optional[int]]]:
+    """
+    Best-effort: extract repo-relative file paths (and optional line numbers) from user text.
+
+    Examples:
+    - src/app.tsx
+    - backend/src/index.ts:42
+    - tests/test_api.py:10
+    """
+
+    out: list[tuple[str, Optional[int]]] = []
+    seen: set[str] = set()
+    t = text or ""
+
+    # Note: avoid matching Windows drive paths (C:\...) which are not repo-relative.
+    pat = re.compile(
+        r"(?P<path>(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|toml|ya?ml|md|rs|go|java|cs|rb|php|sh|ps1|bat|cmd))"
+        r"(?::(?P<line>\d{1,6}))?",
+        flags=re.IGNORECASE,
+    )
+    for m in pat.finditer(t):
+        raw = (m.group("path") or "").strip()
+        if not raw:
+            continue
+        if re.match(r"^[A-Za-z]:[\\/]", raw):
+            continue
+        rel = raw.replace("\\", "/").lstrip("./").strip()
+        if not rel or rel.startswith(".vibe/") or rel.startswith(".git/"):
+            continue
+        if ".." in rel.split("/"):
+            continue
+        line_s = (m.group("line") or "").strip()
+        line: Optional[int] = None
+        if line_s.isdigit():
+            try:
+                line = int(line_s)
+            except Exception:
+                line = None
+        key = f"{rel}:{line or ''}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((rel, line))
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _extract_search_tokens(text: str) -> list[str]:
+    """
+    Extract a small set of helpful tokens from error/troubleshooting messages for ripgrep grounding.
+    Keep it conservative to avoid noisy searches.
+    """
+
+    t = (text or "").strip()
+    low = t.lower()
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    # Common compiler/error codes.
+    for m in re.finditer(r"\bTS\d{3,5}\b", t):
+        s = (m.group(0) or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            tokens.append(s)
+    for m in re.finditer(r"\b(?:ENOENT|EACCES|ECONNREFUSED|ECONNRESET)\b", t, flags=re.IGNORECASE):
+        s = (m.group(0) or "").strip()
+        if s and s.upper() not in seen:
+            seen.add(s.upper())
+            tokens.append(s.upper())
+
+    # Exception class names / common phrases.
+    for k in [
+        "module not found",
+        "cannot find module",
+        "modulenotfounderror",
+        "importerror",
+        "traceback",
+        "pytest",
+        "eslint",
+        "tsc",
+        "vite",
+        "react",
+        "hugo server",
+        "baseurl",
+        "baseurl:",
+        "localhost",
+    ]:
+        if k in low and k not in seen:
+            seen.add(k)
+            tokens.append(k)
+
+    # Symbol-ish identifiers (camelCase / snake_case), avoid too-short/noisy.
+    for m in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]{3,32}\b", t):
+        s = (m.group(0) or "").strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if sl in {"error", "failed", "tests", "build", "start", "serve", "dev", "true", "false", "none", "null"}:
+            continue
+        if sl in seen:
+            continue
+        seen.add(sl)
+        tokens.append(s)
+        if len(tokens) >= 10:
+            break
+
+    # Ports are often a good anchor.
+    for p in _extract_ports_from_text(t)[:3]:
+        if p not in seen:
+            seen.add(p)
+            tokens.append(p)
+
+    return tokens[:10]
+
+
 def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: Path, message: str, repo_pointers: list[str], repo_chunks: list[str]) -> None:
     """
     Chat grounding should not rely only on README/manifests.
 
-    When the user is troubleshooting (ports/localhost/404/errors), we add small excerpts of
-    *actual* config/code that likely explains the behavior (package.json scripts, referenced
-    script files, Hugo config, etc). This makes chat answers verifiable and reduces guesswork.
+    When the user is troubleshooting (errors/stack traces/ports/404), we add small excerpts of
+    *actual* config/code that likely explains the behavior. This makes chat answers verifiable
+    and reduces guesswork across *all* kinds of development tasks (not only websites).
     """
 
     # Keep bounded to avoid flooding the prompt.
     max_total_chunks = 10
 
-    def add_excerpt(rel: str, *, max_lines: int = 220) -> None:
+    def add_excerpt(rel: str, *, start_line: int = 1, end_line: int = 220) -> None:
         nonlocal repo_pointers, repo_chunks
         if len(repo_chunks) >= max_total_chunks:
             return
         try:
-            rr = tools.read_file(agent_id=agent_id, path=rel, start_line=1, end_line=max_lines)
+            rr = tools.read_file(agent_id=agent_id, path=rel, start_line=max(1, int(start_line)), end_line=max(1, int(end_line)))
         except Exception:
             return
         if rr.pointer not in repo_pointers:
@@ -366,13 +482,45 @@ def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: 
     text = (message or "").strip()
     low = text.lower()
     ports = _extract_ports_from_text(text)
-    looks_like_troubleshooting = any(k in low for k in ["localhost", "127.0.0.1", "404", "打不开", "没这个", "无法", "报错", "error", "failed"])
+    looks_like_troubleshooting = any(
+        k in low
+        for k in [
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "404",
+            "traceback",
+            "exception",
+            "modulenotfounderror",
+            "importerror",
+            "cannot find module",
+            "module not found",
+            "enoent",
+            "eacces",
+            "failed",
+            "error",
+            "报错",
+            "失败",
+            "打不开",
+            "没这个",
+            "无法",
+            "拒绝连接",
+            "连接失败",
+            "编译失败",
+            "测试失败",
+        ]
+    )
     if ports:
+        looks_like_troubleshooting = True
+
+    # If the user mentions concrete file paths, that's already a strong grounding signal.
+    mentioned_paths = _extract_repo_paths_from_text(text)
+    if mentioned_paths:
         looks_like_troubleshooting = True
 
     # Always include scan_state: it contains detected node projects/scripts (fast + small).
     if exists(".vibe/manifests/scan_state.json"):
-        add_excerpt(".vibe/manifests/scan_state.json", max_lines=240)
+        add_excerpt(".vibe/manifests/scan_state.json", end_line=240)
 
     # If node projects exist, include their package.json (scripts are often the truth source).
     node_pkg_paths: list[str] = []
@@ -388,12 +536,30 @@ def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: 
         node_pkg_paths = []
     for p in node_pkg_paths[:3]:
         if exists(p):
-            add_excerpt(p, max_lines=220)
+            add_excerpt(p, end_line=220)
 
     # Hugo/static site common configs (when present).
     for rel in ["hugo.toml", "hugo.yaml", "hugo.yml", "config.toml", "config.yaml", "config.yml", "config.json"]:
         if exists(rel):
-            add_excerpt(rel, max_lines=240)
+            add_excerpt(rel, end_line=240)
+
+    # Python/go/rust common project configs (when present).
+    for rel in ["pyproject.toml", "pytest.ini", "tox.ini", "requirements.txt", "setup.py", "go.mod", "Cargo.toml", "Makefile"]:
+        if exists(rel):
+            add_excerpt(rel, end_line=220)
+
+    # If the user referenced concrete files, include the relevant area from those files.
+    for rel, line in mentioned_paths[:6]:
+        if not exists(rel):
+            continue
+        if line and line > 0:
+            start = max(1, int(line) - 40)
+            end = int(line) + 60
+            add_excerpt(rel, start_line=start, end_line=end)
+        else:
+            add_excerpt(rel, end_line=260)
+        if len(repo_chunks) >= max_total_chunks:
+            return
 
     if not looks_like_troubleshooting:
         return
@@ -420,21 +586,17 @@ def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: 
                     base = str(Path(pkg_rel).parent.as_posix())
                     full = (Path(base) / rel).as_posix().lstrip("./")
                     if full and exists(full):
-                        add_excerpt(full, max_lines=260)
+                        add_excerpt(full, end_line=260)
                         if len(repo_chunks) >= max_total_chunks:
                             return
     except Exception:
         pass
 
-    # Ground by searching for ports/localhost/baseURL in code/config, then include a few matching files.
+    # Ground by searching for tokens extracted from the message (error codes, symbols, ports, etc),
+    # then include a few matching files.
     try:
         store = ArtifactsStore(repo_root)
-        queries: list[str] = []
-        if ports:
-            queries.extend(ports[:3])
-        if "localhost" in low or "127.0.0.1" in low:
-            queries.append("localhost")
-        queries.extend(["baseurl", "baseURL", "hugo server", "server --port", "port:"])
+        queries: list[str] = _extract_search_tokens(text)
         seen_q: set[str] = set()
         q_final: list[str] = []
         for q in queries:
@@ -476,7 +638,7 @@ def _maybe_add_chat_repo_grounding(*, tools: Toolbox, agent_id: str, repo_root: 
 
         for rel in files[:4]:
             if exists(rel):
-                add_excerpt(rel, max_lines=260)
+                add_excerpt(rel, end_line=260)
                 if len(repo_chunks) >= max_total_chunks:
                     break
     except Exception:
