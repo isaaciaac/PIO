@@ -539,6 +539,67 @@ class Orchestrator:
                 lines.append(f"  pointers: {ptrs}")
         return "\n".join(lines).strip()
 
+    def _tokenize_for_similarity(self, text: str) -> set[str]:
+        t = (text or "").lower()
+        toks = re.findall(r"[a-z0-9][a-z0-9_./:-]{2,}", t)
+        return set(toks)
+
+    def _similar_lessons_for_query(self, *, agent_id: str, query: str, limit: int = 3) -> list[MemoryRecord]:
+        view_dir = self.repo_root / ".vibe" / "views" / agent_id
+        mem_path = view_dir / "memory.jsonl"
+        if not mem_path.exists():
+            return []
+
+        try:
+            recs = read_memory_records(mem_path, limit=600)
+        except Exception:
+            return []
+
+        lessons = [r for r in recs if str(getattr(r, "kind", "") or "") == "lesson"]
+        if not lessons:
+            return []
+
+        q = (query or "").strip()
+        if not q:
+            return []
+        q_tokens = self._tokenize_for_similarity(q)
+
+        scored: list[tuple[float, MemoryRecord]] = []
+        for r in lessons:
+            text = (r.digest.summary or "") + "\n" + "\n".join(list(r.digest.pinned or [])[:6])
+            tokens = self._tokenize_for_similarity(text)
+            if q_tokens and tokens:
+                jacc = len(q_tokens & tokens) / max(1, len(q_tokens | tokens))
+            else:
+                jacc = 0.0
+            try:
+                seq = difflib.SequenceMatcher(None, q[:2000].lower(), text[:2000].lower()).ratio()
+            except Exception:
+                seq = 0.0
+            score = (jacc * 0.75) + (seq * 0.25)
+            if score < 0.06:
+                continue
+            scored.append((score, r))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _s, r in scored[: max(0, int(limit))]]
+
+    def _format_lessons_for_prompt(self, recs: list[MemoryRecord]) -> str:
+        if not recs:
+            return ""
+        lines: list[str] = []
+        lines.append("SimilarLessons（过往修复经验；事实以 pointers 展开为准）：")
+        for r in recs[:4]:
+            pin = "；".join([str(x).strip() for x in (r.digest.pinned or []) if str(x).strip()][:3]).strip()
+            ptrs = ", ".join([str(p).strip() for p in (r.pointers or []) if str(p).strip()][:2]).strip()
+            s = f"- {str(r.digest.summary or '').strip()[:200]}"
+            if pin:
+                s = s + f"\n  要点: {pin[:240]}"
+            if ptrs:
+                s = s + f"\n  pointers: {ptrs}"
+            lines.append(s)
+        return "\n".join(lines).strip()
+
     def _messages_with_memory(self, *, agent_id: str, system: str, user: str) -> list[dict[str, str]]:
         msgs: list[dict[str, str]] = [{"role": "system", "content": system}]
         mem_text = self._agent_memory_system(agent_id)
@@ -735,6 +796,144 @@ class Orchestrator:
         except Exception:
             return ""
         return ""
+
+    def _failed_command_from_report(self, report: packs.TestReport) -> str:
+        try:
+            for r in report.results:
+                if not r.passed:
+                    return str(r.command or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _extract_error_signals(self, text: str, *, limit: int = 14) -> list[str]:
+        """
+        Extract a small, de-duplicated list of error "signals" from noisy output.
+
+        Used to (a) batch related fixes in a single loop, and (b) anchor lessons.
+        """
+
+        t = (text or "").strip()
+        if not t:
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(s: str) -> None:
+            s2 = " ".join(str(s or "").strip().split())
+            if not s2:
+                return
+            if len(s2) > 260:
+                s2 = s2[:260] + "…"
+            key = s2.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(s2)
+
+        # Pytest summary lines.
+        for m in re.finditer(r"^(?:ERROR|FAILED)\s+(.+)$", t, flags=re.MULTILINE):
+            add(m.group(0))
+            if len(out) >= limit:
+                return out[:limit]
+
+        # Common Python import/collection failures.
+        for m in re.finditer(
+            r"^(?:E\s+)?(?:ModuleNotFoundError|ImportError|SyntaxError|NameError|AttributeError|TypeError):\s+.+$",
+            t,
+            flags=re.MULTILINE,
+        ):
+            add(m.group(0))
+            if len(out) >= limit:
+                return out[:limit]
+
+        # TypeScript compiler errors (tsc/vite).
+        for m in re.finditer(r"^(?:.+\(\d+,\d+\):\s+error\s+TS\d+:\s+.+)$", t, flags=re.MULTILINE):
+            add(m.group(0))
+            if len(out) >= limit:
+                return out[:limit]
+
+        # Generic "cannot find module" / missing file patterns.
+        for m in re.finditer(
+            r"^(?:.*)(?:Cannot find module|Module not found|No such file|ENOENT).*$", t, flags=re.MULTILINE
+        ):
+            add(m.group(0))
+            if len(out) >= limit:
+                return out[:limit]
+
+        # Fallback: pull a few "error:" lines.
+        for m in re.finditer(r"^.*\berror\b.*$", t, flags=re.MULTILINE | re.IGNORECASE):
+            add(m.group(0))
+            if len(out) >= limit:
+                return out[:limit]
+
+        return out[:limit]
+
+    def _focus_commands_for_test_failure(self, *, report: packs.TestReport, blocker_text: str) -> List[str]:
+        """
+        Build a minimal verification command list for fix-loop.
+
+        Strategy:
+        - Re-run only the *failing command* (avoid re-running earlier passing steps).
+        - For pytest failures, try to narrow to failing test files/nodeids or to collection-only.
+        """
+
+        failed_cmd = self._failed_command_from_report(report)
+        if not failed_cmd:
+            return []
+
+        low_cmd = failed_cmd.lower()
+        low = (blocker_text or "").lower()
+
+        if "pytest" in low_cmd:
+            # If pytest failed during collection/import, `--collect-only` is usually enough.
+            collection_smell = any(
+                k in low
+                for k in [
+                    "importerror while importing test module",
+                    "modulenotfounderror",
+                    "cannot import name",
+                    "syntaxerror",
+                ]
+            )
+
+            nodeids: list[str] = []
+            for m in re.finditer(r"\btests[/\\][^\s'\"()]+?\.py::[A-Za-z0-9_:.\\/-]+\b", blocker_text or ""):
+                nodeids.append(m.group(0).replace("\\", "/"))
+
+            files: list[str] = []
+            for m in re.finditer(r"\btests[/\\][^\s'\"()]+?\.py\b", blocker_text or ""):
+                files.append(m.group(0).replace("\\", "/"))
+
+            def uniq(xs: list[str]) -> list[str]:
+                out: list[str] = []
+                seen: set[str] = set()
+                for x in xs:
+                    s = str(x or "").strip()
+                    if not s:
+                        continue
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    out.append(s)
+                return out
+
+            nodeids = uniq(nodeids)[:3]
+            files = uniq(files)[:3]
+
+            extra: list[str] = []
+            if collection_smell:
+                extra.append("--collect-only")
+            if nodeids:
+                extra.extend(nodeids)
+            elif files:
+                extra.extend(files)
+
+            if extra:
+                return [failed_cmd + " " + " ".join(extra)]
+
+        return [failed_cmd]
 
     def _repo_excerpts_for_test_failure(
         self, report: packs.TestReport, *, max_error_files: int = 4, max_chars: int = 9000
@@ -3697,6 +3896,11 @@ class Orchestrator:
                     lines = [str(n).strip() for n in (blockers + notes) if str(n).strip()]
                     blocker_text = "\n".join(lines[:8]) or "Performance blocked"
 
+                extracted = self._extract_error_signals(blocker_text)
+                sim_router = self._format_lessons_for_prompt(
+                    self._similar_lessons_for_query(agent_id="router", query=blocker_text, limit=3)
+                )
+
                 incident: Optional[packs.IncidentPack] = None
                 incident_ptr: Optional[str] = None
                 if blocker_source == "tests":
@@ -3783,6 +3987,12 @@ class Orchestrator:
                             f"TestReport:\n{report.model_dump_json()}\n\n"
                             f"ContextPacket:\n{ctx.model_dump_json()}"
                         )
+                        if extracted:
+                            triage_user = f"{triage_user}\n\nExtractedErrors（同一失败命令的同类错误，建议一次修完）：\n" + "\n".join(
+                                f"- {x}" for x in extracted[:12]
+                            )
+                        if sim_router:
+                            triage_user = f"{triage_user}\n\n{sim_router}"
                         if ctx_excerpts:
                             triage_user = f"{triage_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                         if blocker_source == "tests":
@@ -3793,7 +4003,7 @@ class Orchestrator:
                         triage_msgs = self._messages_with_memory(
                             agent_id="ops_engineer",
                             system=(
-                                "你是运维/排障工程师（ops_engineer）。目标：复现/诊断当前阻塞，并给出最小修复方案，指导 coder 一次修一个 blocker。\n"
+                                "你是运维/排障工程师（ops_engineer）。目标：复现/诊断当前阻塞，并给出最小修复方案，指导 coder 在一次改动里批量修复同一失败命令中的同类错误。\n"
                                 "只输出 JSON（不要 markdown），并严格匹配 FixPlanPack schema："
                                 "{summary: string, root_causes: string[], repro_steps: string[], proposed_fixes: string[], files_to_check: string[], pointers: string[]}。\n"
                                 "不要额外 key；不要最外层包一层对象。\n\n"
@@ -3856,6 +4066,17 @@ class Orchestrator:
                     f"TestReport:\n{report.model_dump_json()}\n\n"
                     f"ContextPacket:\n{ctx.model_dump_json()}"
                 )
+                if extracted:
+                    fix_user = f"{fix_user}\n\nExtractedErrors（尽量一次修完同一失败命令中的这些问题）：\n" + "\n".join(
+                        f"- {x}" for x in extracted[:12]
+                    )
+                if sim_router:
+                    fix_user = f"{fix_user}\n\n{sim_router}"
+                sim_agent = self._format_lessons_for_prompt(
+                    self._similar_lessons_for_query(agent_id=fix_coder_id, query=blocker_text, limit=2)
+                )
+                if sim_agent:
+                    fix_user = f"{fix_user}\n\n（本工种相关经验）\n{sim_agent}"
                 if ctx_excerpts:
                     fix_user = f"{fix_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 if blocker_source == "tests":
@@ -3946,13 +4167,13 @@ class Orchestrator:
                     fix_msgs = self._messages_with_memory(
                         agent_id=fix_coder_id,
                         system=(
-                            f"You are {fix_role}. Fix exactly one blocker. Return JSON only for CodeChange with fields: "
+                            f"You are {fix_role}. Fix the failing command. Batch-fix all related errors from the same failing command output. Return JSON only for CodeChange with fields: "
                             "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                             "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
                             "Hard rules:\n"
                             "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
                             "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
-                        "- Fix the failing command in the blocker (it may require multiple file edits, but it is ONE blocker).\n"
+                        "- Fix the failing command in the blocker; prefer fixing all ExtractedErrors in one go (still one failing command).\n"
                         "- Do not do architecture refactors during fix-loop.\n"
                             "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
                             "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
@@ -4025,37 +4246,136 @@ class Orchestrator:
                     except Exception:
                         pass
 
-                qa_commands_loop = self._determine_test_commands(profile=qa_profile)
+                prev_failed_cmd = self._failed_command_from_report(report) if blocker_source == "tests" else ""
+                prev_ptrs: list[str] = [str(p).strip() for p in (report.pointers or []) if str(p).strip()]
+                prev_signals = extracted[:8] if extracted else []
+
+                qa_commands_full = self._determine_test_commands(profile=qa_profile)
+                qa_commands_focus = qa_commands_full
+                if blocker_source == "tests":
+                    try:
+                        focus = self._focus_commands_for_test_failure(report=report, blocker_text=blocker_text)
+                        if focus:
+                            qa_commands_focus = focus
+                    except Exception:
+                        qa_commands_focus = qa_commands_full
+
                 self._append_guarded(
                     event=new_event(
                         agent="qa",
                         type="TEST_RUN",
-                        summary=f"Fix-loop {loop}: re-running tests",
+                        summary=f"Fix-loop {loop}: verifying (focus)",
                         branch_id=self.branch_id,
                         pointers=[],
-                        meta={"profile": qa_profile, "commands": qa_commands_loop, "route_level": route_level, "style": resolved_style},
-                    ),
-                    activated_agents=activated_agents,
-                )
-                report = self._run_tests(profile=qa_profile, commands=qa_commands_loop)
-                self._append_guarded(
-                    event=new_event(
-                        agent="qa",
-                        type="TEST_PASSED" if report.passed else "TEST_FAILED",
-                        summary="Tests passed" if report.passed else "Tests failed",
-                        branch_id=self.branch_id,
-                        pointers=report.pointers,
                         meta={
-                            "blockers": report.blockers,
-                            "commands": report.commands,
-                            "loop": loop,
                             "profile": qa_profile,
+                            "phase": "fix_focus",
+                            "commands": qa_commands_focus,
                             "route_level": route_level,
                             "style": resolved_style,
                         },
                     ),
                     activated_agents=activated_agents,
                 )
+                focus_report = self._run_tests(profile=qa_profile, commands=qa_commands_focus)
+                self._append_guarded(
+                    event=new_event(
+                        agent="qa",
+                        type="TEST_PASSED" if focus_report.passed else "TEST_FAILED",
+                        summary="Tests passed" if focus_report.passed else "Tests failed",
+                        branch_id=self.branch_id,
+                        pointers=focus_report.pointers,
+                        meta={
+                            "blockers": focus_report.blockers,
+                            "commands": focus_report.commands,
+                            "loop": loop,
+                            "profile": qa_profile,
+                            "phase": "fix_focus",
+                            "route_level": route_level,
+                            "style": resolved_style,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+
+                report = focus_report
+
+                # If focus passed but we didn't run the full verification list, run it once to surface
+                # the *next* blocker early (fast -> full), rather than re-running full every loop.
+                if (not mock_mode) and report.passed and qa_commands_focus != qa_commands_full:
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_RUN",
+                            summary=f"Fix-loop {loop}: verifying (full)",
+                            branch_id=self.branch_id,
+                            pointers=[],
+                            meta={
+                                "profile": qa_profile,
+                                "phase": "fix_full",
+                                "commands": qa_commands_full,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    full_report = self._run_tests(profile=qa_profile, commands=qa_commands_full)
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_PASSED" if full_report.passed else "TEST_FAILED",
+                            summary="Tests passed" if full_report.passed else "Tests failed",
+                            branch_id=self.branch_id,
+                            pointers=full_report.pointers,
+                            meta={
+                                "blockers": full_report.blockers,
+                                "commands": full_report.commands,
+                                "loop": loop,
+                                "profile": qa_profile,
+                                "phase": "fix_full",
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    report = full_report
+
+                # Persist a compact lesson when we moved past the previous failing command (or fully passed),
+                # so future runs can avoid re-hitting the same pitfall.
+                if blocker_source == "tests" and prev_failed_cmd:
+                    new_failed_cmd = self._failed_command_from_report(report) if not report.passed else ""
+                    should_lesson = report.passed or (new_failed_cmd and new_failed_cmd != prev_failed_cmd)
+                    if should_lesson:
+                        try:
+                            root = ""
+                            if fix_plan is not None and str(getattr(fix_plan, "summary", "") or "").strip():
+                                root = str(getattr(fix_plan, "summary", "") or "").strip()
+                            elif incident is not None and str(getattr(incident, "summary", "") or "").strip():
+                                root = str(getattr(incident, "summary", "") or "").strip()
+                            else:
+                                root = "修复测试/构建阻塞"
+
+                            lesson_summary = f"{prev_failed_cmd[:90]} -> {change.summary[:90]}".strip()
+                            pinned: list[str] = []
+                            if root:
+                                pinned.append(f"原因/诊断: {root}")
+                            pinned.extend([str(x).strip() for x in (prev_signals or []) if str(x).strip()][:4])
+                            if fix_plan is not None:
+                                try:
+                                    pinned.extend([str(x).strip() for x in (fix_plan.root_causes or []) if str(x).strip()][:1])
+                                except Exception:
+                                    pass
+
+                            ptrs: list[str] = []
+                            ptrs.extend(prev_ptrs[:8])
+                            ptrs.extend([p for p in [fix_plan_ptr, incident_ptr, change.patch_pointer, change.commit_hash] if p])
+                            ptrs.extend(list(write_pointers or [])[:12])
+                            self._append_agent_lesson(agent_id=fix_coder_id, summary=lesson_summary, pinned=pinned, pointers=ptrs)
+                            self._append_agent_lesson(agent_id="router", summary=lesson_summary, pinned=pinned, pointers=ptrs)
+                        except Exception:
+                            pass
 
                 # If we started with a smoke preflight (L2+), only consider the repo "passing"
                 # after we also pass the required QA profile (usually "full").
