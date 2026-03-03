@@ -780,6 +780,56 @@ class Orchestrator:
         except Exception:
             return ""
 
+    def _artifact_head_text(self, pointer: str, *, max_bytes: int = 16000) -> str:
+        """
+        Read the head of an artifact text file (useful when errors appear early).
+        """
+        try:
+            rel = str(pointer or "").split("@sha256:", 1)[0].strip()
+            if not rel:
+                return ""
+            abs_path = (self.repo_root / rel).resolve()
+            if not abs_path.exists() or not abs_path.is_file():
+                return ""
+            size = abs_path.stat().st_size
+            with abs_path.open("rb") as f:
+                data = f.read(max_bytes)
+            text = decode_bytes(data)
+            if size > max_bytes:
+                return text + "\n…（已截断，仅显示开头）…"
+            return text
+        except Exception:
+            return ""
+
+    def _artifact_peek_text(self, pointer: str, *, head_bytes: int = 60000, tail_bytes: int = 60000) -> str:
+        """
+        Read a bounded "window" of an artifact text file: head + tail (with a marker).
+
+        This increases error-signal coverage vs tail-only, while keeping prompts bounded.
+        """
+        try:
+            rel = str(pointer or "").split("@sha256:", 1)[0].strip()
+            if not rel:
+                return ""
+            abs_path = (self.repo_root / rel).resolve()
+            if not abs_path.exists() or not abs_path.is_file():
+                return ""
+            size = abs_path.stat().st_size
+            if size <= max(0, int(head_bytes)) + max(0, int(tail_bytes)):
+                return decode_bytes(abs_path.read_bytes())
+
+            head = self._artifact_head_text(pointer, max_bytes=max(0, int(head_bytes)))
+            tail = self._artifact_tail_text(pointer, max_bytes=max(0, int(tail_bytes)))
+            parts: list[str] = []
+            if head.strip():
+                parts.append(head.strip())
+            parts.append("…（中间省略）…")
+            if tail.strip():
+                parts.append(tail.strip())
+            return "\n".join(parts).strip()
+        except Exception:
+            return ""
+
     def _test_failure_excerpt(self, report: packs.TestReport) -> str:
         try:
             for r in report.results:
@@ -1021,6 +1071,215 @@ class Orchestrator:
         if len(blob) > max_chars:
             blob = blob[:max_chars] + "\n…（摘录过长，已截断）…"
         return blob
+
+    def _build_test_failure_harvest(
+        self, *, report: packs.TestReport, blocker_text: str
+    ) -> tuple[dict[str, Any], Optional[str]]:
+        """
+        Harvest a broader set of error signals from the failing command output (head+tail),
+        plus a few deterministic "doctor" hints. This is NOT a second test run.
+        """
+
+        failed: Optional[packs.TestResult] = None
+        for r in report.results:
+            if not r.passed:
+                failed = r
+                break
+        if not failed:
+            return {}, None
+
+        failed_cmd = str(failed.command or "").strip()
+        workdir = self._shell_cd_dir(failed_cmd)
+
+        stdout_text = self._artifact_peek_text(failed.stdout, head_bytes=60000, tail_bytes=60000) if failed.stdout else ""
+        stderr_text = self._artifact_peek_text(failed.stderr, head_bytes=60000, tail_bytes=60000) if failed.stderr else ""
+        raw = (stdout_text + "\n" + stderr_text).strip()
+
+        signals = self._extract_error_signals(raw, limit=60)
+
+        ts_by_file: dict[str, list[str]] = {}
+        ts_pat = re.compile(
+            r"^(?P<file>[^\(\s]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+TS\d+:\s+(?P<msg>.*)$",
+            re.MULTILINE,
+        )
+        for m in ts_pat.finditer(raw):
+            f = (m.group("file") or "").replace("\\", "/").strip()
+            if not f:
+                continue
+            line = m.group("line") or "1"
+            col = m.group("col") or "1"
+            msg = (m.group("msg") or "").strip()
+            entry = f"{f}({line},{col}): {msg}".strip()
+            ts_by_file.setdefault(f, [])
+            if entry not in ts_by_file[f]:
+                ts_by_file[f].append(entry)
+            if len(ts_by_file[f]) > 6:
+                ts_by_file[f] = ts_by_file[f][:6]
+            if len(ts_by_file) > 12:
+                break
+
+        pytest_by_file: dict[str, list[str]] = {}
+        for m in re.finditer(r"^(?:ERROR|FAILED)\s+(?P<node>.+)$", raw, flags=re.MULTILINE):
+            node = (m.group("node") or "").strip()
+            if not node:
+                continue
+            file_part = node.split("::", 1)[0].strip()
+            if file_part.startswith("tests/") or file_part.startswith("tests\\"):
+                f = file_part.replace("\\", "/")
+                pytest_by_file.setdefault(f, [])
+                if node not in pytest_by_file[f]:
+                    pytest_by_file[f].append(node)
+                if len(pytest_by_file[f]) > 6:
+                    pytest_by_file[f] = pytest_by_file[f][:6]
+            if len(pytest_by_file) > 12:
+                break
+
+        doctor_findings: list[str] = []
+        doctor_ptrs: list[str] = []
+
+        # Doctor: Node missing dependency.
+        try:
+            missing_pkgs: list[str] = []
+            for m in re.finditer(r"Cannot find module ['\"](?P<pkg>[^'\"]+)['\"]", raw):
+                pkg = (m.group("pkg") or "").strip()
+                if not pkg:
+                    continue
+                if pkg.startswith(".") or pkg.startswith("/") or pkg.startswith("\\"):
+                    continue
+                if pkg in missing_pkgs:
+                    continue
+                missing_pkgs.append(pkg)
+                if len(missing_pkgs) >= 6:
+                    break
+
+            pkg_path = self.repo_root / workdir / "package.json"
+            if missing_pkgs and pkg_path.exists():
+                try:
+                    pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+                    deps = dict(pkg.get("dependencies") or {})
+                    dev = dict(pkg.get("devDependencies") or {})
+                    missing = [p for p in missing_pkgs if p not in deps and p not in dev]
+                except Exception:
+                    missing = missing_pkgs
+                if missing:
+                    doctor_findings.append(
+                        f"Node 依赖缺失：{', '.join(missing[:6])} 不在 {(workdir / 'package.json').as_posix()} 的 dependencies/devDependencies 中。"
+                    )
+                    try:
+                        rr = self.toolbox.read_file(
+                            agent_id="router", path=(workdir / "package.json").as_posix(), start_line=1, end_line=140
+                        )
+                        if rr.pointer:
+                            doctor_ptrs.append(rr.pointer)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Doctor: Python cannot import name -> point to the module file.
+        try:
+            # Example: cannot import name 'MockParser' from 'src.parsers.mock_parser'
+            m = re.search(r"cannot import name ['\"](?P<sym>[^'\"]+)['\"] from ['\"](?P<mod>[^'\"]+)['\"]", raw)
+            if m:
+                sym = (m.group("sym") or "").strip()
+                mod = (m.group("mod") or "").strip()
+                if sym and mod:
+                    doctor_findings.append(f"Python 导入失败：从 {mod} 导入 {sym} 失败；检查该模块是否导出该符号，或修正 import。")
+                    rel = mod.replace(".", "/").strip("/")
+                    candidates = [f"{rel}.py", f"{rel}/__init__.py"]
+                    for c in candidates:
+                        abs_path = self.repo_root / c
+                        if not abs_path.exists():
+                            continue
+                        try:
+                            rr = self.toolbox.read_file(agent_id="router", path=c, start_line=1, end_line=220)
+                            if rr.pointer:
+                                doctor_ptrs.append(rr.pointer)
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
+        total_ts = sum(len(v) for v in ts_by_file.values())
+        total_py = sum(len(v) for v in pytest_by_file.values())
+        summary = ""
+        if total_ts:
+            summary = f"TypeScript 编译错误：{total_ts} 条（{len(ts_by_file)} 个文件）"
+        elif total_py:
+            summary = f"Pytest 错误：{total_py} 条（{len(pytest_by_file)} 个文件）"
+        elif signals:
+            summary = signals[0][:160]
+        else:
+            summary = "测试/构建失败（未能提取更多错误信号）"
+
+        pointers: list[str] = []
+        for p in [failed.stdout, failed.stderr, failed.meta]:
+            s = str(p or "").strip()
+            if s and s not in pointers:
+                pointers.append(s)
+        for p in doctor_ptrs:
+            if p and p not in pointers:
+                pointers.append(p)
+
+        harvest: dict[str, Any] = {
+            "summary": summary,
+            "failed_command": failed_cmd,
+            "workdir": workdir.as_posix(),
+            "signals": signals[:60],
+            "ts_by_file": ts_by_file,
+            "pytest_by_file": pytest_by_file,
+            "doctor_findings": doctor_findings[:10],
+            "pointers": pointers[:24],
+        }
+        ptr = self.artifacts.put_json(harvest, suffix=".harvest.json", kind="harvest").to_pointer()
+        return harvest, ptr
+
+    def _format_harvest_for_prompt(self, *, harvest: dict[str, Any], pointer: Optional[str]) -> str:
+        if not pointer or not harvest:
+            return ""
+
+        lines: list[str] = []
+        lines.append("FailureHarvest（扩大采样：从失败命令输出中一次提取更多错误信号，便于批量修复；事实以 pointers 展开为准）：")
+        lines.append(f"FailureHarvestPointer: {pointer}")
+        summary = str(harvest.get("summary") or "").strip()
+        if summary:
+            lines.append(f"Summary: {summary[:200]}")
+        cmd = str(harvest.get("failed_command") or "").strip()
+        if cmd:
+            lines.append(f"FailedCommand: {cmd[:240]}")
+
+        findings = [str(x).strip() for x in (harvest.get("doctor_findings") or []) if str(x).strip()]
+        if findings:
+            lines.append("DoctorFindings:")
+            for f in findings[:6]:
+                lines.append(f"- {f[:220]}")
+
+        by_file = harvest.get("ts_by_file") or {}
+        if isinstance(by_file, dict) and by_file:
+            lines.append("TS Errors (by file, top):")
+            shown = 0
+            for k, v in list(by_file.items())[:4]:
+                lines.append(f"- {str(k)[:180]}")
+                for it in list(v or [])[:3]:
+                    lines.append(f"  - {str(it)[:220]}")
+                shown += 1
+                if shown >= 4:
+                    break
+
+        py_by_file = harvest.get("pytest_by_file") or {}
+        if isinstance(py_by_file, dict) and py_by_file:
+            lines.append("Pytest (by file, top):")
+            shown = 0
+            for k, v in list(py_by_file.items())[:4]:
+                lines.append(f"- {str(k)[:180]}")
+                for it in list(v or [])[:3]:
+                    lines.append(f"  - {str(it)[:220]}")
+                shown += 1
+                if shown >= 4:
+                    break
+
+        return "\n".join(lines).strip()
 
     def _fix_loop_autohint_for_tests(self, *, report: packs.TestReport, blocker_text: str) -> str:
         """
@@ -3854,6 +4113,7 @@ class Orchestrator:
             )
             loop = 0
             fix_history: list[str] = []
+            harvest_cache: dict[str, tuple[dict[str, Any], str]] = {}
             while loop < max_loops and ((not report.passed) or review_failed or security_failed or compliance_failed or perf_failed):
                 loop += 1
                 if not report.passed:
@@ -3896,7 +4156,33 @@ class Orchestrator:
                     lines = [str(n).strip() for n in (blockers + notes) if str(n).strip()]
                     blocker_text = "\n".join(lines[:8]) or "Performance blocked"
 
-                extracted = self._extract_error_signals(blocker_text)
+                harvest: Optional[dict[str, Any]] = None
+                harvest_ptr: Optional[str] = None
+                harvest_text: str = ""
+                if blocker_source == "tests" and (not mock_mode):
+                    try:
+                        sig_cmd = self._failed_command_from_report(report)
+                        sig_blocker = str((report.blockers or [""])[0] or "").strip()
+                        sig = (sig_cmd + "|" + sig_blocker)[:320]
+                    except Exception:
+                        sig = ""
+
+                    if sig:
+                        if sig not in harvest_cache:
+                            try:
+                                h, h_ptr = self._build_test_failure_harvest(report=report, blocker_text=blocker_text)
+                                if h_ptr:
+                                    harvest_cache[sig] = (h, h_ptr)
+                            except Exception:
+                                pass
+                        if sig in harvest_cache:
+                            harvest, harvest_ptr = harvest_cache[sig]
+                            harvest_text = self._format_harvest_for_prompt(harvest=harvest, pointer=harvest_ptr)
+
+                if harvest and isinstance(harvest.get("signals"), list) and list(harvest.get("signals") or []):
+                    extracted = [str(x).strip() for x in list(harvest.get("signals") or []) if str(x).strip()]
+                else:
+                    extracted = self._extract_error_signals(blocker_text, limit=25)
                 sim_router = self._format_lessons_for_prompt(
                     self._similar_lessons_for_query(agent_id="router", query=blocker_text, limit=3)
                 )
@@ -3915,7 +4201,7 @@ class Orchestrator:
                                 type="INCIDENT_CREATED",
                                 summary=f"Incident: {incident.summary}",
                                 branch_id=self.branch_id,
-                                pointers=[incident_ptr],
+                                pointers=[p for p in [incident_ptr, harvest_ptr] if p],
                                 meta={
                                     "source": incident.source,
                                     "category": incident.category,
@@ -3933,7 +4219,7 @@ class Orchestrator:
                             pinned: list[str] = []
                             pinned.extend([str(x).strip() for x in (incident.diagnosis or [])[:2] if str(x).strip()])
                             pinned.extend([str(x).strip() for x in (incident.next_steps or [])[:2] if str(x).strip()])
-                            ptrs = [p for p in [incident_ptr] if p] + list(incident.evidence_pointers or [])[:8]
+                            ptrs = [p for p in [incident_ptr, harvest_ptr] if p] + list(incident.evidence_pointers or [])[:8]
                             self._append_agent_memory(agent_id="router", kind="incident", summary=incident.summary, pinned=pinned, pointers=ptrs)
                         except Exception:
                             pass
@@ -3989,8 +4275,10 @@ class Orchestrator:
                         )
                         if extracted:
                             triage_user = f"{triage_user}\n\nExtractedErrors（同一失败命令的同类错误，建议一次修完）：\n" + "\n".join(
-                                f"- {x}" for x in extracted[:12]
+                                f"- {x}" for x in extracted[:20]
                             )
+                        if harvest_text:
+                            triage_user = f"{triage_user}\n\n{harvest_text}"
                         if sim_router:
                             triage_user = f"{triage_user}\n\n{sim_router}"
                         if ctx_excerpts:
@@ -4023,7 +4311,7 @@ class Orchestrator:
                                 type="STATE_TRANSITION",
                                 summary=f"Fix-loop {loop}: triage ops_engineer",
                                 branch_id=self.branch_id,
-                                pointers=[fix_plan_ptr],
+                                pointers=[p for p in [fix_plan_ptr, harvest_ptr] if p],
                                 meta={"loop": loop, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style},
                             ),
                             activated_agents=activated_agents,
@@ -4068,8 +4356,10 @@ class Orchestrator:
                 )
                 if extracted:
                     fix_user = f"{fix_user}\n\nExtractedErrors（尽量一次修完同一失败命令中的这些问题）：\n" + "\n".join(
-                        f"- {x}" for x in extracted[:12]
+                        f"- {x}" for x in extracted[:20]
                     )
+                if harvest_text:
+                    fix_user = f"{fix_user}\n\n{harvest_text}"
                 if sim_router:
                     fix_user = f"{fix_user}\n\n{sim_router}"
                 sim_agent = self._format_lessons_for_prompt(
@@ -4254,7 +4544,10 @@ class Orchestrator:
                 qa_commands_focus = qa_commands_full
                 if blocker_source == "tests":
                     try:
-                        focus = self._focus_commands_for_test_failure(report=report, blocker_text=blocker_text)
+                        focus_text = blocker_text
+                        if extracted:
+                            focus_text = focus_text + "\n\nExtractedErrors:\n" + "\n".join(extracted[:30])
+                        focus = self._focus_commands_for_test_failure(report=report, blocker_text=focus_text)
                         if focus:
                             qa_commands_focus = focus
                     except Exception:
