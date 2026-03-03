@@ -5,6 +5,8 @@ import os
 import importlib.util
 import re
 import difflib
+import platform
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +70,59 @@ class Orchestrator:
         if ledger_path(self.repo_root, branch).exists():
             return branch
         return "main"
+
+    def _tooling_probe(self) -> tuple[Optional[str], str, list[str], list[str]]:
+        """
+        Probe local tool availability (PATH detection) so upstream agents don't choose
+        architectures that require missing global CLIs (e.g. hugo, docker).
+
+        Returns: (artifact_pointer, summary, available, missing)
+        """
+        bins = [
+            "git",
+            "python",
+            "pip",
+            "node",
+            "npm",
+            "pnpm",
+            "yarn",
+            "hugo",
+            "docker",
+            "psql",
+            "sqlite3",
+        ]
+        found: dict[str, str] = {}
+        for b in bins:
+            try:
+                p = shutil.which(b) or ""
+            except Exception:
+                p = ""
+            found[b] = p
+
+        available = [b for b in bins if found.get(b)]
+        missing = [b for b in bins if not found.get(b)]
+        summary = f"available={', '.join(available[:8]) or 'none'}; missing={', '.join(missing[:8]) or 'none'}"
+
+        ptr: Optional[str] = None
+        try:
+            ptr = (
+                self.artifacts.put_json(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "platform": platform.platform(),
+                        "bins": bins,
+                        "found": found,
+                        "available": available,
+                        "missing": missing,
+                    },
+                    suffix=".tooling.json",
+                    kind="tooling_probe",
+                ).to_pointer()
+            )
+        except Exception:
+            ptr = None
+
+        return ptr, summary, available, missing
 
     def _compute_fix_loop_max_loops(
         self,
@@ -2054,6 +2109,20 @@ class Orchestrator:
                                 blockers=[],
                             )
 
+        # 1c-ext) Missing external CLI (non-npm). Example: `hugo` not installed.
+        # In this case, do NOT keep iterating in fix-loop trying random installs;
+        # pivot the implementation to avoid requiring a global binary.
+        if missing_bin and missing_bin.upper() != "NODE_ENV" and missing_bin.lower() not in {k.lower() for k in bin_to_pkg.keys()}:
+            b = missing_bin.strip()
+            if b and len(b) <= 40:
+                return (
+                    f"检测到失败命令依赖缺失的外部 CLI：`{b}`（当前环境 PATH 未提供该命令）。\n"
+                    "- 不要让用户手动装全局 CLI 作为前置条件；优先把项目改成不依赖该 CLI 的方案。\n"
+                    "- 如果这是网站/前端项目：优先使用 Vite/React + npm scripts（依赖写入 package.json，使用本地 node_modules/.bin）。\n"
+                    "- 如果是静态站点：可先用纯 HTML/CSS/JS（或用现有 node 工具链）实现最小可用，再迭代。\n"
+                    "- 同步更新 README：写清楚 `npm install` / `npm run dev` / `npm test` 的可复现步骤。"
+                )
+
         # 1d) Node/Windows: env var prefix in npm scripts (e.g. NODE_ENV=production) breaks on cmd.exe.
         # Fix by adding cross-env and rewriting the failing script.
         if missing_bin and missing_bin.upper() == "NODE_ENV":
@@ -3470,6 +3539,36 @@ class Orchestrator:
             activated_agents=activated_agents,
         )
 
+        # Tooling probe (PATH detection): prevent agents from choosing architectures that
+        # require missing global CLIs. This is especially important for "create a website"
+        # tasks where a model might pick e.g. Hugo by default.
+        tooling_ptr, tooling_summary, tooling_available, tooling_missing = self._tooling_probe()
+        if tooling_ptr:
+            try:
+                ctx.log_pointers.append(tooling_ptr)
+            except Exception:
+                pass
+        if tooling_missing:
+            missing_txt = ", ".join(tooling_missing[:8])
+            try:
+                ctx.constraints.append(
+                    f"ToolingProbe：本机 PATH 未检测到这些命令：{missing_txt}。不要选择依赖这些全局 CLI 的技术栈；优先使用可通过 npm/pip 本地依赖落地的方案（详见 {tooling_ptr or 'tooling probe'}）。"
+                )
+            except Exception:
+                pass
+        if tooling_ptr:
+            self._append_guarded(
+                event=new_event(
+                    agent="router",
+                    type="ENV_PROBED",
+                    summary=f"Tooling probe: {tooling_summary}",
+                    branch_id=self.branch_id,
+                    pointers=[tooling_ptr],
+                    meta={"route_level": route_level, "style": resolved_style, "resume_from": resume_from},
+                ),
+                activated_agents=activated_agents,
+            )
+
         req: packs.RequirementPack | None = None
         req_ptr: Optional[str] = None
         usecases: Optional[packs.UseCasePack] = None
@@ -3886,6 +3985,8 @@ class Orchestrator:
                 "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                 "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
                 "- Do not import new npm packages unless you ALSO add them to the correct `package.json` (dependencies/devDependencies) in writes.\n"
+                "- Do not rely on globally installed CLIs (e.g. hugo/rails/nest/next) unless the ToolingProbe indicates they are present on PATH; prefer writing scaffolding files directly.\n"
+                "- Avoid `npx`-based scaffolding (network-dependent). If you must, document it explicitly in README and provide an offline-friendly fallback.\n"
                 "- Do not do large refactors; prefer the smallest coherent change set.\n"
                 "- If you change exports/imports, ensure all references stay consistent.\n"
                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
