@@ -101,7 +101,7 @@ class Orchestrator:
             # escalate from smoke (usually build-only) to full verification (lint/test).
             max_loops = max_loops + 2
 
-        return max(1, min(max_loops, 12))
+        return max(1, min(max_loops, 16))
 
     def _agent(self, agent_id: str):
         cls = AGENT_REGISTRY.get(agent_id)
@@ -920,6 +920,23 @@ class Orchestrator:
 
         return out[:limit]
 
+    def _failure_signature(self, *, report: packs.TestReport, extracted: list[str], blocker_text: str) -> str:
+        """
+        A short, stable signature for "did we make progress?" detection.
+        """
+
+        cmd = self._failed_command_from_report(report)
+        parts: list[str] = []
+        if cmd:
+            parts.append("cmd:" + " ".join(cmd.strip().split())[:220].lower())
+        sigs = extracted or self._extract_error_signals(blocker_text, limit=10)
+        for s in [str(x or "") for x in sigs[:10]]:
+            s2 = " ".join(s.strip().split()).lower()
+            if not s2:
+                continue
+            parts.append(s2[:220])
+        return "|".join(parts)[:1200]
+
     def _focus_commands_for_test_failure(self, *, report: packs.TestReport, blocker_text: str) -> List[str]:
         """
         Build a minimal verification command list for fix-loop.
@@ -1001,8 +1018,10 @@ class Orchestrator:
             return ""
 
         workdir = self._shell_cd_dir(failed.command or "")
-        stdout_text = self._artifact_tail_text(failed.stdout, max_bytes=16000) if failed.stdout else ""
-        stderr_text = self._artifact_tail_text(failed.stderr, max_bytes=16000) if failed.stderr else ""
+        # Use a head+tail peek so we can see early "ERROR ..." lines (pytest) while also
+        # retaining tail summaries; this improves excerpt grounding for batch fixes.
+        stdout_text = self._artifact_peek_text(failed.stdout, head_bytes=40000, tail_bytes=40000) if failed.stdout else ""
+        stderr_text = self._artifact_peek_text(failed.stderr, head_bytes=40000, tail_bytes=40000) if failed.stderr else ""
         text = (stdout_text + "\n" + stderr_text).strip()
 
         out: list[str] = []
@@ -1066,6 +1085,72 @@ class Orchestrator:
                 error_added += 1
             if sum(len(x) for x in out) > max_chars:
                 break
+
+        # Python/pytest: include the failing test module and import target modules when obvious.
+        try:
+            lower = text.lower()
+            is_pytest = "pytest" in str(failed.command or "").lower()
+            is_python = is_pytest or ("importerror" in lower) or ("modulenotfounderror" in lower) or ("cannot import name" in lower)
+        except Exception:
+            is_python = False
+
+        if is_python:
+            # ImportError while importing test module 'tests/xxx.py'
+            try:
+                m = re.search(r"importing test module ['\"](?P<path>tests[/\\].+?\.py)['\"]", text, flags=re.IGNORECASE)
+                if m:
+                    p = (m.group("path") or "").replace("\\", "/").strip()
+                    if p:
+                        add_excerpt(Path(p), start=1, end=220)
+            except Exception:
+                pass
+
+            # ERROR tests/xxx.py lines
+            try:
+                for m in re.finditer(r"^ERROR\s+(?P<path>tests[/\\].+?\.py)\s*$", text, flags=re.MULTILINE):
+                    p = (m.group("path") or "").replace("\\", "/").strip()
+                    if p:
+                        add_excerpt(Path(p), start=1, end=220)
+                    if sum(len(x) for x in out) > max_chars:
+                        break
+            except Exception:
+                pass
+
+            # cannot import name 'X' from 'pkg.mod'
+            try:
+                m = re.search(
+                    r"cannot import name ['\"](?P<sym>[^'\"]+)['\"] from ['\"](?P<mod>[^'\"]+)['\"]",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if m:
+                    mod = (m.group("mod") or "").strip()
+                    rel = mod.replace(".", "/").strip("/")
+                    for c in [f"{rel}.py", f"{rel}/__init__.py"]:
+                        if (self.repo_root / c).exists():
+                            add_excerpt(Path(c), start=1, end=240)
+                    # also include parent package __init__.py when present
+                    parts = rel.split("/")
+                    if len(parts) >= 2:
+                        parent = "/".join(parts[:-1])
+                        p_init = f"{parent}/__init__.py"
+                        if (self.repo_root / p_init).exists():
+                            add_excerpt(Path(p_init), start=1, end=220)
+            except Exception:
+                pass
+
+            # ModuleNotFoundError: No module named 'x.y'
+            try:
+                m = re.search(r"No module named ['\"](?P<mod>[^'\"]+)['\"]", text, flags=re.IGNORECASE)
+                if m:
+                    mod = (m.group("mod") or "").strip()
+                    if mod and not mod.startswith("."):
+                        rel = mod.replace(".", "/").strip("/")
+                        for c in [f"{rel}.py", f"{rel}/__init__.py"]:
+                            if (self.repo_root / c).exists():
+                                add_excerpt(Path(c), start=1, end=240)
+            except Exception:
+                pass
 
         blob = "\n\n".join(out).strip()
         if len(blob) > max_chars:
@@ -4114,6 +4199,8 @@ class Orchestrator:
             loop = 0
             fix_history: list[str] = []
             harvest_cache: dict[str, tuple[dict[str, Any], str]] = {}
+            sig_last: str = ""
+            sig_repeat: int = 0
             while loop < max_loops and ((not report.passed) or review_failed or security_failed or compliance_failed or perf_failed):
                 loop += 1
                 if not report.passed:
@@ -4183,6 +4270,57 @@ class Orchestrator:
                     extracted = [str(x).strip() for x in list(harvest.get("signals") or []) if str(x).strip()]
                 else:
                     extracted = self._extract_error_signals(blocker_text, limit=25)
+
+                # If we have a large batch of issues, allow a small extra fix-loop budget to
+                # avoid "hit the cap then reset" patterns, while keeping a hard bound.
+                try:
+                    if blocker_source == "tests" and len(extracted) >= 30 and max_loops < 16:
+                        max_loops = min(16, max_loops + 2)
+                except Exception:
+                    pass
+
+                sig_now = ""
+                try:
+                    sig_now = self._failure_signature(report=report, extracted=extracted[:12], blocker_text=blocker_text)
+                    if sig_now and sig_now == sig_last:
+                        sig_repeat += 1
+                    else:
+                        sig_repeat = 0
+                    sig_last = sig_now or sig_last
+                except Exception:
+                    sig_now = ""
+                stagnating = sig_repeat >= 1
+
+                stagnation_help: str = ""
+                stagnation_ptrs: list[str] = []
+                if stagnating and blocker_source == "tests" and (not mock_mode):
+                    # When we see the *same* failure signature twice, we likely aren't grounded enough.
+                    # Run a tiny deterministic probe (ripgrep) to give fix agents concrete anchors.
+                    try:
+                        m = re.search(
+                            r"cannot import name ['\"](?P<sym>[^'\"]+)['\"]",
+                            blocker_text or "",
+                            flags=re.IGNORECASE,
+                        )
+                        sym = (m.group("sym") or "").strip() if m else ""
+                        if sym and len(sym) <= 80 and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", sym):
+                            rr = self.toolbox.run_cmd(
+                                agent_id="router",
+                                cmd=["rg", "-n", "--max-count", "80", sym],
+                                cwd=self.repo_root,
+                                timeout_s=120,
+                            )
+                            stagnation_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
+                            out_text = self._artifact_head_text(rr.stdout, max_bytes=9000) if rr.stdout else ""
+                            if out_text.strip():
+                                stagnation_help = (
+                                    "StagnationProbe（重复失败签名：补充一次 ripgrep 结果用于定位符号/引用位置；事实以 pointers 展开为准）：\n"
+                                    f"Query: {sym}\n"
+                                    f"StdoutPointer: {rr.stdout}\n"
+                                    f"Excerpt:\n{out_text.strip()}"
+                                )
+                    except Exception:
+                        stagnation_help = ""
                 sim_router = self._format_lessons_for_prompt(
                     self._similar_lessons_for_query(agent_id="router", query=blocker_text, limit=3)
                 )
@@ -4240,6 +4378,9 @@ class Orchestrator:
                     fix_coder_id = "coder_backend"
                 if fix_coder_id == "integration_engineer" and integrator is None:
                     fix_coder_id = "coder_backend"
+                if stagnating and blocker_source == "tests" and integrator is not None and fix_coder_id != "integration_engineer":
+                    # When we're stuck, prefer an integrator to align modules/contracts/exports holistically.
+                    fix_coder_id = "integration_engineer"
                 activate_agent(fix_coder_id, reason="gate:fix_loop")
 
                 fix_coder = (
@@ -4279,6 +4420,14 @@ class Orchestrator:
                             )
                         if harvest_text:
                             triage_user = f"{triage_user}\n\n{harvest_text}"
+                        if stagnating:
+                            triage_user = (
+                                f"{triage_user}\n\nStagnationDetected: 连续两轮失败签名相同（loop={loop}）。"
+                                "需要更换思路：严格基于 pointers/RepoExcerpts 做定位，避免重复尝试。\n"
+                                f"FailureSignature: {sig_now[:380]}"
+                            )
+                        if stagnation_help:
+                            triage_user = f"{triage_user}\n\n{stagnation_help}"
                         if sim_router:
                             triage_user = f"{triage_user}\n\n{sim_router}"
                         if ctx_excerpts:
@@ -4360,6 +4509,14 @@ class Orchestrator:
                     )
                 if harvest_text:
                     fix_user = f"{fix_user}\n\n{harvest_text}"
+                if stagnating:
+                    fix_user = (
+                        f"{fix_user}\n\nStagnationDetected: 连续两轮失败签名相同（loop={loop}）。"
+                        "禁止重复尝试；必须打开 pointers/RepoExcerpts 定位根因并一次修完同类错误。\n"
+                        f"FailureSignature: {sig_now[:380]}"
+                    )
+                if stagnation_help:
+                    fix_user = f"{fix_user}\n\n{stagnation_help}"
                 if sim_router:
                     fix_user = f"{fix_user}\n\n{sim_router}"
                 sim_agent = self._format_lessons_for_prompt(

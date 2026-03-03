@@ -62,3 +62,50 @@ def test_repo_excerpts_include_db_ts_for_pool_errors(tmp_path: Path, monkeypatch
     blob = orch._repo_excerpts_for_test_failure(report)
     assert "backend/src/db.ts#L1-L200@sha256:" in blob
     assert "backend/src/routes/posts.ts#L1-L220@sha256:" in blob
+
+
+def test_repo_excerpts_include_pytest_import_targets(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "parsers").mkdir(parents=True, exist_ok=True)
+
+    (tmp_path / "tests" / "test_policy_engine.py").write_text(
+        "from src.parsers.mock_parser import parse_policy_text\n\ndef test_x():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "parsers" / "__init__.py").write_text("from .mock_parser import MockParser\n", encoding="utf-8")
+    (tmp_path / "src" / "parsers" / "mock_parser.py").write_text("class MockParser: ...\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    stdout_ptr = orch.artifacts.put_text(
+        "\n".join(
+            [
+                "==================================== ERRORS ====================================",
+                "ERROR tests/test_policy_engine.py",
+                "ImportError while importing test module 'tests/test_policy_engine.py'.",
+                "E   ImportError: cannot import name 'parse_policy_text' from 'src.parsers.mock_parser'",
+            ]
+        )
+        + "\n",
+        suffix=".stdout.txt",
+        kind="cmd",
+    ).to_pointer()
+    stderr_ptr = orch.artifacts.put_text("", suffix=".stderr.txt", kind="cmd").to_pointer()
+
+    cmd = "pytest -q"
+    report = packs.TestReport(
+        commands=[cmd],
+        results=[packs.TestResult(command=cmd, returncode=1, passed=False, stdout=stdout_ptr, stderr=stderr_ptr)],
+        passed=False,
+        blockers=[f"Command failed: {cmd}"],
+        pointers=[stdout_ptr, stderr_ptr],
+    )
+
+    blob = orch._repo_excerpts_for_test_failure(report)
+    assert "tests/test_policy_engine.py#L1-L220@sha256:" in blob
+    assert "src/parsers/mock_parser.py#L1-L240@sha256:" in blob
+    assert "src/parsers/__init__.py#L1-L220@sha256:" in blob
