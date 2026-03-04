@@ -15,6 +15,75 @@ class RequirementPack(BaseModel):
     constraints: List[str] = Field(default_factory=list)
 
 
+IntentPriority = Literal["must", "should", "could"]
+
+
+class IntentFeature(BaseModel):
+    id: str
+    title: str
+    description: str
+    priority: IntentPriority = "should"
+    acceptance: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "id" in out and not isinstance(out.get("id"), str):
+            try:
+                out["id"] = str(out.get("id"))
+            except Exception:
+                pass
+        if "title" not in out and isinstance(out.get("name"), str):
+            out["title"] = out.get("name")
+        if "description" not in out and isinstance(out.get("desc"), str):
+            out["description"] = out.get("desc")
+        if "priority" not in out and isinstance(out.get("prio"), str):
+            out["priority"] = out.get("prio")
+        return out
+
+
+class IntentExpansionPack(BaseModel):
+    """
+    Expand user intent into a richer, delivery-oriented backlog without requiring extra user prompts.
+
+    Important: this is a proposal/backlog. The workflow still must choose a feasible subset and
+    ground claims with pointers during execution.
+    """
+
+    summary: str
+    route_level: RouteLevel
+    assumptions: List[str] = Field(default_factory=list)
+    defaults: Dict[str, Any] = Field(default_factory=dict)
+    feature_backlog: List[IntentFeature] = Field(default_factory=list)
+    open_questions: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    non_goals: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "route_level" not in out:
+            for k in ("route", "level", "routeLevel"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["route_level"] = v.strip()
+                    break
+        if "feature_backlog" not in out:
+            for k in ("features", "backlog", "items"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["feature_backlog"] = v
+                    break
+        return out
+
+
 class PlanTask(BaseModel):
     id: str
     title: str

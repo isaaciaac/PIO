@@ -227,6 +227,17 @@ def default_config() -> VibeConfig:
             ledger_write_types=["REQ_CREATED", "REQ_UPDATED", "AC_DEFINED"],
             tools_allowed=["read_file", "search"],
         ),
+        "intent_expander": agent(
+            "intent_expander",
+            enabled=True,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Expand user intent into a richer, delivery-oriented backlog (level-aware)",
+            capabilities=["intent", "product", "scope"],
+            io_schema="vibe.schemas.packs.IntentExpansionPack",
+            ledger_write_types=["INTENT_EXPANDED"],
+            tools_allowed=["read_file", "search", "scan_repo"],
+        ),
         "requirements_analyst": agent(
             "requirements_analyst",
             enabled=False,
@@ -497,10 +508,11 @@ def default_routes(agent_ids: List[str]) -> RoutesConfig:
         levels={
             "L0": RouteProfile(agents=["router", "coder_backend", "qa"]),
             # L1/L2 include env_engineer for on-demand environment probing (invoked only when needed).
-            "L1": RouteProfile(agents=["pm", "router", "coder_backend", "qa", "env_engineer"]),
+            "L1": RouteProfile(agents=["pm", "intent_expander", "router", "coder_backend", "qa", "env_engineer"]),
             "L2": RouteProfile(
                 agents=[
                     "pm",
+                    "intent_expander",
                     "requirements_analyst",
                     "architect",
                     "api_confirm",
@@ -513,6 +525,7 @@ def default_routes(agent_ids: List[str]) -> RoutesConfig:
             "L3": RouteProfile(
                 agents=[
                     "pm",
+                    "intent_expander",
                     "requirements_analyst",
                     "architect",
                     "api_confirm",
@@ -585,6 +598,7 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
     default_caps: dict[str, list[str]] = {
         "router": ["orchestration", "routing", "triage"],
         "pm": ["requirements", "acceptance", "product"],
+        "intent_expander": ["intent", "product", "scope"],
         "requirements_analyst": ["requirements", "usecases"],
         "architect": ["architecture", "adr"],
         "api_confirm": ["api", "contract"],
@@ -611,6 +625,12 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
             a.capabilities = list(caps)
 
     # Add new agents introduced in later versions (non-breaking; disabled by default).
+    if "intent_expander" not in cfg.agents:
+        try:
+            cfg.agents["intent_expander"] = default_config().agents["intent_expander"]
+        except Exception:
+            pass
+
     if "specialist" not in cfg.agents:
         try:
             cfg.agents["specialist"] = default_config().agents["specialist"]
@@ -622,6 +642,67 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
             cfg.agents["ops_engineer"] = default_config().agents["ops_engineer"]
         except Exception:
             pass
+
+    # Route profiles: older configs won't have intent_expander in L1/L2/L3; add it only when
+    # the profile matches historical defaults to avoid surprising custom setups.
+    if "intent_expander" in cfg.agents and (cfg.routes.levels or {}):
+        l1 = cfg.routes.levels.get("L1")
+        if l1 and (l1.agents or []) == ["pm", "router", "coder_backend", "qa", "env_engineer"]:
+            l1.agents = ["pm", "intent_expander", "router", "coder_backend", "qa", "env_engineer"]
+
+        l2 = cfg.routes.levels.get("L2")
+        if l2 and (l2.agents or []) == [
+            "pm",
+            "requirements_analyst",
+            "architect",
+            "api_confirm",
+            "coder_backend",
+            "code_reviewer",
+            "qa",
+            "env_engineer",
+        ]:
+            l2.agents = [
+                "pm",
+                "intent_expander",
+                "requirements_analyst",
+                "architect",
+                "api_confirm",
+                "coder_backend",
+                "code_reviewer",
+                "qa",
+                "env_engineer",
+            ]
+
+        l3 = cfg.routes.levels.get("L3")
+        if l3 and (l3.agents or []) == [
+            "pm",
+            "requirements_analyst",
+            "architect",
+            "api_confirm",
+            "coder_backend",
+            "code_reviewer",
+            "qa",
+            "env_engineer",
+            "devops",
+            "security",
+            "doc_writer",
+            "release_manager",
+        ]:
+            l3.agents = [
+                "pm",
+                "intent_expander",
+                "requirements_analyst",
+                "architect",
+                "api_confirm",
+                "coder_backend",
+                "code_reviewer",
+                "qa",
+                "env_engineer",
+                "devops",
+                "security",
+                "doc_writer",
+                "release_manager",
+            ]
 
     # Governance/ownership: older configs won't have it; add safe defaults when missing.
     try:

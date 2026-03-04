@@ -34,6 +34,13 @@ class PMAgent(BaseAgent):
     default_model = "deepseek-reasoner"
 
 
+class IntentExpanderAgent(BaseAgent):
+    agent_id = "intent_expander"
+    output_schema = packs.IntentExpansionPack
+    default_provider = "deepseek"
+    default_model = "deepseek-reasoner"
+
+
 class RequirementsAnalystAgent(BaseAgent):
     agent_id = "requirements_analyst"
     output_schema = packs.UseCasePack
@@ -181,6 +188,7 @@ AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
         LogCompressorAgent,
         ResearcherAgent,
         PMAgent,
+        IntentExpanderAgent,
         RequirementsAnalystAgent,
         UXWriterAgent,
         ArchitectAgent,

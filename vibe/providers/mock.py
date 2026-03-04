@@ -32,6 +32,40 @@ class MockProvider:
                 non_goals=["mock: no real code changes"],
                 constraints=["VIBE_MOCK_MODE=1"],
             )
+        elif schema is schemas.IntentExpansionPack:
+            # Try to infer route level from the prompt (best-effort).
+            route_level = "L1"
+            for lv in ["L4", "L3", "L2", "L1", "L0"]:
+                if lv in last_user:
+                    route_level = lv
+                    break
+            out = schemas.IntentExpansionPack(
+                summary="mock: intent expanded into a minimal backlog",
+                route_level=route_level,  # type: ignore[arg-type]
+                assumptions=["Assume: 使用 mock provider；仅验证工作流闭环，不生成真实业务功能。"],
+                defaults={"data_source": "mock", "delivery": "minimal"},
+                feature_backlog=[
+                    schemas.IntentFeature(
+                        id="f1",
+                        title="项目可运行骨架",
+                        description="确保有最小可运行入口、README、以及最小验证命令。",
+                        priority="must",
+                        acceptance=["README 有安装/启动/验证步骤"],
+                        tags=["scaffold", "delivery"],
+                    ),
+                    schemas.IntentFeature(
+                        id="f2",
+                        title="最小功能闭环",
+                        description="根据任务描述做一个可演示的最小闭环（mock 数据即可）。",
+                        priority="should",
+                        acceptance=["至少有一个端到端可演示路径"],
+                        tags=["mvp"],
+                    ),
+                ],
+                open_questions=[],
+                constraints=["VIBE_MOCK_MODE=1"],
+                non_goals=["mock: 不实现真实外部数据/复杂架构"],
+            )
         elif schema is schemas.ChatReply:
             client = (os.getenv("VIBE_CLIENT") or "").strip().lower()
             vscode_env = bool(os.getenv("VSCODE_PID") or (os.getenv("TERM_PROGRAM") or "").strip().lower() == "vscode")
