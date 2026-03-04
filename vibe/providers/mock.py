@@ -17,8 +17,16 @@ T = TypeVar("T", bound=BaseModel)
 class MockProvider:
     provider_id: str = "mock"
 
-    def chat_json(self, *, model: str, messages: List[Dict[str, str]], schema: Type[T], temperature: float = 0.0) -> tuple[T, ProviderResult]:
-        _ = (model, temperature)
+    def chat_json(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        schema: Type[T],
+        temperature: float = 0.0,
+        extra_body: Optional[Dict[str, Any]] = None,
+    ) -> tuple[T, ProviderResult]:
+        _ = (model, temperature, extra_body)
         last_user = ""
         for m in reversed(messages):
             if m.get("role") == "user":

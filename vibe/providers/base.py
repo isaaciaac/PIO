@@ -450,10 +450,21 @@ class OpenAICompatProvider:
     def normalize_messages(self, messages: List[Dict[str, str]], *, model: str) -> List[Dict[str, str]]:
         return messages
 
-    def chat_json(self, *, model: str, messages: List[Dict[str, str]], schema: Type[T], temperature: float = 0.0) -> tuple[T, ProviderResult]:
+    def chat_json(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        schema: Type[T],
+        temperature: float = 0.0,
+        extra_body: Optional[Dict[str, Any]] = None,
+    ) -> tuple[T, ProviderResult]:
         client = self._client()
         msgs = self.normalize_messages(messages, model=model)
-        resp = client.chat.completions.create(model=model, messages=msgs, temperature=temperature)
+        create_kwargs: Dict[str, Any] = {}
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
+        resp = client.chat.completions.create(model=model, messages=msgs, temperature=temperature, **create_kwargs)
         content = resp.choices[0].message.content or ""
         try:
             parsed = _parse_json_to_schema(content, schema=schema)
@@ -475,7 +486,7 @@ class OpenAICompatProvider:
                 [{"role": "system", "content": repair_system}, {"role": "user", "content": repair_user}],
                 model=model,
             )
-            repair_resp = client.chat.completions.create(model=model, messages=repair_msgs, temperature=0.0)
+            repair_resp = client.chat.completions.create(model=model, messages=repair_msgs, temperature=0.0, **create_kwargs)
             repaired = repair_resp.choices[0].message.content or ""
             parsed = _parse_json_to_schema(repaired, schema=schema)
             content = repaired

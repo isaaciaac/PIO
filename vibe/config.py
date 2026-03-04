@@ -28,6 +28,7 @@ class AgentConfig(BaseModel):
     enabled: bool = False
     provider: str
     model: str
+    web_search: bool = False
     purpose: str
     capabilities: List[str] = Field(default_factory=list)
     io_schema: str

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
@@ -58,4 +58,25 @@ class BaseAgent:
             msgs.append({"role": "user", "content": user})
         else:
             msgs = messages
-        return self.provider.chat_json(model=self.config.model, messages=msgs, schema=schema, temperature=temperature)
+
+        extra_body: Optional[Dict[str, Any]] = None
+        try:
+            if (
+                (not mock_mode_enabled())
+                and bool(getattr(self.config, "web_search", False))
+                and str(getattr(self.config, "provider", "") or "").strip().lower() == "dashscope"
+            ):
+                extra_body = {"enable_search": True}
+        except Exception:
+            extra_body = None
+
+        kwargs: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": msgs,
+            "schema": schema,
+            "temperature": temperature,
+        }
+        if extra_body is not None:
+            kwargs["extra_body"] = extra_body
+
+        return self.provider.chat_json(**kwargs)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import importlib.util
 import re
@@ -1089,6 +1090,210 @@ class Orchestrator:
 
         return findings
 
+    def _doctor_node_bin_shims(self, *, node_dir: Path, max_items: int = 8) -> list[dict[str, Any]]:
+        """
+        Windows-only: detect suspicious local CLI shims under node_modules/.bin.
+
+        Why: some toolchains create 0-byte `.exe` placeholder shims on Windows. If a repo
+        script directly spawns `node_modules/.bin/<tool>.exe`, Node may error with
+        `spawn UNKNOWN` (or similar). The safe pattern is to invoke the tool via npm
+        scripts (PATH shim) or prefer `<tool>.cmd` on Windows when spawning a path.
+        """
+        if os.name != "nt":
+            return []
+
+        bin_dir = (self.repo_root / node_dir / "node_modules" / ".bin").resolve()
+        if not bin_dir.exists() or not bin_dir.is_dir():
+            return []
+
+        items: list[dict[str, Any]] = []
+        try:
+            for exe in list(bin_dir.glob("*.exe"))[:240]:
+                try:
+                    if not exe.is_file():
+                        continue
+                    size = int(exe.stat().st_size)
+                except Exception:
+                    continue
+                if size != 0:
+                    continue
+
+                tool = exe.stem
+                cmd = bin_dir / f"{tool}.cmd"
+                ps1 = bin_dir / f"{tool}.ps1"
+                try:
+                    rel_exe = exe.relative_to(self.repo_root).as_posix()
+                except Exception:
+                    rel_exe = exe.as_posix()
+                items.append(
+                    {
+                        "tool": tool,
+                        "exe": rel_exe,
+                        "size": size,
+                        "cmd_exists": bool(cmd.exists()),
+                        "ps1_exists": bool(ps1.exists()),
+                    }
+                )
+                if len(items) >= max(1, int(max_items)):
+                    break
+        except Exception:
+            return []
+
+        if not items:
+            return []
+
+        tools = ", ".join([str(x.get("tool") or "").strip() for x in items if str(x.get("tool") or "").strip()][:6])
+        detail = (
+            "发现 0 字节 `.exe` shim：在 Windows 下，如果脚本直接执行 "
+            "`node_modules/.bin/<tool>.exe`，可能触发 `spawn UNKNOWN`/`ENOENT` 等错误。"
+            "建议：通过 `npm run <script>` 调用（让 PATH shim 生效），或在 spawn 时优先使用 `<tool>.cmd`，"
+            "并避免硬编码 `.exe` 路径。"
+        )
+        return [
+            {
+                "kind": "node_bin_zero_byte_exe",
+                "severity": "high",
+                "title": f"node_modules/.bin 存在 0 字节 .exe shim（Windows spawn 可能失败）：{tools}",
+                "detail": detail[:400],
+                "pointers": [],
+                "items": items,
+            }
+        ]
+
+    def _doctor_node_scripts_bin_usage(self, *, node_dir: Path, max_files: int = 14) -> list[dict[str, Any]]:
+        """
+        Detect repo scripts that directly reference `node_modules/.bin` (especially `.exe`),
+        which is a common cross-platform pitfall.
+        """
+        findings: list[dict[str, Any]] = []
+        roots: list[Path] = []
+        # Prefer scanning explicit scripts/ folders (avoid rglob'ing the entire repo).
+        for r in [self.repo_root / node_dir / "scripts", self.repo_root / "scripts"]:
+            if r.exists() and r.is_dir():
+                roots.append(r)
+
+        if not roots:
+            return findings
+
+        pat_bin = re.compile(r"node_modules[\\/]\.bin", flags=re.IGNORECASE)
+        pat_bin_exe = re.compile(r"node_modules[\\/]\.bin[\\/][A-Za-z0-9_.-]+\.exe\b", flags=re.IGNORECASE)
+
+        checked = 0
+        for root in roots[:3]:
+            try:
+                for p in root.rglob("*"):
+                    if checked >= max(1, int(max_files)):
+                        break
+                    if not p.is_file():
+                        continue
+                    if p.suffix.lower() not in {".js", ".cjs", ".mjs", ".ts"}:
+                        continue
+                    try:
+                        text = p.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if not text:
+                        continue
+                    if len(text) > 200_000:
+                        text = text[:200_000]
+                    m = pat_bin.search(text)
+                    if not m:
+                        continue
+                    checked += 1
+
+                    line = (text[: m.start()].count("\n") + 1) if m.start() >= 0 else 1
+                    try:
+                        rel_repo = p.relative_to(self.repo_root).as_posix()
+                    except Exception:
+                        rel_repo = p.as_posix()
+
+                    ptr: Optional[str] = None
+                    try:
+                        rr = self.toolbox.read_file(
+                            agent_id="router",
+                            path=rel_repo,
+                            start_line=max(1, line - 2),
+                            end_line=line + 3,
+                        )
+                        ptr = rr.pointer
+                    except Exception:
+                        ptr = None
+
+                    severity = "medium"
+                    title = f"脚本直接引用 node_modules/.bin：{rel_repo}"
+                    if pat_bin_exe.search(text):
+                        severity = "high"
+                        title = f"脚本直接引用 node_modules/.bin/*.exe（Windows 易踩坑）：{rel_repo}"
+                    findings.append(
+                        {
+                            "kind": "script_uses_node_modules_bin",
+                            "severity": severity,
+                            "title": title[:200],
+                            "detail": (
+                                "直接拼接 `.bin` 路径会绕过 npm 的跨平台 shim 机制（Windows 常用 `.cmd`），"
+                                "并可能选到不可执行占位文件。建议：用 `npm run` 调用，或在 Windows 上优先 `.cmd`，"
+                                "并对可执行文件做 size>0/exists 检查。"
+                            ),
+                            "pointers": [p for p in [ptr] if p],
+                        }
+                    )
+            except Exception:
+                continue
+
+        return findings
+
+    def _node_bin_health_report(self, *, node_dir: Path, max_items: int = 20) -> tuple[Optional[str], str]:
+        """
+        Build a small, pointer-backed report about node_modules/.bin health.
+
+        This is used when we suspect an environment/tooling issue (e.g. repeated `spawn UNKNOWN`).
+        """
+        bin_dir = (self.repo_root / node_dir / "node_modules" / ".bin").resolve()
+        if not bin_dir.exists() or not bin_dir.is_dir():
+            return None, ""
+
+        suspicious: list[dict[str, Any]] = []
+        try:
+            for p in list(bin_dir.iterdir())[:1200]:
+                if not p.is_file():
+                    continue
+                name = p.name
+                low = name.lower()
+                if not (low.endswith(".exe") or low.endswith(".cmd") or low.endswith(".ps1")):
+                    continue
+                try:
+                    size = int(p.stat().st_size)
+                except Exception:
+                    size = -1
+
+                # Most `.cmd` shims are tiny; only `.exe` with size==0 is a strong smell.
+                if low.endswith(".exe") and size == 0:
+                    tool = p.stem
+                    suspicious.append(
+                        {
+                            "tool": tool,
+                            "file": p.relative_to(self.repo_root).as_posix(),
+                            "size": size,
+                            "cmd_exists": bool((bin_dir / f"{tool}.cmd").exists()),
+                            "ps1_exists": bool((bin_dir / f"{tool}.ps1").exists()),
+                        }
+                    )
+                if len(suspicious) >= max(1, int(max_items)):
+                    break
+        except Exception:
+            suspicious = []
+
+        report = {
+            "version": 1,
+            "node_dir": node_dir.as_posix() if node_dir.as_posix() not in {"", "."} else ".",
+            "bin_dir": bin_dir.relative_to(self.repo_root).as_posix() if bin_dir.is_absolute() else str(bin_dir),
+            "suspicious": suspicious,
+        }
+        ptr = self.artifacts.put_json(report, suffix=".binhealth.json", kind="binhealth").to_pointer()
+        tools = ", ".join([str(x.get("tool") or "").strip() for x in suspicious if str(x.get("tool") or "").strip()][:6])
+        summary = f"zero_byte_exe={len(suspicious)}" + (f" ({tools})" if tools else "")
+        return ptr, summary
+
     def _doctor_preflight(self, *, max_findings: int = 6) -> tuple[Optional[str], str]:
         """
         Lightweight static preflight to reduce "QA discovers everything" churn.
@@ -1165,6 +1370,20 @@ class Orchestrator:
                         "pointers": ptrs[:4],
                     }
                 )
+                if len(findings) >= max_findings:
+                    break
+            if len(findings) >= max_findings:
+                break
+
+            # Windows/Node: suspicious local CLI shims and scripts that hardcode `.bin` paths.
+            for f in self._doctor_node_bin_shims(node_dir=node_dir)[: max(0, max_findings - len(findings))]:
+                findings.append(f)
+                if len(findings) >= max_findings:
+                    break
+            if len(findings) >= max_findings:
+                break
+            for f in self._doctor_node_scripts_bin_usage(node_dir=node_dir)[: max(0, max_findings - len(findings))]:
+                findings.append(f)
                 if len(findings) >= max_findings:
                     break
             if len(findings) >= max_findings:
@@ -1360,6 +1579,19 @@ class Orchestrator:
                 continue
             parts.append(s2[:220])
         return "|".join(parts)[:1200]
+
+    def _failure_fingerprint(self, *, signature: str) -> str:
+        """
+        A short fingerprint for de-duplicating repeated failures.
+
+        NOTE: fingerprint is derived from the (already normalized) failure signature; it is
+        stable across runs and safe to log in ledger meta.
+        """
+        s = (signature or "").strip()
+        if not s:
+            return ""
+        h = hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+        return f"fp_{h[:12]}"
 
     def _focus_commands_for_test_failure(self, *, report: packs.TestReport, blocker_text: str) -> List[str]:
         """
@@ -1812,6 +2044,44 @@ class Orchestrator:
         text = (blocker_text or "").strip()
         lower = text.lower()
 
+        # 0) Windows: Node spawn UNKNOWN is frequently caused by spawning `.bin/*.exe` directly.
+        if os.name == "nt" and ("spawn unknown" in lower or "syscall: 'spawn'" in lower):
+            lines: list[str] = []
+            lines.append("检测到 `spawn UNKNOWN`（Windows 常见环境/脚本问题）：")
+            lines.append("- 常见根因：脚本直接执行 `node_modules/.bin/<tool>.exe`，可能选到 0 字节占位 shim；或应执行 `<tool>.cmd`。")
+            lines.append("- 修复优先级：先让失败命令可稳定通过（build/lint/test），再改业务逻辑。")
+            lines.append("- 建议：通过 `npm run <script>` 调用工具（让 PATH shim 生效）；或在 Windows 上优先 `.cmd` 并跳过 size==0 的 `.exe`。")
+            return "\n".join(lines).strip()
+
+        # 1) Missing external CLI (non-npm). Pivot the implementation to avoid requiring a global binary.
+        try:
+            m = re.search(
+                r"'(?P<bin>[^']+)'\s+is\s+not\s+recognized\s+as\s+an\s+internal\s+or\s+external\s+command",
+                text,
+                flags=re.IGNORECASE,
+            )
+            missing_bin = (m.group("bin") or "").strip() if m else ""
+            if not missing_bin:
+                m = re.search(r"\bcommand\s+not\s+found:\s+(?P<bin>[A-Za-z0-9._-]+)\b", text, flags=re.IGNORECASE)
+                missing_bin = (m.group("bin") or "").strip() if m else ""
+            if not missing_bin:
+                m = re.search(r"\bspawn\s+(?P<bin>[A-Za-z0-9._-]+)\s+enoent\b", text, flags=re.IGNORECASE)
+                missing_bin = (m.group("bin") or "").strip() if m else ""
+        except Exception:
+            missing_bin = ""
+
+        known_local_bins = {"tsc", "typescript", "eslint", "jest", "vitest", "prettier"}
+        if missing_bin and missing_bin.upper() != "NODE_ENV" and missing_bin.lower() not in known_local_bins:
+            b = missing_bin.strip()
+            if b and len(b) <= 40:
+                return (
+                    f"检测到失败命令依赖缺失的外部 CLI：`{b}`（当前环境 PATH 未提供该命令）。\n"
+                    "- 不要把“让用户手动装全局 CLI”当作前置条件；优先把项目改成不依赖该 CLI 的方案。\n"
+                    "- 如果是网站/前端：优先使用 npm 工程骨架（Vite/React/Express 等），依赖写入 package.json。\n"
+                    "- 如果是静态站点：优先用纯 HTML/CSS/JS 或 Node 工具链实现 MVP，再迭代。\n"
+                    "- 同步更新 README：写清楚 `npm install` / `npm run dev` / `npm test` 的可复现步骤。"
+                )
+
         # Only attempt for TS/Node-ish errors.
         if not any(k in lower for k in ["tsc", "error ts", "typescript", "ts2349", "call signatures", "pool"]):
             return ""
@@ -2074,6 +2344,87 @@ class Orchestrator:
                 return (m.group("bin") or "").strip()
             return ""
 
+        # 0) Windows/Node: `spawn UNKNOWN` often comes from spawning `.bin/*.exe` shims directly.
+        # If we can see a `.cmd` wrapper for the same tool, prefer `.cmd` (and avoid 0-byte `.exe` placeholders).
+        if os.name == "nt":
+            spawn_unknown = re.search(
+                r"\bspawn\s+(?P<path>[^\r\n]+?)\s+UNKNOWN\b", text, flags=re.IGNORECASE
+            )
+            if spawn_unknown or "syscall: 'spawn'" in lower:
+                try:
+                    m = spawn_unknown or re.search(
+                        r"\bspawn\s+(?P<path>[^\r\n]+?)\s+UNKNOWN\b", text, flags=re.IGNORECASE
+                    )
+                    spath = (m.group("path") if m else "") or ""
+                    spath = spath.strip().strip('"').strip("'").strip()
+                    tool = Path(spath).stem if spath else ""
+                    if tool and len(tool) <= 60:
+                        candidates: list[tuple[Path, Path]] = []
+                        for base in [failed_node_dir, Path(".")]:
+                            candidates.append(
+                                (
+                                    (self.repo_root / base / "node_modules" / ".bin" / f"{tool}.exe").resolve(),
+                                    (self.repo_root / base / "node_modules" / ".bin" / f"{tool}.cmd").resolve(),
+                                )
+                            )
+                        exe_path: Optional[Path] = None
+                        cmd_path: Optional[Path] = None
+                        for ex, cm in candidates:
+                            if ex.exists() and cm.exists():
+                                exe_path, cmd_path = ex, cm
+                                break
+                        if exe_path and cmd_path:
+                            try:
+                                exe_size = int(exe_path.stat().st_size)
+                            except Exception:
+                                exe_size = -1
+                            # Only auto-fix when the `.exe` is clearly bogus (0 bytes), to avoid breaking legit native bins.
+                            if exe_size == 0:
+                                roots: list[Path] = []
+                                for r in [
+                                    self.repo_root / failed_node_dir / "scripts",
+                                    self.repo_root / "scripts",
+                                ]:
+                                    if r.exists() and r.is_dir():
+                                        roots.append(r)
+
+                                writes: list[packs.FileWrite] = []
+                                files_changed: list[str] = []
+                                pat = re.compile(rf"(?i)\b{re.escape(tool)}\.exe\b")
+                                for root in roots[:3]:
+                                    for p in list(root.rglob("*"))[:200]:
+                                        if not p.is_file():
+                                            continue
+                                        if p.suffix.lower() not in {".js", ".cjs", ".mjs", ".ts"}:
+                                            continue
+                                        try:
+                                            src = p.read_text(encoding="utf-8", errors="replace")
+                                        except Exception:
+                                            continue
+                                        if not pat.search(src):
+                                            continue
+                                        dst = pat.sub(f"{tool}.cmd", src)
+                                        if dst == src:
+                                            continue
+                                        rel = p.relative_to(self.repo_root).as_posix()
+                                        writes.append(packs.FileWrite(path=rel, content=dst))
+                                        files_changed.append(rel)
+                                        if len(writes) >= 6:
+                                            break
+                                    if len(writes) >= 6:
+                                        break
+
+                                if writes:
+                                    return packs.CodeChange(
+                                        kind="patch",
+                                        summary=f"auto-fix: avoid 0-byte `{tool}.exe` shim by using `{tool}.cmd` on Windows",
+                                        writes=writes,
+                                        files_changed=files_changed,
+                                        blockers=[],
+                                    )
+                except Exception:
+                    pass
+
         # 1) ESLint: missing config file
         if "eslint couldn't find a configuration file" in lower or "eslint could not find a configuration file" in lower:
             # If any config already exists, don't auto-create.
@@ -2262,13 +2613,8 @@ class Orchestrator:
         if missing_bin and missing_bin.upper() != "NODE_ENV" and missing_bin.lower() not in {k.lower() for k in bin_to_pkg.keys()}:
             b = missing_bin.strip()
             if b and len(b) <= 40:
-                return (
-                    f"检测到失败命令依赖缺失的外部 CLI：`{b}`（当前环境 PATH 未提供该命令）。\n"
-                    "- 不要让用户手动装全局 CLI 作为前置条件；优先把项目改成不依赖该 CLI 的方案。\n"
-                    "- 如果这是网站/前端项目：优先使用 Vite/React + npm scripts（依赖写入 package.json，使用本地 node_modules/.bin）。\n"
-                    "- 如果是静态站点：可先用纯 HTML/CSS/JS（或用现有 node 工具链）实现最小可用，再迭代。\n"
-                    "- 同步更新 README：写清楚 `npm install` / `npm run dev` / `npm test` 的可复现步骤。"
-                )
+                # No deterministic patch here; provide guidance via Incident/AutoHint instead.
+                return None
 
         # 1d) Node/Windows: env var prefix in npm scripts (e.g. NODE_ENV=production) breaks on cmd.exe.
         # Fix by adding cross-env and rewriting the failing script.
@@ -4255,6 +4601,7 @@ class Orchestrator:
                 "- If you add a Vite app, include `index.html` at that app root.\n"
                 "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
                 "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
                 "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n"
                 "\n"
                 "- Delivery-first: if the task implies \"real-time\"/\"price\"/\"live data\", implement a configurable real data source when feasible; "
@@ -4682,6 +5029,17 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
             report = self._run_tests(profile=qa_profile, commands=qa_commands)
+
+            failure_fp = ""
+            try:
+                if not report.passed:
+                    b0 = str((report.blockers or [""])[0] or "").strip()
+                    extracted0 = self._extract_error_signals(b0, limit=12)
+                    sig0 = self._failure_signature(report=report, extracted=extracted0, blocker_text=b0)
+                    failure_fp = self._failure_fingerprint(signature=sig0)
+            except Exception:
+                failure_fp = ""
+
             self._append_guarded(
                 event=new_event(
                     agent="qa",
@@ -4695,6 +5053,7 @@ class Orchestrator:
                     pointers=report.pointers,
                     meta={
                         "blockers": report.blockers,
+                        "failure_fingerprint": failure_fp,
                         "profile": qa_profile,
                         "phase": phase,
                         "commands": report.commands,
@@ -5206,8 +5565,10 @@ class Orchestrator:
                     pass
 
                 sig_now = ""
+                fp_now = ""
                 try:
                     sig_now = self._failure_signature(report=report, extracted=extracted[:12], blocker_text=blocker_text)
+                    fp_now = self._failure_fingerprint(signature=sig_now) if sig_now else ""
                     if sig_now and sig_now == sig_last:
                         sig_repeat += 1
                     else:
@@ -5215,7 +5576,9 @@ class Orchestrator:
                     sig_last = sig_now or sig_last
                 except Exception:
                     sig_now = ""
+                    fp_now = ""
                 stagnating = sig_repeat >= 1
+                stagnating_hard = sig_repeat >= 2
 
                 stagnation_help: str = ""
                 stagnation_ptrs: list[str] = []
@@ -5247,6 +5610,58 @@ class Orchestrator:
                                 )
                     except Exception:
                         stagnation_help = ""
+
+                    # If we're still stuck (3x same signature) or we see a common env/tooling smell,
+                    # collect extra deterministic probes so the next fix is evidence-driven.
+                    try:
+                        lowb = (blocker_text or "").lower()
+                        env_smell = any(k in lowb for k in ["spawn unknown", "syscall: 'spawn'", "enoent", "eacces"])
+                        if stagnating_hard or env_smell:
+                            cmd_dir = Path(".")
+                            try:
+                                cmd_dir = self._shell_cd_dir(self._failed_command_from_report(report) or "")
+                            except Exception:
+                                cmd_dir = Path(".")
+
+                            bin_ptr, bin_sum = self._node_bin_health_report(node_dir=cmd_dir, max_items=24)
+                            if bin_ptr:
+                                stagnation_ptrs.append(bin_ptr)
+                                piece = (
+                                    "EnvProbe（重复失败：检查 node_modules/.bin shim 健康度；事实以 pointers 展开为准）：\n"
+                                    f"Workdir: {cmd_dir.as_posix() if cmd_dir.as_posix() else '.'}\n"
+                                    f"BinHealthPointer: {bin_ptr}\n"
+                                    f"Summary: {bin_sum}"
+                                ).strip()
+                                stagnation_help = (stagnation_help + "\n\n" if stagnation_help else "") + piece
+
+                            rr = self.toolbox.run_cmd(
+                                agent_id="router",
+                                cmd=[
+                                    "rg",
+                                    "-n",
+                                    "--max-count",
+                                    "120",
+                                    "--glob",
+                                    "!**/node_modules/**",
+                                    "--glob",
+                                    "!**/.vibe/**",
+                                    r"node_modules[\\/]\.bin",
+                                    ".",
+                                ],
+                                cwd=self.repo_root,
+                                timeout_s=120,
+                            )
+                            stagnation_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
+                            out_text = self._artifact_head_text(rr.stdout, max_bytes=9000) if rr.stdout else ""
+                            if out_text.strip():
+                                piece = (
+                                    "RgProbe（定位是否有脚本硬编码 node_modules/.bin；事实以 pointers 展开为准）：\n"
+                                    f"StdoutPointer: {rr.stdout}\n"
+                                    f"Excerpt:\n{out_text.strip()}"
+                                ).strip()
+                                stagnation_help = (stagnation_help + "\n\n" if stagnation_help else "") + piece
+                    except Exception:
+                        pass
                 sim_router = self._format_lessons_for_prompt(
                     self._similar_lessons_for_query(agent_id="router", query=blocker_text, limit=3)
                 )
@@ -5271,6 +5686,8 @@ class Orchestrator:
                                     "category": incident.category,
                                     "suggested_fix_agent": incident.suggested_fix_agent,
                                     "required_capabilities": incident.required_capabilities,
+                                    "failure_fingerprint": fp_now,
+                                    "failure_signature": sig_now[:600] if sig_now else "",
                                     "loop": loop,
                                     "route_level": route_level,
                                     "style": resolved_style,
@@ -5323,7 +5740,12 @@ class Orchestrator:
                     can_triage = ops_engineer is not None and (mock_mode or self._api_key_available_for_agent("ops_engineer"))
                 except Exception:
                     can_triage = False
-                if can_triage and ops_engineer is not None:
+                should_triage = (
+                    can_triage
+                    and ops_engineer is not None
+                    and ((blocker_source != "tests") or (loop == 1) or stagnating or stagnating_hard)
+                )
+                if should_triage:
                     try:
                         activate_agent("ops_engineer", reason="gate:triage")
                         triage_user = (
@@ -5441,6 +5863,13 @@ class Orchestrator:
                         "禁止重复尝试；必须打开 pointers/RepoExcerpts 定位根因并一次修完同类错误。\n"
                         f"FailureSignature: {sig_now[:380]}"
                     )
+                if stagnating_hard:
+                    fix_user = (
+                        f"{fix_user}\n\nEnvPivot: 同一失败指纹已连续出现 3 次（loop={loop}，fingerprint={fp_now}）。"
+                        "这通常不是“业务逻辑”问题，而是环境/命令/工程骨架/跨平台脚本问题（如 `.cmd`/`.exe`、"
+                        "`node_modules/.bin` 占位 shim、PATH、lockfile/依赖安装）。"
+                        "本轮优先修复这些工程级问题，让失败命令能稳定通过，再考虑其他改动。"
+                    )
                 if stagnation_help:
                     fix_user = f"{fix_user}\n\n{stagnation_help}"
                 if sim_router:
@@ -5551,6 +5980,7 @@ class Orchestrator:
                             "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
                             "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
                             "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                            "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
                             "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
                             f"{workflow_hint}"
                         ),
@@ -5689,6 +6119,16 @@ class Orchestrator:
                     activated_agents=activated_agents,
                 )
                 focus_report = self._run_tests(profile=qa_profile, commands=qa_commands_focus)
+
+                focus_fp = ""
+                try:
+                    if not focus_report.passed:
+                        b0 = str((focus_report.blockers or [""])[0] or "").strip()
+                        extracted0 = self._extract_error_signals(b0, limit=12)
+                        sig0 = self._failure_signature(report=focus_report, extracted=extracted0, blocker_text=b0)
+                        focus_fp = self._failure_fingerprint(signature=sig0)
+                except Exception:
+                    focus_fp = ""
                 self._append_guarded(
                     event=new_event(
                         agent="qa",
@@ -5698,6 +6138,7 @@ class Orchestrator:
                         pointers=focus_report.pointers,
                         meta={
                             "blockers": focus_report.blockers,
+                            "failure_fingerprint": focus_fp,
                             "commands": focus_report.commands,
                             "loop": loop,
                             "profile": qa_profile,
@@ -5745,6 +6186,16 @@ class Orchestrator:
                             activated_agents=activated_agents,
                         )
                         full_report = self._run_tests(profile=qa_profile, commands=qa_commands_full_to_run)
+
+                        full_fp = ""
+                        try:
+                            if not full_report.passed:
+                                b0 = str((full_report.blockers or [""])[0] or "").strip()
+                                extracted0 = self._extract_error_signals(b0, limit=12)
+                                sig0 = self._failure_signature(report=full_report, extracted=extracted0, blocker_text=b0)
+                                full_fp = self._failure_fingerprint(signature=sig0)
+                        except Exception:
+                            full_fp = ""
                         self._append_guarded(
                             event=new_event(
                                 agent="qa",
@@ -5754,6 +6205,7 @@ class Orchestrator:
                                 pointers=full_report.pointers,
                                 meta={
                                     "blockers": full_report.blockers,
+                                    "failure_fingerprint": full_fp,
                                     "commands": full_report.commands,
                                     "loop": loop,
                                     "profile": qa_profile,
