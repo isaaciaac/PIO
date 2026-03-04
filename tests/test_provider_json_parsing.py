@@ -79,3 +79,12 @@ def test_parse_json_to_schema_accepts_js_object_literal_keys():
     parsed = _parse_json_to_schema(text, schema=packs.CodeChange)
     assert parsed.kind == "patch"
     assert parsed.writes and parsed.writes[0].path == "a.txt"
+
+
+def test_parse_json_to_schema_coerces_list_to_riskregister():
+    from vibe.schemas import packs
+
+    text = '["README.md#L1-L10@sha256:abc"]'
+    parsed = _parse_json_to_schema(text, schema=packs.RiskRegister)
+    assert parsed.passed is False
+    assert parsed.highs and parsed.highs[0].id == "__malformed_output__"

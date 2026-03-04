@@ -4893,21 +4893,66 @@ class Orchestrator:
             )
             if ctx_excerpts:
                 sec_user = f"{sec_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
-            sec_msgs = self._messages_with_memory(
-                agent_id="security",
-                system=(
-                    "你是安全审计（security）。你必须只列出 blockers 和 high 风险，其他不要展开。\n"
-                    "只输出 JSON（不要 markdown），并严格匹配 RiskRegister schema："
-                    "{passed: bool, blockers: RiskItem[], highs: RiskItem[]}。\n"
-                    "不要额外 key；不要最外层包一层对象。\n\n"
-                    "规则：\n"
-                    "- passed 只有在 blockers 和 highs 都为空时才为 true。\n"
-                    "- 每个 RiskItem 必须给出可定位的 pointers（文件片段/日志/契约）。\n\n"
-                    f"{workflow_hint}"
-                ),
-                user=sec_user,
+            base_system = (
+                "你是安全审计（security）。你必须只列出 blockers 和 high 风险，其他不要展开。\n"
+                "只输出 JSON（不要 markdown），并严格匹配 RiskRegister schema："
+                "{passed: bool, blockers: RiskItem[], highs: RiskItem[]}。\n"
+                "不要额外 key；不要最外层包一层对象。\n\n"
+                "规则：\n"
+                "- passed 只有在 blockers 和 highs 都为空时才为 true。\n"
+                "- 每个 RiskItem 必须给出可定位的 pointers（文件片段/日志/契约）。\n"
+                "- 如果没有任何风险，输出：{\"passed\":true,\"blockers\":[],\"highs\":[]}。\n\n"
+                f"{workflow_hint}"
             )
-            reg, _ = security.chat_json(schema=packs.RiskRegister, messages=sec_msgs, user=sec_user)
+
+            def _is_malformed(reg: packs.RiskRegister) -> bool:
+                try:
+                    items = list(reg.blockers or []) + list(reg.highs or [])
+                    return len(items) == 1 and str(items[0].id or "") == "__malformed_output__"
+                except Exception:
+                    return False
+
+            reg: Optional[packs.RiskRegister] = None
+            last_err: Exception | None = None
+            for attempt in range(2):
+                try:
+                    extra = ""
+                    if attempt == 1:
+                        extra = (
+                            "\n\n强制格式（第二次尝试）：\n"
+                            "- 只能输出一个 JSON 对象\n"
+                            "- 所有 key 必须使用双引号\n"
+                            "- 不允许输出数组/列表作为顶层\n"
+                            "示例：{\"passed\":false,\"blockers\":[{\"id\":\"R1\",\"severity\":\"high\",\"title\":\"...\",\"description\":\"...\",\"pointers\":[\"path#L1-L2@sha256:...\"]}],\"highs\":[]}\n"
+                        )
+                    sec_msgs = self._messages_with_memory(
+                        agent_id="security",
+                        system=base_system + extra,
+                        user=sec_user,
+                    )
+                    reg, _ = security.chat_json(schema=packs.RiskRegister, messages=sec_msgs, user=sec_user)
+                    if reg is not None and not _is_malformed(reg):
+                        break
+                    last_err = RuntimeError("security output malformed")
+                except Exception as e:
+                    last_err = e
+                    reg = None
+                    continue
+
+            if reg is None:
+                reg = packs.RiskRegister(
+                    passed=False,
+                    blockers=[
+                        packs.RiskItem(
+                            id="__security_agent_error__",
+                            severity="high",
+                            title="Security agent failed to produce valid JSON",
+                            description=str(last_err or "unknown error")[:800],
+                            pointers=[],
+                        )
+                    ],
+                    highs=[],
+                )
             ptr = self.artifacts.put_json(reg.model_dump(), suffix=".security.json", kind="security").to_pointer()
             passed = bool(reg.passed) and not (reg.blockers or []) and not (reg.highs or [])
             self._append_guarded(

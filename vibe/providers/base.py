@@ -349,6 +349,29 @@ def _coerce_data_to_schema(data: Any, *, schema: Type[BaseModel]) -> Any:
                 if isinstance(v, str) and v.strip():
                     return {**data, "summary": v.strip()}
 
+    if name == "RiskRegister":
+        # Some models output a list of pointers or a list of risk items directly.
+        # Coerce into the expected shape so downstream gates don't crash.
+        if isinstance(data, list):
+            ptrs = [str(x).strip() for x in data if isinstance(x, str) and str(x).strip()]
+            if not ptrs:
+                return {"passed": True, "blockers": [], "highs": []}
+            item = {
+                "id": "__malformed_output__",
+                "severity": "high",
+                "title": "Security output malformed",
+                "description": "Model returned a JSON list instead of RiskRegister. Rerun security or inspect pointers.",
+                "pointers": ptrs[:12],
+            }
+            return {"passed": False, "blockers": [], "highs": [item]}
+
+        if isinstance(data, dict):
+            # If missing passed, infer from whether items exist.
+            blockers = data.get("blockers")
+            highs = data.get("highs")
+            if "passed" not in data and isinstance(blockers, list) and isinstance(highs, list):
+                return {**data, "passed": (len(blockers) == 0 and len(highs) == 0)}
+
     return data
 
 
