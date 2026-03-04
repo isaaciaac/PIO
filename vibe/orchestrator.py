@@ -3421,6 +3421,16 @@ class Orchestrator:
                 agent_pool_list.append(a)
         activated_agents: Set[str] = set(activated_agents_list)
 
+        # Route-aware planning/execution caps: higher strategies expand more and may require
+        # more plan tasks, but we still keep hard bounds to avoid runaway runs.
+        base_cap = {"L0": 3, "L1": 6, "L2": 8, "L3": 10, "L4": 12}.get(str(route_level), 6)
+        if resolved_style == "free":
+            base_cap = base_cap + 1
+        if resolved_style == "detailed":
+            base_cap = max(3, base_cap - 1)
+        max_plan_tasks = max(3, min(int(base_cap), 16))
+        max_implement_tasks = max_plan_tasks
+
         # Ledger: route selection + activation set (must be auditable).
         route_pointers = [p for p in [diff.pointer] if p]
         self._append_guarded(
@@ -3571,6 +3581,8 @@ class Orchestrator:
 
         req: packs.RequirementPack | None = None
         req_ptr: Optional[str] = None
+        intent: packs.IntentExpansionPack | None = None
+        intent_ptr: Optional[str] = None
         usecases: Optional[packs.UseCasePack] = None
         usecases_ptr: Optional[str] = None
         decisions: Optional[packs.DecisionPack] = None
@@ -3609,12 +3621,14 @@ class Orchestrator:
                     return None
 
             req_ptr = str(meta.get("req_ptr") or "").strip() or None
+            intent_ptr = str(meta.get("intent_ptr") or "").strip() or None
             plan_ptr = str(meta.get("plan_ptr") or "").strip() or None
             usecases_ptr = str(meta.get("usecases_ptr") or "").strip() or None
             decisions_ptr = str(meta.get("decisions_ptr") or "").strip() or None
             contract_ptr = str(meta.get("contract_ptr") or "").strip() or None
 
             req = _load(req_ptr, packs.RequirementPack) if req_ptr else None
+            intent = _load(intent_ptr, packs.IntentExpansionPack) if intent_ptr else None
             plan = _load(plan_ptr, packs.Plan) if plan_ptr else None
             usecases = _load(usecases_ptr, packs.UseCasePack) if usecases_ptr else None
             decisions = _load(decisions_ptr, packs.DecisionPack) if decisions_ptr else None
@@ -3717,6 +3731,67 @@ class Orchestrator:
                 ),
                 activated_agents=activated_agents,
             )
+
+        if (not resume_mode) and route_level != "L0" and "intent_expander" in self.config.agents:
+            activate_agent("intent_expander", reason="gate:intent_expansion")
+            try:
+                expander = self._agent("intent_expander")
+                ie_user = (
+                    f"RouteLevel: {route_level}\nStyle: {resolved_style}\n\n"
+                    f"Task:\n{task_text}\n\n"
+                    f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                    f"ContextPacket:\n{ctx.model_dump_json()}"
+                )
+                if ctx_excerpts:
+                    ie_user = f"{ie_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                ie_msgs = self._messages_with_memory(
+                    agent_id="intent_expander",
+                    system=(
+                        "你是意图展开器（intent_expander）。目标：在不频繁追问用户的前提下，把需求扩展为更完整、可交付的功能/质量清单。\n"
+                        "只输出 JSON（不要 markdown），并严格匹配 IntentExpansionPack schema：\n"
+                        "{summary: string, route_level: 'L0'|'L1'|'L2'|'L3'|'L4', assumptions: string[], defaults: object, "
+                        "feature_backlog: [{id,title,description,priority,acceptance,tags}], open_questions: string[], constraints: string[], non_goals: string[]}。\n"
+                        "不要额外 key；不要最外层包一层对象。\n\n"
+                        "展开强度规则（route_level 越高越完整，功能更丰富更复杂）：\n"
+                        "- L0(快速/草稿)：最少展开；只给 3-6 条关键假设/最小闭环。\n"
+                        "- L1(简单MVP)：补齐同类产品的常见模块（CRUD/权限/日志/README/最小验证）。\n"
+                        "- L2(多模块MVP)：补齐契约/模块边界/用例/错误处理/集成验证。\n"
+                        "- L3(可发布)：补齐可复现运行、配置、回归测试、基础安全、发布说明。\n"
+                        "- L4(生产级)：补齐监控/告警/性能/合规/运维Runbook/回滚与审计。\n\n"
+                        "约束：\n"
+                        "- 不要声称“已创建/已实现”；这里只是提出 backlog/假设。\n"
+                        "- assumptions 用 'Assume:' 开头写默认假设（例如技术栈、数据源、部署方式）。\n"
+                        "- feature_backlog 要可执行、可验收；priority 用 must/should/could。\n"
+                        "- 如必须追问，放到 open_questions（<=6），其余都用合理默认假设前进。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=ie_user,
+                )
+                intent, _ = expander.chat_json(schema=packs.IntentExpansionPack, messages=ie_msgs, user=ie_user)
+                # Ensure route_level is consistent with the selected route (models may echo a different one).
+                try:
+                    intent = intent.model_copy(update={"route_level": route_level})
+                except Exception:
+                    pass
+                intent_ptr = self.artifacts.put_json(intent.model_dump(), suffix=".intent.json", kind="intent").to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="intent_expander",
+                        type="INTENT_EXPANDED",
+                        summary="Intent expanded",
+                        branch_id=self.branch_id,
+                        pointers=[intent_ptr],
+                        meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id},
+                    ),
+                    activated_agents=activated_agents,
+                )
+                try:
+                    ctx.constraints.append(f"IntentExpansion：{(intent.summary or '').strip()[:180]}（详见 {intent_ptr}）。")
+                except Exception:
+                    pass
+            except Exception:
+                intent = None
+                intent_ptr = None
 
         needs_arch = route_level in {"L2", "L3", "L4"}
         try:
@@ -3887,6 +3962,8 @@ class Orchestrator:
                 plan_user = f"{plan_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
             if usecases is not None:
                 plan_user = f"{plan_user}\n\nUseCasePack:\n{usecases.model_dump_json()}"
+            if intent is not None:
+                plan_user = f"{plan_user}\n\nIntentExpansionPack:\n{intent.model_dump_json()}"
             if decisions is not None:
                 plan_user = f"{plan_user}\n\nDecisionPack:\n{decisions.model_dump_json()}"
             if contract is not None:
@@ -3894,11 +3971,11 @@ class Orchestrator:
             router_msgs = self._messages_with_memory(
                 agent_id="router",
                 system=(
-                    "你是调度器 Router：把需求拆成最多 5 个可执行任务。\n"
+                    f"你是调度器 Router：把需求拆成最多 {max_plan_tasks} 个可执行任务。\n"
                     "只输出 JSON（不要 markdown），并严格匹配 Plan schema：{tasks:[{id,title,agent,description}]}。\n"
                     "不要额外 key；不要最外层包一层对象。\n\n"
                     "规划规则：\n"
-                    "- tasks <= 5；每个 task 必须可落地、可验收。\n"
+                    f"- tasks <= {max_plan_tasks}；每个 task 必须可落地、可验收。\n"
                     "- tasks 按顺序执行：先补齐工程骨架/可运行验证，再实现核心功能，最后补文档/收尾。\n"
                     "- task.agent 尽量选择可落地写文件的工种（coder_backend/coder_frontend/integration_engineer）；不要把 pm/qa/reviewer/security 当成 plan task（它们由 gate 触发）。\n"
                     "- 交付导向：至少包含一个任务负责「README/运行方式/最小验证」的交付说明。\n"
@@ -3912,7 +3989,7 @@ class Orchestrator:
                 messages=router_msgs,
                 user=plan_user,
             )
-            plan = augment_plan(plan, req=req, task_text=task_text, activated_agents=activated_agents)
+            plan = augment_plan(plan, req=req, task_text=task_text, activated_agents=activated_agents, max_tasks=max_plan_tasks)
             try:
                 plan_ptr = self.artifacts.put_json(plan.model_dump(), suffix=".plan.json", kind="plan").to_pointer()
             except Exception:
@@ -4006,6 +4083,7 @@ class Orchestrator:
             base = (
                 f"Task:\n{task_text}\n\n"
                 f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"IntentExpansionPack:\n{intent.model_dump_json() if intent is not None else '{}'}\n\n"
                 f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
                 f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
                 f"PlanTask:\n{task.model_dump_json()}\n\n"
@@ -4028,7 +4106,7 @@ class Orchestrator:
 
         if not resume_mode:
             code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
-            for t in list(plan.tasks or [])[:5]:
+            for t in list(plan.tasks or [])[:max_implement_tasks]:
                 agent_id = (t.agent or "").strip() or primary_coder_id
                 if agent_id not in code_agents:
                     agent_id = primary_coder_id
@@ -4173,6 +4251,7 @@ class Orchestrator:
                     "agents": activated_agents_list,
                     "style": resolved_style,
                     "req_ptr": req_ptr,
+                    "intent_ptr": intent_ptr,
                     "plan_ptr": plan_ptr,
                     "usecases_ptr": usecases_ptr,
                     "decisions_ptr": decisions_ptr,
@@ -4483,6 +4562,7 @@ class Orchestrator:
                     "qa_required_profile": qa_required_profile,
                     "style": resolved_style,
                     "req_ptr": req_ptr,
+                    "intent_ptr": intent_ptr,
                     "plan_ptr": plan_ptr,
                     "usecases_ptr": usecases_ptr,
                     "decisions_ptr": decisions_ptr,
@@ -4530,6 +4610,7 @@ class Orchestrator:
                     "reason": "qa_no_commands",
                     "style": resolved_style,
                     "req_ptr": req_ptr,
+                    "intent_ptr": intent_ptr,
                     "plan_ptr": plan_ptr,
                     "usecases_ptr": usecases_ptr,
                     "decisions_ptr": decisions_ptr,
@@ -5528,6 +5609,7 @@ class Orchestrator:
                         "blockers": blockers[:20],
                         "style": resolved_style,
                         "req_ptr": req_ptr,
+                        "intent_ptr": intent_ptr,
                         "plan_ptr": plan_ptr,
                         "usecases_ptr": usecases_ptr,
                         "decisions_ptr": decisions_ptr,
@@ -5802,6 +5884,7 @@ class Orchestrator:
                 "qa_required_profile": qa_required_profile,
                 "style": resolved_style,
                 "req_ptr": req_ptr,
+                "intent_ptr": intent_ptr,
                 "plan_ptr": plan_ptr,
                 "usecases_ptr": usecases_ptr,
                 "decisions_ptr": decisions_ptr,

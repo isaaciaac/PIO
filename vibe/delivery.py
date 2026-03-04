@@ -90,7 +90,14 @@ def augment_requirement_pack(req: packs.RequirementPack, *, task_text: str) -> p
     return out
 
 
-def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_text: str, activated_agents: Set[str]) -> packs.Plan:
+def augment_plan(
+    plan: packs.Plan,
+    *,
+    req: packs.RequirementPack | None,
+    task_text: str,
+    activated_agents: Set[str],
+    max_tasks: int = 5,
+) -> packs.Plan:
     """
     Ensure the plan includes delivery-critical items (docs + data source clarity) even if the Router forgets.
     """
@@ -113,8 +120,10 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
     if delivery_agent not in activated_agents:
         delivery_agent = "coder_backend"
 
+    cap = max(1, int(max_tasks))
+
     if not has_hint(["readme", "运行", "启动", "how to run", "getting started"]):
-        if len(tasks) < 5:
+        if len(tasks) < cap:
             tasks.append(
                 packs.PlanTask(
                     id="t_delivery_docs",
@@ -124,7 +133,7 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
                 )
             )
         else:
-            # Merge into the last task to keep <= 5.
+            # Merge into the last task to keep <= cap.
             last = tasks[-1]
             last = last.model_copy(
                 update={"description": (last.description or "").rstrip() + "\n\n交付补充：更新 README.md（安装/启动/最小验证步骤；关键配置）。"}
@@ -132,7 +141,7 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
             tasks[-1] = last
 
     if needs.wants_live_data and not has_hint(["数据源", "api", "第三方", "mock", "模拟", "真实", "price", "quote"]):
-        if len(tasks) < 5:
+        if len(tasks) < cap:
             tasks.append(
                 packs.PlanTask(
                     id="t_data_source",
@@ -148,6 +157,5 @@ def augment_plan(plan: packs.Plan, *, req: packs.RequirementPack | None, task_te
             )
             tasks[-1] = last
 
-    out.tasks = tasks[:5]
+    out.tasks = tasks[:cap]
     return out
-
