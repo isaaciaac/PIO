@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -29,6 +30,13 @@ def test_cli_run_mock_creates_green_checkpoint(tmp_path: Path, monkeypatch) -> N
     written = tmp_path / "hello.txt"
     assert written.exists()
     assert written.read_text(encoding="utf-8") == "hello from mock\n"
+
+    wc = tmp_path / ".vibe" / "manifests" / "workspace_contract.json"
+    assert wc.exists()
+    payload = json.loads(wc.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert "commands" in payload and isinstance(payload["commands"], dict)
+    assert "qa_full" in payload["commands"]
 
 
 def test_codechange_accepts_file_key() -> None:

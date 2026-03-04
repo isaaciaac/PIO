@@ -124,6 +124,153 @@ class Orchestrator:
 
         return ptr, summary, available, missing
 
+    def _write_workspace_contract(
+        self,
+        *,
+        route_level: packs.RouteLevel,
+        style: str,
+        tooling_ptr: Optional[str],
+        tooling_available: list[str],
+        tooling_missing: list[str],
+    ) -> tuple[Optional[str], str, str]:
+        """
+        Produce a deterministic, pointer-backed "workspace contract" so agents have a stable
+        source of truth about repo layout and runnable commands.
+
+        Writes: .vibe/manifests/workspace_contract.json
+        Returns: (read_file_pointer, short_summary, excerpt_text)
+        """
+
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        mdir = self.repo_root / ".vibe" / "manifests"
+        mdir.mkdir(parents=True, exist_ok=True)
+
+        node_dirs = self._find_node_project_dirs()
+        node_projects: list[dict[str, Any]] = []
+        for d in node_dirs[:8]:
+            pkg_path = (self.repo_root / d / "package.json").resolve()
+            if not pkg_path.exists():
+                continue
+            try:
+                pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                pkg = {}
+            scripts = dict((pkg.get("scripts") or {}) if isinstance(pkg, dict) else {})
+            pm = self._package_manager(d)
+            rel_pkg = pkg_path.relative_to(self.repo_root).as_posix()
+            node_projects.append(
+                {
+                    "dir": d.as_posix() if d.as_posix() not in {"", "."} else ".",
+                    "package_manager": pm,
+                    "package_json": rel_pkg,
+                    "scripts": {k: str(v) for k, v in list(scripts.items())[:40] if str(k).strip()},
+                }
+            )
+
+        langs: list[str] = []
+        if (self.repo_root / "pyproject.toml").exists() or (self.repo_root / "requirements.txt").exists() or (self.repo_root / "setup.py").exists():
+            langs.append("python")
+        if node_projects:
+            langs.append("node")
+        if (self.repo_root / "go.mod").exists():
+            langs.append("go")
+        if (self.repo_root / "Cargo.toml").exists():
+            langs.append("rust")
+
+        # Verification commands are derived from the same heuristics QA uses.
+        qa_smoke = self._determine_test_commands(profile="smoke")
+        qa_unit = self._determine_test_commands(profile="unit")
+        qa_full = self._determine_test_commands(profile="full")
+
+        # Dev/start commands: best-effort, script-driven (facts only; no invention).
+        dev_cmds: list[str] = []
+        start_cmds: list[str] = []
+        install_cmds: list[str] = []
+        for np in node_projects[:8]:
+            rel = str(np.get("dir") or ".").strip() or "."
+            pm = str(np.get("package_manager") or "npm").strip() or "npm"
+            scripts = np.get("scripts") or {}
+            if isinstance(scripts, dict):
+                if "dev" in scripts:
+                    dev_cmds.append(self._shell_cmd_in_dir(rel_dir=Path(rel), cmd=f"{pm} run dev"))
+                if "start" in scripts:
+                    start_cmds.append(self._shell_cmd_in_dir(rel_dir=Path(rel), cmd=f"{pm} start"))
+            install_cmds.append(self._shell_cmd_in_dir(rel_dir=Path(rel), cmd=f"{pm} install"))
+
+        # Env templates (existence only; do not read secrets).
+        env_files: list[str] = []
+        try:
+            patterns = [
+                ".env.example",
+                ".env.template",
+                ".env.sample",
+                ".env.local.example",
+                ".env.development.example",
+                ".env.production.example",
+            ]
+            seen: set[str] = set()
+            for pat in patterns:
+                for p in self.repo_root.rglob(pat):
+                    try:
+                        rel = p.relative_to(self.repo_root).as_posix()
+                    except Exception:
+                        continue
+                    if rel.startswith(".vibe/") or rel.startswith(".git/"):
+                        continue
+                    if rel in seen:
+                        continue
+                    seen.add(rel)
+                    env_files.append(rel)
+                    if len(env_files) >= 20:
+                        break
+                if len(env_files) >= 20:
+                    break
+        except Exception:
+            env_files = []
+
+        contract = {
+            "version": 1,
+            "generated_at": ts,
+            "route_level": route_level,
+            "style": str(style or "").strip() or "balanced",
+            "languages": langs,
+            "tooling_probe": {
+                "pointer": tooling_ptr,
+                "available": list(tooling_available or []),
+                "missing": list(tooling_missing or []),
+            },
+            "node_projects": node_projects,
+            "commands": {
+                "setup": install_cmds[:8],
+                "dev": dev_cmds[:6],
+                "start": start_cmds[:6],
+                "qa_smoke": qa_smoke[:10],
+                "qa_unit": qa_unit[:14],
+                "qa_full": qa_full[:20],
+            },
+            "env_templates": env_files,
+            "notes": [
+                "事实源：package.json/lockfiles/现有脚本；不要凭空发明命令或文件。",
+                "QA 会基于 qa_* 命令执行；若为空，需先补齐工程骨架/脚本。",
+            ],
+        }
+
+        path = mdir / "workspace_contract.json"
+        try:
+            path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            return None, "", ""
+
+        try:
+            rr = self.toolbox.read_file(agent_id="router", path=".vibe/manifests/workspace_contract.json", start_line=1, end_line=260)
+            summary = (
+                f"langs={','.join(langs) or 'unknown'}; node_projects={len(node_projects)}; "
+                f"qa_full_cmds={len(qa_full)}; env_templates={len(env_files)}"
+            )
+            return rr.pointer, summary, rr.content or ""
+        except Exception:
+            return None, "", ""
+
     def _compute_fix_loop_max_loops(
         self,
         *,
@@ -3579,6 +3726,44 @@ class Orchestrator:
                 activated_agents=activated_agents,
             )
 
+        wc_ptr: Optional[str] = None
+        wc_summary: str = ""
+        try:
+            wc_ptr, wc_summary, wc_excerpt = self._write_workspace_contract(
+                route_level=route_level,
+                style=resolved_style,
+                tooling_ptr=tooling_ptr,
+                tooling_available=tooling_available,
+                tooling_missing=tooling_missing,
+            )
+            if wc_ptr:
+                ctx.repo_pointers.append(wc_ptr)
+                try:
+                    ctx.constraints.append(f"WorkspaceContract：{wc_summary}（详见 {wc_ptr}）。")
+                except Exception:
+                    pass
+                if str(wc_excerpt or "").strip():
+                    extra = f"<<< {wc_ptr} >>>\n{wc_excerpt.strip()}\n"
+                    if ctx_excerpts:
+                        ctx_excerpts = (ctx_excerpts.rstrip() + "\n\nWorkspaceContract:\n" + extra).strip()
+                    else:
+                        ctx_excerpts = ("WorkspaceContract:\n" + extra).strip()
+
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="WORKSPACE_CONTRACT_BUILT",
+                        summary=f"WorkspaceContract built ({wc_summary})",
+                        branch_id=self.branch_id,
+                        pointers=[wc_ptr],
+                        meta={"route_level": route_level, "style": resolved_style},
+                    ),
+                    activated_agents=activated_agents,
+                )
+        except Exception:
+            wc_ptr = None
+            wc_summary = ""
+
         req: packs.RequirementPack | None = None
         req_ptr: Optional[str] = None
         intent: packs.IntentExpansionPack | None = None
@@ -3647,7 +3832,7 @@ class Orchestrator:
                 plan = packs.Plan(tasks=[])
 
         doctor_ptr: Optional[str] = None
-        if route_level != "L0" and (resume_mode or route_level in {"L2", "L3", "L4"}):
+        if route_level != "L0":
             try:
                 doctor_ptr, doctor_summary = self._doctor_preflight(max_findings=6)
                 if doctor_ptr:
@@ -4842,6 +5027,61 @@ class Orchestrator:
             harvest_cache: dict[str, tuple[dict[str, Any], str]] = {}
             sig_last: str = ""
             sig_repeat: int = 0
+
+            # Verification cache: avoid re-running already-passing full command batches when
+            # the last patch didn't touch their project dir. This improves fix-loop throughput
+            # in multi-package Node repos (client+server).
+            dirty_full_cmds: set[str] = set()
+            last_full_cmds: list[str] = []
+            try:
+                known_node_dirs = [d.as_posix() if d.as_posix() not in {"", "."} else "." for d in self._find_node_project_dirs()]
+            except Exception:
+                known_node_dirs = ["."]
+            if not known_node_dirs:
+                known_node_dirs = ["."]
+
+            def _cmd_node_dir(cmd: str) -> str:
+                try:
+                    d = self._shell_cd_dir(str(cmd or ""))
+                    s = d.as_posix() if d.as_posix() not in {"", "."} else "."
+                    return s or "."
+                except Exception:
+                    return "."
+
+            def _file_node_dir(rel: str) -> str:
+                r = str(rel or "").replace("\\", "/").lstrip("/")
+                if not r:
+                    return "."
+                best = "."
+                for d in known_node_dirs:
+                    if d in {"", "."}:
+                        continue
+                    prefix = d.rstrip("/") + "/"
+                    if r.startswith(prefix) and len(d) > len(best):
+                        best = d
+                return best
+
+            def _is_global_node_config(rel: str) -> bool:
+                r = str(rel or "").replace("\\", "/").lstrip("/")
+                if not r:
+                    return False
+                if "/" in r:
+                    return False
+                name = r.lower()
+                return name in {
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "pnpm-workspace.yaml",
+                    "tsconfig.json",
+                    "eslint.config.js",
+                    "eslint.config.cjs",
+                    ".eslintrc",
+                    ".eslintrc.json",
+                    ".eslintrc.js",
+                    ".eslintrc.cjs",
+                }
             while loop < max_loops and ((not report.passed) or review_failed or security_failed or compliance_failed or perf_failed):
                 loop += 1
                 if not report.passed:
@@ -5339,6 +5579,41 @@ class Orchestrator:
                 prev_signals = extracted[:8] if extracted else []
 
                 qa_commands_full = self._determine_test_commands(profile=qa_profile)
+                # Verification cache: only re-run "full" commands that are still dirty for the
+                # touched project dir(s), rather than re-running the entire matrix every loop.
+                if list(qa_commands_full) != last_full_cmds:
+                    last_full_cmds = list(qa_commands_full)
+                    dirty_full_cmds = set(qa_commands_full)
+                    # Seed: commands that already passed before this loop don't need re-run.
+                    try:
+                        for r0 in list(report.results or []):
+                            if getattr(r0, "passed", False) and str(getattr(r0, "command", "") or "") in dirty_full_cmds:
+                                dirty_full_cmds.discard(str(getattr(r0, "command", "") or ""))
+                    except Exception:
+                        pass
+
+                try:
+                    touched_paths = list(change.files_changed or []) or [w.path for w in list(change.writes or [])]
+                    touched_dirs: set[str] = set()
+                    global_dirty = False
+                    for rp in touched_paths[:80]:
+                        relp = str(rp or "").replace("\\", "/").lstrip("/")
+                        if not relp or relp.startswith(".vibe/") or relp.startswith(".git/"):
+                            continue
+                        if _is_global_node_config(relp):
+                            global_dirty = True
+                            break
+                        touched_dirs.add(_file_node_dir(relp))
+                    if global_dirty:
+                        touched_dirs = set(known_node_dirs)
+                        touched_dirs.add(".")
+                    if touched_dirs:
+                        for c0 in qa_commands_full:
+                            if _cmd_node_dir(str(c0 or "")) in touched_dirs or "." in touched_dirs:
+                                dirty_full_cmds.add(str(c0 or ""))
+                except Exception:
+                    pass
+
                 qa_commands_focus = qa_commands_full
                 if blocker_source == "tests":
                     try:
@@ -5390,48 +5665,69 @@ class Orchestrator:
                 )
 
                 report = focus_report
+                try:
+                    for r0 in list(focus_report.results or []):
+                        if getattr(r0, "passed", False):
+                            cmd0 = str(getattr(r0, "command", "") or "")
+                            if cmd0 in dirty_full_cmds:
+                                dirty_full_cmds.discard(cmd0)
+                except Exception:
+                    pass
 
-                # If focus passed but we didn't run the full verification list, run it once to surface
-                # the *next* blocker early (fast -> full), rather than re-running full every loop.
+                # If focus passed but we didn't run the full verification list, run only the "dirty"
+                # subset once to surface the *next* blocker early (focus -> full), rather than
+                # re-running the entire full matrix every loop.
                 if (not mock_mode) and report.passed and qa_commands_focus != qa_commands_full:
-                    self._append_guarded(
-                        event=new_event(
-                            agent="qa",
-                            type="TEST_RUN",
-                            summary=f"Fix-loop {loop}: verifying (full)",
-                            branch_id=self.branch_id,
-                            pointers=[],
-                            meta={
-                                "profile": qa_profile,
-                                "phase": "fix_full",
-                                "commands": qa_commands_full,
-                                "route_level": route_level,
-                                "style": resolved_style,
-                            },
-                        ),
-                        activated_agents=activated_agents,
-                    )
-                    full_report = self._run_tests(profile=qa_profile, commands=qa_commands_full)
-                    self._append_guarded(
-                        event=new_event(
-                            agent="qa",
-                            type="TEST_PASSED" if full_report.passed else "TEST_FAILED",
-                            summary="Tests passed" if full_report.passed else "Tests failed",
-                            branch_id=self.branch_id,
-                            pointers=full_report.pointers,
-                            meta={
-                                "blockers": full_report.blockers,
-                                "commands": full_report.commands,
-                                "loop": loop,
-                                "profile": qa_profile,
-                                "phase": "fix_full",
-                                "route_level": route_level,
-                                "style": resolved_style,
-                            },
-                        ),
-                        activated_agents=activated_agents,
-                    )
-                    report = full_report
+                    qa_commands_full_to_run = [
+                        c for c in list(qa_commands_full or []) if str(c or "") in dirty_full_cmds
+                    ]
+                    if qa_commands_full_to_run:
+                        self._append_guarded(
+                            event=new_event(
+                                agent="qa",
+                                type="TEST_RUN",
+                                summary=f"Fix-loop {loop}: verifying (full)",
+                                branch_id=self.branch_id,
+                                pointers=[],
+                                meta={
+                                    "profile": qa_profile,
+                                    "phase": "fix_full",
+                                    "commands": qa_commands_full_to_run,
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                        full_report = self._run_tests(profile=qa_profile, commands=qa_commands_full_to_run)
+                        self._append_guarded(
+                            event=new_event(
+                                agent="qa",
+                                type="TEST_PASSED" if full_report.passed else "TEST_FAILED",
+                                summary="Tests passed" if full_report.passed else "Tests failed",
+                                branch_id=self.branch_id,
+                                pointers=full_report.pointers,
+                                meta={
+                                    "blockers": full_report.blockers,
+                                    "commands": full_report.commands,
+                                    "loop": loop,
+                                    "profile": qa_profile,
+                                    "phase": "fix_full",
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                        report = full_report
+                        try:
+                            for r0 in list(full_report.results or []):
+                                if getattr(r0, "passed", False):
+                                    cmd0 = str(getattr(r0, "command", "") or "")
+                                    if cmd0 in dirty_full_cmds:
+                                        dirty_full_cmds.discard(cmd0)
+                        except Exception:
+                            pass
 
                 # Persist a compact lesson when we moved past the previous failing command (or fully passed),
                 # so future runs can avoid re-hitting the same pitfall.
