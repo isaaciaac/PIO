@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ast
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
@@ -133,6 +134,78 @@ def _iter_balanced_json_substrings(text: str, *, max_candidates: int = 20) -> li
         seen.add(s)
         uniq.append(s)
     return uniq
+
+
+def _strip_js_comments(text: str) -> str:
+    # Best-effort: strip line comments. Keep this conservative to avoid breaking URLs etc.
+    lines = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s.startswith("//"):
+            continue
+        lines.append(ln)
+    return "\n".join(lines)
+
+
+def _quote_unquoted_object_keys(text: str) -> str:
+    """
+    Convert JS-like object keys into JSON keys:
+      {kind: "x"} -> {"kind": "x"}
+    """
+    s = text or ""
+    # This is heuristic; it intentionally doesn't try to parse strings/escapes perfectly.
+    return re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', s)
+
+
+def _remove_trailing_commas(text: str) -> str:
+    # { "a": 1, } -> { "a": 1 }
+    # [1,2,] -> [1,2]
+    return re.sub(r",(\s*[}\]])", r"\1", text or "")
+
+
+def _try_json_loads_relaxed(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Relaxed fixes for common model output formats.
+    fixed = (text or "").strip()
+    fixed = _strip_js_comments(fixed)
+    fixed = fixed.strip().rstrip(";").strip()
+    fixed = _quote_unquoted_object_keys(fixed)
+    fixed = _remove_trailing_commas(fixed)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        return None
+
+
+def _try_python_literal(text: str) -> Any:
+    """
+    Parse Python-dict-like output safely:
+      {'a': 1, 'b': True} -> dict
+
+    This is a deterministic fallback for models that emit single-quoted "JSON".
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    s = _strip_js_comments(s).strip().rstrip(";").strip()
+    try:
+        val = ast.literal_eval(s)
+    except Exception:
+        # Some models include JSON booleans/null inside a Python-ish object.
+        try:
+            s2 = re.sub(r"\bnull\b", "None", s, flags=re.IGNORECASE)
+            s2 = re.sub(r"\btrue\b", "True", s2, flags=re.IGNORECASE)
+            s2 = re.sub(r"\bfalse\b", "False", s2, flags=re.IGNORECASE)
+            val = ast.literal_eval(s2)
+        except Exception:
+            return None
+    if isinstance(val, (dict, list)):
+        return val
+    return None
 
 
 def _unwrap_schema_envelope(data: Any, *, schema: Type[BaseModel]) -> Any:
@@ -304,10 +377,11 @@ def _parse_json_to_schema(text: str, *, schema: Type[T]) -> T:
     for cand in candidates[:60]:
         if not cand:
             continue
-        try:
-            data = json.loads(cand)
-        except json.JSONDecodeError as e:
-            last_err = e
+        data = _try_json_loads_relaxed(cand)
+        if data is None:
+            data = _try_python_literal(cand)
+        if data is None:
+            last_err = json.JSONDecodeError("No parseable JSON", cand, 0)
             continue
         try:
             data = _unwrap_schema_envelope(data, schema=schema)

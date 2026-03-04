@@ -55,3 +55,27 @@ def test_parse_json_to_schema_coerces_single_write_to_codechange():
     assert parsed.kind == "patch"
     assert "src/x.txt" in parsed.summary
     assert parsed.writes and parsed.writes[0].path == "src/x.txt"
+
+
+def test_parse_json_to_schema_accepts_python_dict_like_output():
+    from vibe.schemas import packs
+
+    text = (
+        "{'kind':'patch','summary':'x','writes':[{'path':'a.txt','content':'hi\\n'}],"
+        "'files_changed':['a.txt'],'blockers':[]}"
+    )
+    parsed = _parse_json_to_schema(text, schema=packs.CodeChange)
+    assert parsed.kind == "patch"
+    assert parsed.writes and parsed.writes[0].path == "a.txt"
+
+
+def test_parse_json_to_schema_accepts_js_object_literal_keys():
+    from vibe.schemas import packs
+
+    text = (
+        '{kind:"patch",summary:"x",writes:[{path:"a.txt",content:"hi\\n"}],'
+        'files_changed:["a.txt"],blockers:[]}'
+    )
+    parsed = _parse_json_to_schema(text, schema=packs.CodeChange)
+    assert parsed.kind == "patch"
+    assert parsed.writes and parsed.writes[0].path == "a.txt"
