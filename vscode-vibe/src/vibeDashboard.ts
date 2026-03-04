@@ -160,6 +160,7 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private workspaceRoot?: string;
   private persistTimer?: NodeJS.Timeout;
   private pendingVisionContext: string[] = [];
+  private static readonly LAST_TASK_KEY = "vibe.lastTask.v1";
 
   private static readonly CHAT_HISTORY_KEY = "vibe.chatHistory.v1";
   private static readonly CHAT_HISTORY_VERSION = 1;
@@ -1337,6 +1338,9 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         abortSignal: abort.signal,
       });
       const taskId = lastNonEmptyLine(taskRes.stdout) || "(unknown_task_id)";
+      try {
+        await this.context.workspaceState.update(VibeDashboardViewProvider.LAST_TASK_KEY, { id: taskId, text: taskText, ts: Date.now() });
+      } catch {}
 
       const maxAttempts = policyOverride === "allow_all" ? 3 : policyOverride === "prompt" ? 2 : 1;
       let attempt = 0;
@@ -1460,9 +1464,21 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         this.addMessage("assistant", "当前是聊天模式，不能执行工作流。请切换到「确认权限」或「完全授权」后再发送需求。", "系统");
         return;
       }
+      if (this.isResumeRequest(text)) {
+        this.addMessage("user", text);
+        this.addMessage("assistant", "当前是聊天模式，不能继续执行工作流。请切换到「确认权限」或「完全授权」。", "系统");
+        return;
+      }
       const chatAgent = agent || "pm";
       await this.handleAgentChat(root, chatAgent, text, mock, policyOverride, style);
       this.draftParts.push(text);
+      return;
+    }
+
+    if (this.isResumeRequest(text)) {
+      this.addMessage("user", text);
+      this.addMessage("assistant", "好的，我从上次失败的位置继续执行…", "系统");
+      await this.handleWorkflowResume(root, mock, policyOverride, route, style);
       return;
     }
 
@@ -1520,6 +1536,163 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       this.draftParts = [];
       this.draftHinted = false;
       return;
+    }
+  }
+
+  private isResumeRequest(text: string): boolean {
+    const t = String(text || "").trim().toLowerCase();
+    if (!t) return false;
+    if (t === "继续" || t === "接着" || t === "重试" || t === "继续执行" || t === "从上次继续" || t === "从上次失败继续") return true;
+    const hasContinue = /(继续|接着|续跑|重试|恢复)/.test(t);
+    const hasAnchor = /(上次|失败|断点|未通过|卡住|从.*继续)/.test(t);
+    return hasContinue && hasAnchor;
+  }
+
+  private async readLatestTask(root: string): Promise<{ id: string; text: string } | undefined> {
+    const ledgerPath = vscode.Uri.file(path.join(root, ".vibe", "ledger.jsonl"));
+    try {
+      const raw = await readTextFile(ledgerPath);
+      const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const e = JSON.parse(lines[i]);
+          if (String(e?.type || "") === "REQ_CREATED") {
+            const id = String(e?.id || "").trim();
+            const text = String(e?.summary || "").trim();
+            if (id) return { id, text };
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async handleWorkflowResume(root: string, mock: boolean, policyOverride: string, route: string, style: string): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    const abort = new AbortController();
+    this.abort = abort;
+    this.setStatus("准备继续…");
+    this.postState();
+
+    let stopWatcher: (() => void) | undefined;
+    try {
+      const envOverrides = await this.getEnvOverrides?.();
+      await this.ensureInit(root, envOverrides, abort.signal);
+
+      const before = await countLedgerLines(root);
+
+      let last: any = undefined;
+      try {
+        last = this.context.workspaceState.get<any>(VibeDashboardViewProvider.LAST_TASK_KEY);
+      } catch {}
+
+      let taskId = String(last?.id || "").trim();
+      let taskText = String(last?.text || "").trim();
+      if (!taskId) {
+        const latest = await this.readLatestTask(root);
+        if (latest) {
+          taskId = latest.id;
+          taskText = latest.text;
+        }
+      }
+      if (!taskId) {
+        this.addMessage("assistant", "未找到可继续的任务（ledger 中没有 REQ_CREATED）。请先描述需求并执行一次工作流。", "系统");
+        return;
+      }
+
+      const maxAttempts = policyOverride === "allow_all" ? 3 : policyOverride === "prompt" ? 2 : 1;
+      let attempt = 0;
+      let checkpointId = "(unknown_checkpoint_id)";
+      let cp: any | undefined = undefined;
+
+      const runStart = await countLedgerLines(root);
+      stopWatcher = this.startLedgerProgressWatcher(root, runStart);
+
+      let routeToUse = (route || "auto").trim() || "auto";
+
+      while (attempt < maxAttempts) {
+        if (abort.signal.aborted) break;
+        attempt += 1;
+        this.setStatus(attempt === 1 ? "正在继续工作流…" : `继续修复中（第 ${attempt} 轮/${maxAttempts}）…`);
+
+        const runArgs = ["run", "--task", taskId, "--path", root, "--route", routeToUse, "--resume"];
+        if (mock) runArgs.push("--mock");
+        if (style) runArgs.push("--style", style);
+
+        const title = attempt === 1 ? (mock ? "Vibe：继续（模拟）" : "Vibe：继续") : `Vibe：继续修复（第 ${attempt} 轮）`;
+
+        const runRes = await runVibeCapture(runArgs, {
+          cwd: root,
+          mock,
+          output: this.output,
+          title,
+          envOverrides,
+          policyOverride,
+          abortSignal: abort.signal,
+        });
+
+        checkpointId = lastNonEmptyLine(runRes.stdout) || checkpointId;
+        cp = await readCheckpoint(root, checkpointId);
+
+        const green = typeof cp?.green === "boolean" ? Boolean(cp.green) : undefined;
+        const reason = String(cp?.meta?.reason || "").trim();
+
+        if (green === true) break;
+        if (attempt >= maxAttempts) break;
+
+        if (reason === "fix_loop_blockers") {
+          if (routeToUse === "auto" && attempt >= 1) {
+            routeToUse = "L2";
+          }
+          continue;
+        }
+
+        break;
+      }
+
+      const events = await readLedgerEventsSince(root, before);
+      stopWatcher?.();
+      stopWatcher = undefined;
+      this.setStatus("正在生成总结…");
+
+      const facts = this.collectWorkflowFacts(taskText || "继续执行工作流", taskId, checkpointId, cp, events, { attempts: attempt });
+      try {
+        const summary = await this.summarizeWorkflowWithPm(root, facts, mock, style, envOverrides, abort.signal);
+        this.addMessage("assistant", summary.text, "产品经理（PM）");
+      } catch {
+        const narrative = this.formatWorkflowNarrative(taskId, checkpointId, cp, events, { attempts: attempt });
+        this.addMessage("assistant", narrative, "工作流");
+      }
+
+      try {
+        await this.context.workspaceState.update(VibeDashboardViewProvider.LAST_TASK_KEY, { id: taskId, text: taskText, ts: Date.now() });
+      } catch {}
+    } catch (e) {
+      if (e instanceof VibeRunError) {
+        if (e.code === 130 || /cancelled/i.test(e.message || "")) {
+          this.addMessage("assistant", "已停止当前运行。", "系统");
+          return;
+        }
+        const hint =
+          (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
+            ? "\n\n提示：在命令面板（Ctrl+Shift+P）运行 `Vibe：设置 DeepSeek 密钥` / `Vibe：设置 DashScope 密钥`。"
+            : "";
+        this.addMessage("assistant", `${formatRunError(e)}${hint}`, "错误");
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        this.addMessage("assistant", message, "错误");
+      }
+    } finally {
+      stopWatcher?.();
+      this.running = false;
+      this.abort = undefined;
+      this.setStatus("");
+      this.postState();
     }
   }
 
