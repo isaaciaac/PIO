@@ -4,10 +4,19 @@ import json
 import os
 import re
 import ast
+import time
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import BaseModel, ValidationError
 
 
@@ -29,6 +38,54 @@ class ProviderMeta:
 class ProviderResult:
     raw_text: str
     meta: ProviderMeta
+
+
+def _is_retryable_openai_error(e: Exception) -> bool:
+    if isinstance(e, (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)):
+        return True
+    if isinstance(e, APIStatusError):
+        try:
+            sc = int(getattr(e, "status_code", 0) or 0)
+        except Exception:
+            sc = 0
+        if sc in {408, 409, 429, 500, 502, 503, 504}:
+            return True
+    # Some providers return 500 for throttling; rely on message as a last resort.
+    msg = str(e or "").lower()
+    if "too many requests" in msg or "thrott" in msg or "rate limit" in msg:
+        return True
+    return False
+
+
+def _retry_after_seconds(e: Exception) -> Optional[float]:
+    """
+    Extract retry-after seconds when available (best-effort).
+    """
+    if isinstance(e, APIStatusError):
+        try:
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                ra = resp.headers.get("retry-after")
+                if ra:
+                    return float(ra)
+        except Exception:
+            return None
+    return None
+
+
+def _sleep_retry(attempt: int, *, e: Exception) -> None:
+    # Honor explicit Retry-After when present.
+    ra = _retry_after_seconds(e)
+    if ra is not None and ra > 0:
+        time.sleep(min(ra, 20.0))
+        return
+
+    # Exponential backoff with jitter.
+    base = float(os.getenv("VIBE_PROVIDER_RETRY_BASE_SEC", "0.8"))
+    cap = float(os.getenv("VIBE_PROVIDER_RETRY_MAX_SEC", "8"))
+    delay = min(cap, base * (2 ** max(0, int(attempt))))
+    delay = delay * (0.85 + (random.random() * 0.3))  # jitter
+    time.sleep(max(0.0, delay))
 
 
 def _extract_json(text: str) -> Any:
@@ -464,7 +521,34 @@ class OpenAICompatProvider:
         create_kwargs: Dict[str, Any] = {}
         if extra_body:
             create_kwargs["extra_body"] = extra_body
-        resp = client.chat.completions.create(model=model, messages=msgs, temperature=temperature, **create_kwargs)
+
+        max_retries = int(os.getenv("VIBE_PROVIDER_MAX_RETRIES", "4"))
+        resp = None
+        last_err: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model, messages=msgs, temperature=temperature, **create_kwargs
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt >= max_retries or not _is_retryable_openai_error(e):
+                    break
+                _sleep_retry(attempt, e=e)
+
+        if resp is None:
+            e = last_err or ProviderError("Unknown provider error")
+            status = getattr(e, "status_code", None)
+            hint = ""
+            msg = str(e or "")
+            if status in (429, 500, 502, 503, 504) or ("too many requests" in msg.lower()):
+                hint = (
+                    "（可能是服务端限流/拥塞：请稍后重试；或减少并发/降低路由等级/切换更快模型；"
+                    "也可临时用 VIBE_MOCK_MODE=1 跑通流程。）"
+                )
+            raise ProviderError(f"Provider call failed ({self.provider_id}:{model}) {hint}\n{msg}") from e
         content = resp.choices[0].message.content or ""
         try:
             parsed = _parse_json_to_schema(content, schema=schema)
@@ -486,7 +570,23 @@ class OpenAICompatProvider:
                 [{"role": "system", "content": repair_system}, {"role": "user", "content": repair_user}],
                 model=model,
             )
-            repair_resp = client.chat.completions.create(model=model, messages=repair_msgs, temperature=0.0, **create_kwargs)
+            repair_resp = None
+            last_err = None
+            for attempt in range(max_retries + 1):
+                try:
+                    repair_resp = client.chat.completions.create(
+                        model=model, messages=repair_msgs, temperature=0.0, **create_kwargs
+                    )
+                    last_err = None
+                    break
+                except Exception as ee:
+                    last_err = ee
+                    if attempt >= max_retries or not _is_retryable_openai_error(ee):
+                        break
+                    _sleep_retry(attempt, e=ee)
+            if repair_resp is None:
+                ee = last_err or ProviderError("Unknown provider error")
+                raise ProviderError(f"Provider repair call failed ({self.provider_id}:{model})\n{ee}") from ee
             repaired = repair_resp.choices[0].message.content or ""
             parsed = _parse_json_to_schema(repaired, schema=schema)
             content = repaired
