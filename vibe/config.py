@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field
@@ -28,7 +28,9 @@ class AgentConfig(BaseModel):
     enabled: bool = False
     provider: str
     model: str
-    web_search: bool = False
+    # For DashScope (Qwen) only. When "auto", search is enabled only for prompts
+    # that look like they need external fact verification (e.g. API endpoints).
+    web_search: Union[Literal["off", "auto", "on"], bool] = "off"
     purpose: str
     capabilities: List[str] = Field(default_factory=list)
     io_schema: str
@@ -142,6 +144,7 @@ def default_config() -> VibeConfig:
         enabled: bool,
         provider: str,
         model: str,
+        web_search: Union[Literal["off", "auto", "on"], bool] = "off",
         purpose: str,
         capabilities: List[str],
         io_schema: str,
@@ -153,6 +156,7 @@ def default_config() -> VibeConfig:
             enabled=enabled,
             provider=provider,
             model=model,
+            web_search=web_search,
             purpose=purpose,
             capabilities=capabilities,
             io_schema=io_schema,
@@ -211,6 +215,7 @@ def default_config() -> VibeConfig:
             enabled=False,
             provider="dashscope",
             model="qwen-plus",
+            web_search="auto",
             purpose="Collect external references into refstore",
             capabilities=["research", "references"],
             io_schema="vibe.schemas.packs.ReferenceItem",
@@ -277,8 +282,9 @@ def default_config() -> VibeConfig:
         "api_confirm": agent(
             "api_confirm",
             enabled=False,
-            provider="deepseek",
-            model="deepseek-reasoner",
+            provider="dashscope",
+            model="qwen-plus",
+            web_search="auto",
             purpose="Confirm API contracts and schemas",
             capabilities=["api", "contract"],
             io_schema="vibe.schemas.packs.ContractPack",
