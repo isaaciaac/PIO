@@ -2442,12 +2442,15 @@ class Orchestrator:
                         prefer_cmd = (exe_size is None) or (exe_size == 0) or (noext_size == 0)
                         if prefer_cmd:
                             roots: list[Path] = []
+                            seen: set[Path] = set()
                             for r in [
                                 self.repo_root / failed_node_dir / "scripts",
                                 self.repo_root / "scripts",
                             ]:
-                                if r.exists() and r.is_dir():
-                                    roots.append(r)
+                                rr = r.resolve()
+                                if rr.exists() and rr.is_dir() and rr not in seen:
+                                    seen.add(rr)
+                                    roots.append(rr)
 
                             writes: list[packs.FileWrite] = []
                             files_changed: list[str] = []
@@ -2469,16 +2472,21 @@ class Orchestrator:
                                     # lines) that mention `.bin`, which is where npm shims live.
                                     out_lines: list[str] = []
                                     changed = False
-                                    prev_has_bin = False
+                                    in_bin_stmt = False
                                     for ln in src.splitlines(True):
-                                        has_bin = ".bin" in ln.lower()
-                                        if pat.search(ln) and (has_bin or prev_has_bin):
+                                        ll = ln.lower()
+                                        if in_bin_stmt and re.match(r"^\\s*(?:const|let|var)\\b", ln) and ".bin" not in ll:
+                                            in_bin_stmt = False
+                                        if not in_bin_stmt and ".bin" in ll:
+                                            in_bin_stmt = True
+                                        if in_bin_stmt and pat.search(ln):
                                             nl = pat.sub(f"{tool}.cmd", ln)
                                             changed = changed or (nl != ln)
                                             out_lines.append(nl)
                                         else:
                                             out_lines.append(ln)
-                                        prev_has_bin = has_bin
+                                        if in_bin_stmt and ";" in ln:
+                                            in_bin_stmt = False
                                     if not changed:
                                         continue
                                     dst = "".join(out_lines)
