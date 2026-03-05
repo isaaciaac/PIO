@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import re
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -103,6 +105,74 @@ def init(path: Optional[Path] = typer.Option(None, "--path", help="Repo path (de
     write_default_config(repo_root, cfg)
     write_manifests(repo_root)
     typer.echo(f"Initialized .vibe in {repo_root}")
+
+
+@app.command()
+def sandbox(
+    ctx: typer.Context,
+    keep: bool = typer.Option(True, "--keep/--clean", help="Keep sandbox dir on disk (default: keep)"),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Run local verification commands (default: verify)"),
+) -> None:
+    """
+    Create a temporary sandbox workspace and run an end-to-end dry run to ensure
+    Vibe can actually write files and execute verification commands.
+
+    This helps prevent "looks runnable but no files exist" situations by doing
+    real local execution in a disposable workspace.
+    """
+    # Force deterministic dry-run without requiring API keys.
+    os.environ["VIBE_MOCK_MODE"] = "1"
+    os.environ["VIBE_MOCK_WRITES"] = "1"
+
+    root = Path(tempfile.mkdtemp(prefix="vibe-sandbox-")).resolve()
+    try:
+        cfg = default_config()
+        ensure_vibe_dirs(root, agent_ids=list(cfg.agents.keys()))
+        write_default_config(root, cfg)
+        write_manifests(root)
+
+        # Seed a task.
+        tools = _make_toolbox(root, policy_override=(ctx.obj or {}).get("policy"))
+        ledger = Ledger(root, branch_id="main")
+        event = new_event(
+            agent="user",
+            type="REQ_CREATED",
+            summary="sandbox: smoke",
+            branch_id="main",
+            meta={"text": "sandbox: smoke test"},
+        )
+        ledger.append(event)
+
+        orch = Orchestrator(root, policy_mode=(ctx.obj or {}).get("policy"))
+        result = orch.run(task_id=event.id, route="L1", style="balanced", resume=False)
+
+        # Optional real local verification (not mocked).
+        if verify:
+            # Prefer python verification because mock-writes scaffolds a minimal python project.
+            py = shutil.which("python") or ""
+            if not py:
+                typer.echo(f"sandbox created: {root}")
+                typer.echo(f"checkpoint: {result.checkpoint_id}")
+                typer.echo("verify skipped: python not found on PATH", err=True)
+                return
+            try:
+                orch.toolbox.run_cmd(agent_id="router", cmd=[py, "main.py"], cwd=root, timeout_s=120)
+                orch.toolbox.run_cmd(agent_id="router", cmd=[py, "-m", "unittest", "-q"], cwd=root, timeout_s=120)
+            except Exception as e:
+                typer.echo(f"sandbox created: {root}")
+                typer.echo(f"checkpoint: {result.checkpoint_id}")
+                typer.echo(f"verify failed: {e}", err=True)
+                raise typer.Exit(code=4)
+
+        typer.echo(f"sandbox created: {root}")
+        typer.echo(f"task: {event.id}")
+        typer.echo(f"checkpoint: {result.checkpoint_id}")
+    finally:
+        if not keep:
+            try:
+                shutil.rmtree(root, ignore_errors=True)
+            except Exception:
+                pass
 
 
 @app.command()
