@@ -207,6 +207,18 @@ class MockProvider:
                 files_to_check=[],
                 pointers=[],
             )
+        elif schema is schemas.ImplementationBlueprint:
+            out = schemas.ImplementationBlueprint(
+                summary="mock: implementation blueprint (no-op scope)",
+                global_allowed_write_globs=["**"],
+                global_denied_write_globs=[".vibe/**", ".git/**"],
+                task_scopes=[],
+                fix_allowed_write_globs=[],
+                fix_denied_write_globs=[],
+                invariants=["mock: keep changes minimal and coherent"],
+                verification=["mock: run configured tests/lint/build"],
+                pointers=[],
+            )
         elif schema is schemas.ReviewReport:
             out = schemas.ReviewReport(passed=True, blockers=[], nits=[], pointers=[])
         elif schema is schemas.RiskRegister:

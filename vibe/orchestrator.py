@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fnmatch
 import hashlib
 import os
 import importlib.util
@@ -40,6 +41,54 @@ from vibe.knowledge.base import best_knowledge_snippet
 class RunResult:
     checkpoint_id: str
     green: bool
+
+
+class WriteScopeDeniedError(RuntimeError):
+    def __init__(self, *, path: str, allow: list[str], deny: list[str]) -> None:
+        allow_preview = ", ".join(list(allow or [])[:6])
+        deny_preview = ", ".join(list(deny or [])[:6])
+        msg = f"Write scope denied: {path}".strip()
+        if allow_preview:
+            msg = f"{msg} (allow=[{allow_preview}{'…' if len(list(allow or [])) > 6 else ''}])"
+        if deny_preview:
+            msg = f"{msg} (deny=[{deny_preview}{'…' if len(list(deny or [])) > 6 else ''}])"
+        super().__init__(msg)
+        self.path = path
+        self.allow = list(allow or [])
+        self.deny = list(deny or [])
+
+
+def _normalize_scope_pattern(pat: str) -> str:
+    return (str(pat or "").replace("\\", "/").strip()).lstrip("/")
+
+
+def _matches_scope_pattern(rel: str, pat: str) -> bool:
+    r = _normalize_scope_pattern(rel).lower()
+    p = _normalize_scope_pattern(pat).lower()
+    if not p:
+        return False
+    if any(ch in p for ch in ["*", "?", "["]):
+        try:
+            return fnmatch.fnmatch(r, p)
+        except Exception:
+            return False
+    p2 = p.rstrip("/")
+    if not p2:
+        return False
+    return r == p2 or r.startswith(p2 + "/")
+
+
+def _in_write_scope(rel: str, *, allow: list[str], deny: list[str]) -> bool:
+    r = _normalize_scope_pattern(rel)
+    if not r:
+        return False
+    d = [p for p in (deny or []) if _normalize_scope_pattern(p)]
+    a = [p for p in (allow or []) if _normalize_scope_pattern(p)]
+    if d and any(_matches_scope_pattern(r, p) for p in d[:200]):
+        return False
+    if a and not any(_matches_scope_pattern(r, p) for p in a[:400]):
+        return False
+    return True
 
 
 class Orchestrator:
@@ -752,6 +801,7 @@ class Orchestrator:
         interesting = {
             "ROUTE_SELECTED",
             "PLAN_CREATED",
+            "LEAD_BLUEPRINT_BUILT",
             "CONTEXT_PACKET_BUILT",
             "WORKSPACE_CONTRACT_BUILT",
             "ENV_PROBED",
@@ -3598,6 +3648,8 @@ class Orchestrator:
         activate_agent: Optional[Any] = None,
         route_level: Optional[packs.RouteLevel] = None,
         style: str = "",
+        write_allowlist: Optional[List[str]] = None,
+        write_denylist: Optional[List[str]] = None,
     ) -> Tuple[packs.CodeChange, List[str]]:
         def sanitize_content_for_path(path: str, content: str) -> str:
             rel = (path or "").replace("\\", "/").lstrip("/")
@@ -3605,10 +3657,18 @@ class Orchestrator:
                 return self._sanitize_package_json_text(content)
             return content
 
+        scope_allow = [_normalize_scope_pattern(p) for p in list(write_allowlist or []) if _normalize_scope_pattern(p)]
+        scope_deny = [_normalize_scope_pattern(p) for p in list(write_denylist or []) if _normalize_scope_pattern(p)]
+
         write_pointers: List[str] = []
         write_ops: list[dict[str, str]] = []
         copy_ops: list[dict[str, str]] = []
         ptrs: list[Optional[str]] = []
+
+        # When a write scope is active, do not allow "commit-only" changes since we can't
+        # deterministically validate touched files after the fact.
+        if (scope_allow or scope_deny) and change.commit_hash and not (change.writes or change.patch_pointer):
+            raise RuntimeError("Write scope enforced: commit_hash-only CodeChange is not allowed; use writes/patch")
         if change.writes:
             ptrs = [None for _ in list(change.writes)]
             pending: dict[str, list[int]] = {}
@@ -3618,6 +3678,8 @@ class Orchestrator:
                 rel = (w.path or "").replace("\\", "/").lstrip("/")
                 if rel.startswith(".vibe/") or rel.startswith(".git/"):
                     raise RuntimeError(f"Refusing to write internal path: {w.path}")
+                if (scope_allow or scope_deny) and not _in_write_scope(rel, allow=scope_allow, deny=scope_deny):
+                    raise WriteScopeDeniedError(path=rel, allow=scope_allow, deny=scope_deny)
                 try:
                     content = sanitize_content_for_path(w.path, w.content)
                     ptrs[idx] = self.toolbox.write_file(agent_id=actor_agent_id, path=w.path, content=content)
@@ -3666,6 +3728,8 @@ class Orchestrator:
                 dst = (c.dst or "").replace("\\", "/").lstrip("/")
                 if src.startswith(".vibe/") or src.startswith(".git/") or dst.startswith(".vibe/") or dst.startswith(".git/"):
                     raise RuntimeError(f"Refusing to copy internal path: {src} -> {dst}")
+                if (scope_allow or scope_deny) and dst and not _in_write_scope(dst, allow=scope_allow, deny=scope_deny):
+                    raise WriteScopeDeniedError(path=dst, allow=scope_allow, deny=scope_deny)
                 ptr = self.toolbox.copy_file(agent_id=actor_agent_id, src=src, dst=dst)
                 write_pointers.append(ptr)
                 copy_ops.append({"src": src, "dst": dst, "pointer": ptr})
@@ -3730,6 +3794,8 @@ class Orchestrator:
                         raise RuntimeError(f"Refusing to apply patch touching internal path: {p}")
                     if ":" in rel or rel.startswith("\\\\") or rel.startswith("//") or "/../" in f"/{rel}/":
                         raise RuntimeError(f"Refusing to apply patch with unsafe path: {p}")
+                    if (scope_allow or scope_deny) and not _in_write_scope(rel, allow=scope_allow, deny=scope_deny):
+                        raise WriteScopeDeniedError(path=rel, allow=scope_allow, deny=scope_deny)
 
                 patch_path = change.patch_pointer.split("@sha256:", 1)[0]
                 abs_patch = (self.repo_root / patch_path).resolve()
@@ -3765,6 +3831,8 @@ class Orchestrator:
         activate_agent: Optional[Any] = None,
         route_level: Optional[packs.RouteLevel] = None,
         style: str = "",
+        write_allowlist: Optional[List[str]] = None,
+        write_denylist: Optional[List[str]] = None,
         max_repairs: int = 2,
     ) -> Tuple[packs.CodeChange, List[str]]:
         """
@@ -3785,6 +3853,8 @@ class Orchestrator:
                     activate_agent=activate_agent,
                     route_level=route_level,
                     style=style,
+                    write_allowlist=write_allowlist,
+                    write_denylist=write_denylist,
                 )
             except Exception as e:
                 last_err = e
@@ -3801,6 +3871,7 @@ class Orchestrator:
                         "Missing npm dependencies for imports in CodeChange.writes",
                         "Ownership denied:",
                         "Ownership approval denied",
+                        "Write scope denied:",
                     ]
                 )
                 if not repairable or attempt >= max_repairs:
@@ -4236,6 +4307,7 @@ class Orchestrator:
 
         resolved_style = normalize_style(style_seed)
         workflow_hint = style_workflow_hint(resolved_style)
+        mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
 
         diff = self._git_diff_stats_best_effort()
         risks = detect_risks(task_text, diff=diff)
@@ -4367,6 +4439,7 @@ class Orchestrator:
             pass
 
         router = self._agent("router")
+        implementation_lead = self._agent("implementation_lead") if "implementation_lead" in self.config.agents else None
         pm = self._agent("pm") if "pm" in self.config.agents else None
         req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in self.config.agents else None
         architect = self._agent("architect") if "architect" in self.config.agents else None
@@ -4971,6 +5044,250 @@ class Orchestrator:
                 )
                 plan.tasks = [boot] + list(plan.tasks or [])[:4]
 
+        impl_blueprint: Optional[packs.ImplementationBlueprint] = None
+        impl_blueprint_ptr: Optional[str] = None
+
+        def _sanitize_blueprint(bp: packs.ImplementationBlueprint) -> packs.ImplementationBlueprint:
+            def clean(pats: List[str], *, limit: int) -> List[str]:
+                out: list[str] = []
+                seen: set[str] = set()
+                for raw in list(pats or [])[: max(0, limit * 3)]:
+                    s = _normalize_scope_pattern(str(raw or ""))
+                    if not s:
+                        continue
+                    # Never allow internal system dirs, and avoid unsafe paths.
+                    if s.startswith(".vibe/") or s.startswith(".git/"):
+                        continue
+                    if ":" in s or s.startswith("\\\\") or s.startswith("//") or "/../" in f"/{s}/":
+                        continue
+                    if s not in seen:
+                        seen.add(s)
+                        out.append(s)
+                    if len(out) >= limit:
+                        break
+                return out
+
+            bp.global_allowed_write_globs = clean(list(bp.global_allowed_write_globs or []), limit=48) or ["**"]
+            bp.global_denied_write_globs = clean(list(bp.global_denied_write_globs or []), limit=48)
+            bp.fix_allowed_write_globs = clean(list(bp.fix_allowed_write_globs or []), limit=48)
+            bp.fix_denied_write_globs = clean(list(bp.fix_denied_write_globs or []), limit=48)
+            try:
+                scopes = list(bp.task_scopes or [])
+            except Exception:
+                scopes = []
+            norm_scopes: list[packs.ImplementationBlueprintTaskScope] = []
+            for s in scopes[:64]:
+                try:
+                    sid = str(getattr(s, "task_id", "") or "").strip()
+                except Exception:
+                    sid = ""
+                if not sid:
+                    continue
+                allow = clean(list(getattr(s, "allowed_write_globs", []) or []), limit=24)
+                deny = clean(list(getattr(s, "denied_write_globs", []) or []), limit=24)
+                notes = str(getattr(s, "notes", "") or "").strip()
+                norm_scopes.append(
+                    packs.ImplementationBlueprintTaskScope(
+                        task_id=sid,
+                        allowed_write_globs=allow,
+                        denied_write_globs=deny,
+                        notes=notes,
+                    )
+                )
+            bp.task_scopes = norm_scopes
+            bp.invariants = [str(x).strip()[:240] for x in list(bp.invariants or []) if str(x).strip()][:16]
+            bp.verification = [str(x).strip()[:240] for x in list(bp.verification or []) if str(x).strip()][:12]
+            bp.pointers = [str(x).strip() for x in list(bp.pointers or []) if str(x).strip()][:24]
+            return bp
+
+        def _scope_for_plan_task(task: packs.PlanTask) -> tuple[list[str], list[str]]:
+            if impl_blueprint is None:
+                return [], []
+            tid = str(getattr(task, "id", "") or "").strip()
+            allow: list[str] = []
+            deny: list[str] = []
+            for s in list(impl_blueprint.task_scopes or [])[:96]:
+                if str(getattr(s, "task_id", "") or "").strip() != tid:
+                    continue
+                allow = list(getattr(s, "allowed_write_globs", []) or [])
+                deny = list(getattr(s, "denied_write_globs", []) or [])
+                break
+            if not allow:
+                allow = list(impl_blueprint.global_allowed_write_globs or [])
+            deny = list(impl_blueprint.global_denied_write_globs or []) + list(deny or [])
+            return allow, deny
+
+        def _scope_for_fix_loop() -> tuple[list[str], list[str]]:
+            if impl_blueprint is None:
+                return [], []
+            allow = list(impl_blueprint.fix_allowed_write_globs or [])
+            if not allow:
+                allow = list(impl_blueprint.global_allowed_write_globs or [])
+            deny = list(impl_blueprint.global_denied_write_globs or []) + list(impl_blueprint.fix_denied_write_globs or [])
+            return allow, deny
+
+        def maybe_build_implementation_blueprint(*, reason: str) -> None:
+            nonlocal impl_blueprint, impl_blueprint_ptr
+            if resume_mode:
+                return
+            cfg = self.config.agents.get("implementation_lead")
+            if cfg is None or not bool(getattr(cfg, "enabled", True)):
+                return
+            if route_level not in {"L2", "L3", "L4"}:
+                return
+            try:
+                can_call = mock_mode or self._api_key_available_for_agent("implementation_lead")
+            except Exception:
+                can_call = False
+            if not can_call or implementation_lead is None:
+                return
+
+            try:
+                activate_agent("implementation_lead", reason=reason)
+            except Exception:
+                pass
+
+            bp_system = (
+                "你是 implementation_lead（技术主管/代码一致性负责人）。目标：把架构/计划翻译成可落地的文件级实现蓝图，"
+                "减少 coder 各自为政导致的漂移/屎山化。\n"
+                "只输出符合 ImplementationBlueprint schema 的 JSON（不要 markdown，不要包裹对象）。\n\n"
+                "你必须给出：\n"
+                "- summary：一句话\n"
+                "- global_allowed_write_globs：全局允许改动的文件/路径 glob（repo-root 相对路径，使用 / 分隔；尽量收敛但要够用）\n"
+                "- task_scopes：为每个 PlanTask(task_id) 给更窄的 allowed_write_globs（可为空，表示沿用 global）\n"
+                "- fix_allowed_write_globs：fix-loop 允许改动的范围（可为空，表示沿用 global）\n"
+                "- invariants：跨任务必须保持一致的约束（端口/env 变量/目录命名/公共类型等）\n"
+                "- verification：最后如何验证（命令层面）\n\n"
+                "硬规则：\n"
+                "- 绝对禁止 `.vibe/**`、`.git/**`。\n"
+                "- 绝不要臆造“已有文件/脚本/页面”；如需新增文件，必须把路径纳入 allowed globs。\n"
+                "- 默认不要修改 node_modules；只有在 Windows shim/binary workaround 等必要时，才允许最小范围的 copy/writes。\n\n"
+                f"{workflow_hint}"
+            )
+            bp_user = (
+                f"Task:\n{task_text}\n\n"
+                f"RouteLevel: {route_level}\nStyle: {resolved_style}\n\n"
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"FullPlan:\n{plan.model_dump_json()}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if ctx_excerpts:
+                bp_user = f"{bp_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+
+            try:
+                bp_msgs = self._messages_with_memory(agent_id="implementation_lead", system=bp_system, user=bp_user)
+                bp, _ = implementation_lead.chat_json(schema=packs.ImplementationBlueprint, messages=bp_msgs, user=bp_user)
+                bp = _sanitize_blueprint(bp)
+                ptr = self.artifacts.put_json(bp.model_dump(), suffix=".impl_blueprint.json", kind="impl_blueprint").to_pointer()
+                impl_blueprint = bp
+                impl_blueprint_ptr = ptr
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="LEAD_BLUEPRINT_BUILT",
+                        summary="Implementation blueprint built",
+                        branch_id=self.branch_id,
+                        pointers=[ptr],
+                        meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id, "tasks": len(list(plan.tasks or []))},
+                    ),
+                    activated_agents=activated_agents,
+                )
+                try:
+                    ctx.log_pointers = list(ctx.log_pointers) + [ptr]
+                except Exception:
+                    pass
+            except Exception:
+                impl_blueprint = None
+                impl_blueprint_ptr = None
+
+        def maybe_build_fix_blueprint(
+            *,
+            reason: str,
+            blocker_source: str,
+            blocker_text: str,
+            extracted: list[str],
+            report: packs.TestReport,
+        ) -> None:
+            """
+            Escalation path: when fix-loop stagnates, consult implementation_lead to
+            provide a tighter file-level scope and invariants for convergence.
+            """
+            nonlocal impl_blueprint, impl_blueprint_ptr
+            cfg = self.config.agents.get("implementation_lead")
+            if cfg is None or not bool(getattr(cfg, "enabled", True)):
+                return
+            if route_level == "L0":
+                return
+            try:
+                can_call = mock_mode or self._api_key_available_for_agent("implementation_lead")
+            except Exception:
+                can_call = False
+            if not can_call or implementation_lead is None:
+                return
+
+            try:
+                activate_agent("implementation_lead", reason=reason)
+            except Exception:
+                pass
+
+            bp_system = (
+                "你是 implementation_lead（技术主管/代码一致性负责人）。当前工作流卡在 fix-loop，需要你提供“可收敛”的文件级修复范围与约束。\n"
+                "只输出符合 ImplementationBlueprint schema 的 JSON（不要 markdown，不要包裹对象）。\n"
+                "重点要求：\n"
+                "- fix_allowed_write_globs：只允许修复当前 blocker 所需的最小范围（可为空表示不限制）。\n"
+                "- fix_denied_write_globs：明确禁止改动的范围（可为空）。\n"
+                "- invariants：跨文件必须保持一致的关键约束。\n"
+                "- verification：优先给出最小验证命令集合（围绕失败命令）。\n"
+                "可选：task_scopes 可以留空；global_allowed_write_globs 仅在需要时给出。\n\n"
+                "硬规则：\n"
+                "- 绝对禁止 `.vibe/**`、`.git/**`。\n"
+                "- 不要凭空编造文件存在；如果你允许新增文件，请在 allow globs 里覆盖它。\n"
+                "- 默认不要修改 node_modules；只有在 Windows shim/binary workaround 等必要时，才允许最小范围 copy/writes。\n\n"
+                f"{workflow_hint}"
+            )
+            bp_user = (
+                f"Task:\n{task_text}\n\n"
+                f"BlockerSource: {blocker_source}\n"
+                f"Blocker:\n{blocker_text}\n\n"
+                + (
+                    "ExtractedErrors:\n" + "\n".join([f"- {x}" for x in list(extracted or [])[:20]]) + "\n\n"
+                    if extracted
+                    else ""
+                )
+                + f"TestReport:\n{report.model_dump_json()}\n\n"
+                + f"ContextPacket:\n{ctx.model_dump_json()}\n"
+            )
+            if ctx_excerpts:
+                bp_user = f"{bp_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            if impl_blueprint is not None:
+                bp_user = f"{bp_user}\n\nExistingBlueprint:\n{impl_blueprint.model_dump_json()}"
+
+            try:
+                bp_msgs = self._messages_with_memory(agent_id="implementation_lead", system=bp_system, user=bp_user)
+                bp, _ = implementation_lead.chat_json(schema=packs.ImplementationBlueprint, messages=bp_msgs, user=bp_user)
+                bp = _sanitize_blueprint(bp)
+                ptr = self.artifacts.put_json(bp.model_dump(), suffix=".impl_blueprint.fix.json", kind="impl_blueprint").to_pointer()
+                impl_blueprint = bp
+                impl_blueprint_ptr = ptr
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="LEAD_BLUEPRINT_BUILT",
+                        summary="Implementation blueprint updated for fix-loop",
+                        branch_id=self.branch_id,
+                        pointers=[ptr],
+                        meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id, "phase": "fix_loop"},
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                pass
+
+        maybe_build_implementation_blueprint(reason="gate:blueprint")
+
         def coder_actor(agent_id: str):
             if agent_id == "coder_frontend" and coder_frontend is not None:
                 return coder_frontend, "Frontend Coder (React/TypeScript)"
@@ -4981,6 +5298,27 @@ class Orchestrator:
         primary_coder, coder_role = coder_actor(primary_coder_id)
 
         def coder_system(*, role: str, task: packs.PlanTask) -> str:
+            scope_lines: list[str] = []
+            if impl_blueprint is not None:
+                try:
+                    allow, deny = _scope_for_plan_task(task)
+                except Exception:
+                    allow, deny = [], []
+                allow = [str(x).strip() for x in list(allow or []) if str(x).strip()][:12]
+                deny = [str(x).strip() for x in list(deny or []) if str(x).strip()][:12]
+                inv = [str(x).strip() for x in list(impl_blueprint.invariants or []) if str(x).strip()][:8]
+                ver = [str(x).strip() for x in list(impl_blueprint.verification or []) if str(x).strip()][:6]
+                if allow:
+                    scope_lines.append("Allowed write paths/globs (MUST stay within):\n" + "\n".join([f"- {p}" for p in allow]))
+                if deny:
+                    scope_lines.append("Denied write paths/globs:\n" + "\n".join([f"- {p}" for p in deny]))
+                if inv:
+                    scope_lines.append("Invariants (keep consistent across tasks):\n" + "\n".join([f"- {p}" for p in inv]))
+                if ver:
+                    scope_lines.append("End-state verification targets:\n" + "\n".join([f"- {p}" for p in ver]))
+            blueprint_hint = ""
+            if scope_lines:
+                blueprint_hint = "\n\nImplementationLeadBlueprint:\n" + "\n\n".join(scope_lines) + "\n"
             return (
                 f"You are {role}. Return JSON only for CodeChange with fields: "
                 "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
@@ -5010,7 +5348,7 @@ class Orchestrator:
                 "otherwise fall back to mock BUT label it clearly (e.g. `source=mock`) and document how to switch to real data in README.\n"
                 "- Never claim \"real\" data if it's mock; keep the UI/API honest.\n"
                 "\n\n"
-                f"{workflow_hint}"
+                f"{blueprint_hint}{workflow_hint}"
             )
 
         def task_user_text(*, task: packs.PlanTask) -> str:
@@ -5077,6 +5415,7 @@ class Orchestrator:
                     user=user_text,
                 )
                 task_change, _ = actor.chat_json(schema=packs.CodeChange, messages=msgs, user=user_text)
+                task_allow, task_deny = _scope_for_plan_task(t) if impl_blueprint is not None else ([], [])
                 task_change, write_ptrs = self._materialize_code_change_with_repair(
                     change=task_change,
                     actor_agent_id=agent_id,
@@ -5087,6 +5426,8 @@ class Orchestrator:
                     activate_agent=activate_agent,
                     route_level=route_level,
                     style=resolved_style,
+                    write_allowlist=task_allow,
+                    write_denylist=task_deny,
                 )
 
                 # Keep prompts downstream small: we only need patch evidence + file list.
@@ -5217,7 +5558,6 @@ class Orchestrator:
         qa_profile = qa_required_profile
         if route_level in {"L2", "L3", "L4"}:
             qa_profile = "smoke"
-        mock_mode = os.getenv("VIBE_MOCK_MODE", "").strip() == "1"
         qa_commands = self._determine_test_commands(profile=qa_profile)
 
         envspec_ptr: Optional[str] = None
@@ -5983,6 +6323,22 @@ class Orchestrator:
                 stagnating = sig_repeat >= 1
                 stagnating_hard = sig_repeat >= 2
 
+                # Escalation: if we are stuck (or on high routes even on first failure),
+                # consult implementation_lead to set a tighter, file-scoped fix plan.
+                if impl_blueprint is None and (
+                    (loop == 1 and route_level in {"L3", "L4"}) or stagnating_hard
+                ):
+                    try:
+                        maybe_build_fix_blueprint(
+                            reason="gate:blueprint_fix",
+                            blocker_source=blocker_source,
+                            blocker_text=blocker_text,
+                            extracted=extracted,
+                            report=report,
+                        )
+                    except Exception:
+                        pass
+
                 stagnation_help: str = ""
                 stagnation_ptrs: list[str] = []
                 if stagnating and blocker_source == "tests" and (not mock_mode):
@@ -6368,6 +6724,20 @@ class Orchestrator:
                     fix_role = "Integration Engineer (align frontend/backend/contracts)"
                 elif fix_coder_id == "coder_backend":
                     fix_role = "Backend Coder"
+                fix_allow, fix_deny = _scope_for_fix_loop() if impl_blueprint is not None else ([], [])
+                fix_scope_hint = ""
+                try:
+                    allow_short = [str(x).strip() for x in list(fix_allow or []) if str(x).strip()][:12]
+                    deny_short = [str(x).strip() for x in list(fix_deny or []) if str(x).strip()][:12]
+                except Exception:
+                    allow_short, deny_short = [], []
+                if allow_short or deny_short:
+                    lines: list[str] = []
+                    if allow_short:
+                        lines.append("Allowed write paths/globs (MUST stay within):\n" + "\n".join([f"- {p}" for p in allow_short]))
+                    if deny_short:
+                        lines.append("Denied write paths/globs:\n" + "\n".join([f"- {p}" for p in deny_short]))
+                    fix_scope_hint = "\n\nImplementationLeadWriteScope:\n" + "\n\n".join(lines)
                 if auto_change is None:
                     fix_msgs = self._messages_with_memory(
                         agent_id=fix_coder_id,
@@ -6386,7 +6756,7 @@ class Orchestrator:
                             "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
                             "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
                             "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
-                            f"{workflow_hint}"
+                            f"{fix_scope_hint}\n\n{workflow_hint}"
                         ),
                     user=fix_user,
                 )
@@ -6401,6 +6771,8 @@ class Orchestrator:
                         activate_agent=activate_agent,
                         route_level=route_level,
                         style=resolved_style,
+                        write_allowlist=fix_allow,
+                        write_denylist=fix_deny,
                     )
                 else:
                     change, write_pointers = self._materialize_code_change(
@@ -6410,6 +6782,8 @@ class Orchestrator:
                         activate_agent=activate_agent,
                         route_level=route_level,
                         style=resolved_style,
+                        write_allowlist=fix_allow,
+                        write_denylist=fix_deny,
                     )
                 try:
                     evidence = change.commit_hash or change.patch_pointer or ""

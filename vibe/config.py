@@ -186,6 +186,7 @@ def default_config() -> VibeConfig:
                 "ROUTE_SELECTED",
                 "AGENTS_ACTIVATED",
                 "PLAN_CREATED",
+                "LEAD_BLUEPRINT_BUILT",
                 "CONTEXT_PACKET_BUILT",
                 "STATE_TRANSITION",
                 "INCIDENT_CREATED",
@@ -582,6 +583,7 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
         needed = {
             "ROUTE_SELECTED",
             "AGENTS_ACTIVATED",
+            "LEAD_BLUEPRINT_BUILT",
             "INCIDENT_CREATED",
             "ENV_PROBED",
             "WORKSPACE_CONTRACT_BUILT",

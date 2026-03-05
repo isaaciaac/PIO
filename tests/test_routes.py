@@ -114,6 +114,7 @@ def test_cli_run_mock_route_L2_runs_review_and_creates_green_checkpoint(tmp_path
     assert cp.meta.get("route_level") == "L2"
 
     types = _ledger_types(tmp_path)
+    assert "LEAD_BLUEPRINT_BUILT" in types
     assert "USECASES_DEFINED" in types
     assert "ADR_ADDED" in types
     assert "REVIEW_PASSED" in types
@@ -139,6 +140,7 @@ def test_cli_run_mock_route_L3_runs_security_docs_release_and_creates_green_chec
     assert cp.meta.get("route_level") == "L3"
 
     types = _ledger_types(tmp_path)
+    assert "LEAD_BLUEPRINT_BUILT" in types
     assert "ENV_UPDATED" in types
     assert "SEC_REVIEW_PASSED" in types
     assert "DOC_UPDATED" in types
@@ -165,6 +167,7 @@ def test_cli_run_mock_route_L4_runs_compliance_perf_runbook_and_creates_green_ch
     assert cp.meta.get("route_level") == "L4"
 
     types = _ledger_types(tmp_path)
+    assert "LEAD_BLUEPRINT_BUILT" in types
     assert "COMPLIANCE_PASSED" in types
     assert "PERF_BENCH_RUN" in types
     assert "RUNBOOK_UPDATED" in types

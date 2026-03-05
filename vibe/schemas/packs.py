@@ -314,6 +314,102 @@ class FixPlanPack(BaseModel):
     pointers: List[str] = Field(default_factory=list)
 
 
+class ImplementationBlueprintTaskScope(BaseModel):
+    task_id: str
+    allowed_write_globs: List[str] = Field(default_factory=list)
+    denied_write_globs: List[str] = Field(default_factory=list)
+    notes: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "task_id" not in out:
+            for k in ("id", "task", "taskId"):
+                v = out.get(k)
+                if v is not None:
+                    try:
+                        out["task_id"] = str(v)
+                    except Exception:
+                        out["task_id"] = v
+                    break
+        if "allowed_write_globs" not in out:
+            for k in ("allow", "allowed", "allowed_writes", "allowed_paths", "allowed_globs"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["allowed_write_globs"] = v
+                    break
+        if "denied_write_globs" not in out:
+            for k in ("deny", "denied", "denylist", "denied_paths", "denied_globs"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["denied_write_globs"] = v
+                    break
+        return out
+
+
+class ImplementationBlueprint(BaseModel):
+    """
+    File-level guidance produced by the implementation_lead.
+
+    Used for:
+    - Constraining file write scope per plan task (reduce drift/"spaghetti" changes).
+    - Narrowing fix-loop changes to the minimal relevant surface area.
+    """
+
+    summary: str
+    global_allowed_write_globs: List[str] = Field(default_factory=list)
+    global_denied_write_globs: List[str] = Field(default_factory=list)
+    task_scopes: List[ImplementationBlueprintTaskScope] = Field(default_factory=list)
+    fix_allowed_write_globs: List[str] = Field(default_factory=list)
+    fix_denied_write_globs: List[str] = Field(default_factory=list)
+    invariants: List[str] = Field(default_factory=list)
+    verification: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+
+        # Common key variants.
+        if "global_allowed_write_globs" not in out:
+            for k in ("global_allow", "global_allowed", "allowed", "allow", "write_allowlist"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["global_allowed_write_globs"] = v
+                    break
+        if "global_denied_write_globs" not in out:
+            for k in ("global_deny", "global_denied", "denied", "deny", "write_denylist"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["global_denied_write_globs"] = v
+                    break
+        if "task_scopes" not in out:
+            for k in ("tasks", "scopes", "taskScopes"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["task_scopes"] = v
+                    break
+        if "fix_allowed_write_globs" not in out:
+            for k in ("fix_allow", "fix_allowed", "fix_scope_allow", "fix_write_allowlist"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["fix_allowed_write_globs"] = v
+                    break
+        if "fix_denied_write_globs" not in out:
+            for k in ("fix_deny", "fix_denied", "fix_scope_deny", "fix_write_denylist"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["fix_denied_write_globs"] = v
+                    break
+        return out
+
+
 class ReviewReport(BaseModel):
     passed: bool
     blockers: List[str] = Field(default_factory=list)
