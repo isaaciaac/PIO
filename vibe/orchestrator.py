@@ -723,6 +723,111 @@ class Orchestrator:
             if event.type not in allowed:
                 raise RuntimeError(f"Ledger write type not allowed for agent {event.agent}: {event.type}")
         self.ledger.append(event)
+        try:
+            self._cc_implementation_lead(event)
+        except Exception:
+            pass
+
+    def _cc_implementation_lead(self, event: LedgerEvent) -> None:
+        """
+        Always-on "CC" channel for the implementation lead.
+
+        Goal: even when we don't actively consult the lead for small changes, they should
+        still have a pointer-backed, structured trace of what coders/QA/router did. This
+        helps prevent "各自为政" drift and enables fast escalation when issues grow.
+
+        This is intentionally best-effort and compact (no long logs, only pointers).
+        """
+        if "implementation_lead" not in self.config.agents:
+            return
+
+        if (event.agent or "").strip() in {"implementation_lead"}:
+            return
+
+        t = str(event.type or "").strip()
+        if not t:
+            return
+
+        # Keep signal high: only CC key workflow events.
+        interesting = {
+            "ROUTE_SELECTED",
+            "PLAN_CREATED",
+            "CONTEXT_PACKET_BUILT",
+            "WORKSPACE_CONTRACT_BUILT",
+            "ENV_PROBED",
+            "ENV_UPDATED",
+            "PATCH_WRITTEN",
+            "CODE_COMMIT",
+            "CODE_REFACTOR",
+            "TEST_RUN",
+            "TEST_PASSED",
+            "TEST_FAILED",
+            "INCIDENT_CREATED",
+            "REVIEW_PASSED",
+            "REVIEW_BLOCKED",
+            "SEC_REVIEW_PASSED",
+            "SEC_REVIEW_BLOCKED",
+            "CHECKPOINT_CREATED",
+        }
+        if t not in interesting:
+            return
+
+        kind = "strategy"
+        if t in {"TEST_FAILED", "INCIDENT_CREATED", "REVIEW_BLOCKED", "SEC_REVIEW_BLOCKED"}:
+            kind = "incident"
+        elif t == "CHECKPOINT_CREATED":
+            kind = "postmortem"
+
+        meta = event.meta if isinstance(event.meta, dict) else {}
+
+        def _take_str(x: Any, *, limit: int = 240) -> str:
+            s = str(x or "").strip().replace("\r", "").replace("\t", " ")
+            if len(s) > limit:
+                s = s[:limit] + "…"
+            return s
+
+        pinned: list[str] = []
+        pinned.append(f"event={event.id}")
+        if meta.get("route_level"):
+            pinned.append(f"route_level={_take_str(meta.get('route_level'), limit=40)}")
+        if meta.get("style"):
+            pinned.append(f"style={_take_str(meta.get('style'), limit=40)}")
+        if meta.get("phase"):
+            pinned.append(f"phase={_take_str(meta.get('phase'), limit=40)}")
+        if meta.get("loop") is not None:
+            pinned.append(f"loop={_take_str(meta.get('loop'), limit=20)}")
+
+        files = meta.get("files_changed")
+        if isinstance(files, list) and files:
+            shown = ", ".join([_take_str(x, limit=80) for x in list(files)[:8] if str(x).strip()]).strip()
+            if shown:
+                pinned.append(f"files={shown}" + (" …" if len(files) > 8 else ""))
+
+        cmds = meta.get("commands")
+        if isinstance(cmds, list) and cmds:
+            shown = " | ".join([_take_str(x, limit=120) for x in list(cmds)[:2] if str(x).strip()]).strip()
+            if shown:
+                pinned.append(f"cmds={shown}" + (" …" if len(cmds) > 2 else ""))
+
+        blocker = meta.get("blocker")
+        if isinstance(blocker, str) and blocker.strip():
+            pinned.append("blocker=" + _take_str(self._compact_error_excerpt(blocker, max_lines=18, max_chars=320), limit=320))
+
+        summary = f"{event.agent} {t}: {str(event.summary or '').strip()}".strip()
+        summary = _take_str(summary, limit=220)
+
+        view_dir = self.repo_root / ".vibe" / "views" / "implementation_lead"
+        mem_path = view_dir / "memory.jsonl"
+        append_memory_record(
+            mem_path,
+            MemoryRecord(
+                ts=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                agent_id="implementation_lead",
+                kind=kind,  # type: ignore[arg-type]
+                digest=ChatDigest(summary=summary, pinned=pinned[:8], background=[], open_questions=[]),
+                pointers=list(event.pointers or [])[:24],
+            ),
+        )
 
     def _agent_memory_system(self, agent_id: str) -> Optional[str]:
         view_dir = self.repo_root / ".vibe" / "views" / agent_id

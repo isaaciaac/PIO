@@ -199,6 +199,17 @@ def default_config() -> VibeConfig:
             ],
             tools_allowed=["read_file", "run_cmd", "git", "search", "write_file", "copy_file", "scan_repo"],
         ),
+        "implementation_lead": agent(
+            "implementation_lead",
+            enabled=True,
+            provider="deepseek",
+            model="deepseek-reasoner",
+            purpose="Keep code structure coherent across coders; translate architecture into implementable structure and supervise changes",
+            capabilities=["implementation_lead", "code_structure", "supervision", "review"],
+            io_schema="vibe.schemas.packs.ChatReply",
+            ledger_write_types=[],
+            tools_allowed=["read_file", "read_artifact", "git", "search"],
+        ),
         "log_compressor": agent(
             "log_compressor",
             enabled=False,
@@ -664,6 +675,12 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
     if "specialist" not in cfg.agents:
         try:
             cfg.agents["specialist"] = default_config().agents["specialist"]
+        except Exception:
+            pass
+
+    if "implementation_lead" not in cfg.agents:
+        try:
+            cfg.agents["implementation_lead"] = default_config().agents["implementation_lead"]
         except Exception:
             pass
 

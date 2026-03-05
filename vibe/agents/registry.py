@@ -13,6 +13,13 @@ class RouterAgent(BaseAgent):
     default_model = "qwen-plus"
 
 
+class ImplementationLeadAgent(BaseAgent):
+    agent_id = "implementation_lead"
+    output_schema = packs.ChatReply
+    default_provider = "deepseek"
+    default_model = "deepseek-reasoner"
+
+
 class LogCompressorAgent(BaseAgent):
     agent_id = "log_compressor"
     output_schema = packs.LogIndex
@@ -192,6 +199,7 @@ AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     cls.agent_id: cls
     for cls in [
         RouterAgent,
+        ImplementationLeadAgent,
         LogCompressorAgent,
         ResearcherAgent,
         WebInfoAgent,
