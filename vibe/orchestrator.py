@@ -24,6 +24,7 @@ from vibe.storage.checkpoints import CheckpointsStore, Checkpoint
 from vibe.storage.ledger import Ledger
 from vibe.storage.ledger import ledger_path
 from vibe.toolbox import Toolbox
+from vibe.repo import ensure_vibe_dirs
 from vibe.routes import DiffStats, decide_route, detect_risks
 from vibe.routes import RiskSignals
 from vibe.context import append_memory_record, effective_context_config, read_memory_records
@@ -48,6 +49,12 @@ class Orchestrator:
         if not cfg_path.exists():
             raise FileNotFoundError("Missing .vibe/vibe.yaml. Run `vibe init` first.")
         self.config = VibeConfig.load(cfg_path)
+
+        # Ensure any newly introduced .vibe subdirs/files exist without requiring re-init.
+        try:
+            ensure_vibe_dirs(repo_root, agent_ids=list(self.config.agents.keys()))
+        except Exception:
+            pass
 
         self.policy = ToolPolicy(mode=resolve_policy_mode(self.config.policy.mode, override=policy_mode))
         self.toolbox = Toolbox(repo_root, config=self.config, policy=self.policy)
