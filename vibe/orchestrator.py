@@ -2424,14 +2424,23 @@ class Orchestrator:
                 if tool and len(tool) <= 60:
                     bin_dir = (self.repo_root / failed_node_dir / "node_modules" / ".bin").resolve()
                     exe_path = (bin_dir / f"{tool}.exe").resolve()
+                    noext_path = (bin_dir / f"{tool}").resolve()
                     cmd_path = (bin_dir / f"{tool}.cmd").resolve()
-                    if exe_path.exists() and cmd_path.exists():
+                    if cmd_path.exists():
                         try:
-                            exe_size = int(exe_path.stat().st_size)
+                            exe_size = int(exe_path.stat().st_size) if exe_path.exists() else None
                         except Exception:
-                            exe_size = -1
-                        # Only auto-fix when the `.exe` is clearly bogus (0 bytes), to avoid breaking legit native bins.
-                        if exe_size == 0:
+                            exe_size = None
+                        try:
+                            noext_size = int(noext_path.stat().st_size) if noext_path.exists() else None
+                        except Exception:
+                            noext_size = None
+
+                        # Only auto-fix when the `.exe` is clearly bogus/missing. On Windows,
+                        # npm typically provides `<tool>.cmd` as the real entrypoint; a `.exe`
+                        # may be missing or a zero-byte placeholder.
+                        prefer_cmd = (exe_size is None) or (exe_size == 0) or (noext_size == 0)
+                        if prefer_cmd:
                             roots: list[Path] = []
                             for r in [
                                 self.repo_root / failed_node_dir / "scripts",
@@ -2455,9 +2464,25 @@ class Orchestrator:
                                         continue
                                     if not pat.search(src):
                                         continue
-                                    dst = pat.sub(f"{tool}.cmd", src)
-                                    if dst == src:
+
+                                    # Avoid clobbering "manual bin/" fallbacks: only rewrite lines (or adjacent
+                                    # lines) that mention `.bin`, which is where npm shims live.
+                                    out_lines: list[str] = []
+                                    changed = False
+                                    prev_has_bin = False
+                                    for ln in src.splitlines(True):
+                                        has_bin = ".bin" in ln.lower()
+                                        if pat.search(ln) and (has_bin or prev_has_bin):
+                                            nl = pat.sub(f"{tool}.cmd", ln)
+                                            changed = changed or (nl != ln)
+                                            out_lines.append(nl)
+                                        else:
+                                            out_lines.append(ln)
+                                        prev_has_bin = has_bin
+                                    if not changed:
                                         continue
+                                    dst = "".join(out_lines)
+
                                     rel = p.relative_to(self.repo_root).as_posix()
                                     writes.append(packs.FileWrite(path=rel, content=dst))
                                     files_changed.append(rel)
@@ -2469,9 +2494,7 @@ class Orchestrator:
                             if writes:
                                 return packs.CodeChange(
                                     kind="patch",
-                                    summary=(
-                                        f"auto-fix: avoid 0-byte `{tool}.exe` placeholder shim by using `{tool}.cmd` on Windows"
-                                    ),
+                                    summary=f"auto-fix: prefer `{tool}.cmd` over `{tool}.exe` in node_modules/.bin on Windows",
                                     writes=writes,
                                     files_changed=files_changed,
                                     blockers=[],

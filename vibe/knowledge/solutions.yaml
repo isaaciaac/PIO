@@ -9,6 +9,7 @@ entries:
     actions:
       - "不要直接执行/校验 `node_modules/.bin/<tool>.exe`（可能是 0 字节占位）。优先 `npm run <script>` / `npx <tool>`，或在 Windows 上改用 `<tool>.cmd`。"
       - "如果脚本里硬编码了 `<tool>.exe`：把它替换为 `<tool>.cmd`（让 cmd shim 去定位真实二进制）。"
+      - "如果 `node_modules/.bin/<tool>.exe` 根本不存在但 `<tool>.cmd` 存在：这通常也是 npm 在 Windows 的正常布局；脚本应优先使用 `<tool>.cmd`。"
 
   - id: node_redeclare_dirname_filename
     title: Node CommonJS 中重复声明 __dirname/__filename 导致 SyntaxError
@@ -18,4 +19,3 @@ entries:
     actions:
       - "在 CommonJS 下，`__dirname`/`__filename` 已由 Node 提供；删除脚本里 `const __dirname = ...` / `const __filename = ...` 的重复声明即可。"
       - "如果项目是 ESM（package.json: type=module），不要用 `__dirname`；用 `import.meta.url` + `fileURLToPath()` 计算目录并使用不同变量名（不要叫 `__dirname`）。"
-
