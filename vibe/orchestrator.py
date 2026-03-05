@@ -2411,15 +2411,14 @@ class Orchestrator:
                 return (m.group("bin") or "").strip()
             return ""
 
-        # 0) Windows/Node: some packages create 0-byte `.exe` placeholder shims in `node_modules/.bin`.
-        # If a script treats that `.exe` as the real binary and fails, prefer the `.cmd` shim.
-        if os.name == "nt" and "node_modules" in lower and ".bin" in lower:
+        # 0) Windows/Node: npm tools typically expose `.cmd`/`.ps1` wrappers under `node_modules/.bin`.
+        # A `.exe` may be missing or be a zero-byte placeholder shim; prefer `.cmd` for scripts that hardcode `.exe`.
+        if os.name == "nt" and re.search(r"node_modules[\\/](?:\.bin|bin)[\\/]", lower or ""):
             try:
-                m = re.search(
-                    r"node_modules[\\/]\.bin[\\/](?P<tool>[A-Za-z0-9_.-]+)\.exe",
-                    text,
-                    flags=re.IGNORECASE,
-                )
+                m = re.search(r"node_modules[\\/]\.bin[\\/](?P<tool>[A-Za-z0-9_.-]+)\.exe", text, flags=re.IGNORECASE)
+                if not m:
+                    # Common typo: `node_modules/bin/<tool>.exe` (missing dot)
+                    m = re.search(r"node_modules[\\/]bin[\\/](?P<tool>[A-Za-z0-9_.-]+)\.exe", text, flags=re.IGNORECASE)
                 tool = (m.group("tool") or "").strip() if m else ""
                 if tool and len(tool) <= 60:
                     bin_dir = (self.repo_root / failed_node_dir / "node_modules" / ".bin").resolve()
@@ -2469,18 +2468,24 @@ class Orchestrator:
                                         continue
 
                                     # Avoid clobbering "manual bin/" fallbacks: only rewrite lines (or adjacent
-                                    # lines) that mention `.bin`, which is where npm shims live.
+                                    # lines) that refer to node_modules + (.bin or the common 'bin' typo).
                                     out_lines: list[str] = []
                                     changed = False
                                     in_bin_stmt = False
                                     for ln in src.splitlines(True):
                                         ll = ln.lower()
-                                        if in_bin_stmt and re.match(r"^\\s*(?:const|let|var)\\b", ln) and ".bin" not in ll:
+                                        node_bin_hint = ("node_modules" in ll) and (
+                                            ".bin" in ll or "'bin'" in ll or '"bin"' in ll or "\\bin\\" in ll or "/bin/" in ll
+                                        )
+                                        if in_bin_stmt and re.match(r"^\\s*(?:const|let|var)\\b", ln) and (".bin" not in ll) and (not node_bin_hint):
                                             in_bin_stmt = False
-                                        if not in_bin_stmt and ".bin" in ll:
+                                        if not in_bin_stmt and (".bin" in ll or node_bin_hint):
                                             in_bin_stmt = True
                                         if in_bin_stmt and pat.search(ln):
                                             nl = pat.sub(f"{tool}.cmd", ln)
+                                            # Also correct the common `node_modules/bin` typo -> `node_modules/.bin`.
+                                            if "node_modules" in ll and ".bin" not in ll:
+                                                nl = re.sub(r"(?i)(['\"])bin\1", r"\1.bin\1", nl)
                                             changed = changed or (nl != ln)
                                             out_lines.append(nl)
                                         else:
