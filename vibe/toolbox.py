@@ -69,6 +69,26 @@ class Toolbox:
             self.policy.check(agent_id=agent_id, tool="write_file", detail=f"write {path} (bytes={len(content.encode('utf-8'))})")
         return self.fs.write_file(path, content)
 
+    def copy_file(self, *, agent_id: str, src: str, dst: str) -> str:
+        if _is_internal_path(src) or _is_internal_path(dst):
+            raise PolicyDeniedError("Refusing to copy internal path under .vibe/ or .git/.")
+
+        # Ownership/authority gate applies to destination paths.
+        try:
+            if getattr(getattr(self.config, "governance", None), "ownership", None) and self.config.governance.ownership.enabled:
+                rel_dst = normalize_relpath(dst)
+                rule = match_ownership_rule(path=rel_dst, rules=self.config.governance.ownership.rules)
+            else:
+                rule = None
+        except Exception:
+            rule = None
+        if rule and list(rule.owners or []) and agent_id not in set(rule.owners) and agent_id != "router":
+            raise OwnershipDeniedError(agent_id=agent_id, path=dst, rule=rule)
+
+        self._require_tool_allowed(agent_id=agent_id, tool="copy_file")
+        self.policy.check(agent_id=agent_id, tool="copy_file", detail=f"copy {src} -> {dst}")
+        return self.fs.copy_file(src, dst)
+
     def run_cmd(self, *, agent_id: str, cmd: Cmd, cwd: Optional[Path] = None, timeout_s: int = 600) -> CmdResult:
         self._require_tool_allowed(agent_id=agent_id, tool="run_cmd")
         self.policy.check(agent_id=agent_id, tool="run_cmd", detail=f"run {cmd!r} (cwd={cwd or self.repo_root})")

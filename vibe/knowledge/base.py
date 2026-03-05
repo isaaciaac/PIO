@@ -23,6 +23,16 @@ def _kb_path() -> Path:
     return (Path(__file__).resolve().parent / "solutions.yaml").resolve()
 
 
+def _repo_kb_path(repo_root: Optional[Path]) -> Optional[Path]:
+    if repo_root is None:
+        return None
+    try:
+        p = (Path(repo_root).resolve() / ".vibe" / "knowledge" / "solutions.yaml").resolve()
+    except Exception:
+        return None
+    return p if p.exists() else None
+
+
 @lru_cache(maxsize=1)
 def load_knowledge() -> List[KnowledgeEntry]:
     path = _kb_path()
@@ -47,7 +57,52 @@ def load_knowledge() -> List[KnowledgeEntry]:
     return out
 
 
-def match_knowledge(text: str, *, limit: int = 3) -> List[Tuple[KnowledgeEntry, float]]:
+def load_knowledge_for_repo(repo_root: Optional[Path]) -> List[KnowledgeEntry]:
+    """
+    Load knowledge entries from:
+      1) workspace-local `.vibe/knowledge/solutions.yaml` (if present)
+      2) built-in `vibe/knowledge/solutions.yaml`
+
+    Local entries override built-in by `id`.
+    """
+
+    local_path = _repo_kb_path(repo_root)
+    builtin = load_knowledge()
+    local: List[KnowledgeEntry] = []
+    if local_path is not None:
+        try:
+            data = yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            data = {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if isinstance(entries, list):
+            for it in entries[:400]:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    local.append(KnowledgeEntry.model_validate(it))
+                except Exception:
+                    continue
+
+    if not local:
+        return builtin
+
+    merged: List[KnowledgeEntry] = []
+    seen: set[str] = set()
+    for e in local:
+        if e.id in seen:
+            continue
+        seen.add(e.id)
+        merged.append(e)
+    for e in builtin:
+        if e.id in seen:
+            continue
+        seen.add(e.id)
+        merged.append(e)
+    return merged
+
+
+def match_knowledge(text: str, *, limit: int = 3, repo_root: Optional[Path] = None) -> List[Tuple[KnowledgeEntry, float]]:
     """
     Lightweight regex-based matching against the built-in knowledge base.
 
@@ -56,7 +111,7 @@ def match_knowledge(text: str, *, limit: int = 3) -> List[Tuple[KnowledgeEntry, 
     t = (text or "").strip()
     if not t:
         return []
-    entries = load_knowledge()
+    entries = load_knowledge_for_repo(repo_root)
     if not entries:
         return []
 
@@ -81,8 +136,8 @@ def match_knowledge(text: str, *, limit: int = 3) -> List[Tuple[KnowledgeEntry, 
     return scored[: max(0, int(limit))]
 
 
-def best_knowledge_snippet(text: str, *, max_lines: int = 10) -> Optional[str]:
-    matches = match_knowledge(text, limit=1)
+def best_knowledge_snippet(text: str, *, max_lines: int = 10, repo_root: Optional[Path] = None) -> Optional[str]:
+    matches = match_knowledge(text, limit=1, repo_root=repo_root)
     if not matches:
         return None
     entry, _score = matches[0]
@@ -96,4 +151,3 @@ def best_knowledge_snippet(text: str, *, max_lines: int = 10) -> Optional[str]:
         if len(lines) >= max_lines:
             break
     return "\n".join(lines).strip() if lines else None
-

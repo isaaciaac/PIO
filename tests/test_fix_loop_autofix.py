@@ -221,9 +221,7 @@ def test_auto_fix_ts_auth_export_mismatch(tmp_path: Path, monkeypatch) -> None:
 
     orch = Orchestrator(tmp_path)
     report = _dummy_failed_report('cd /d "server" && npm run build')
-    blocker = (
-        "src/routes/customer.routes.ts(1,10): error TS2614: Module '\"../middleware/auth\"' has no exported member 'auth'.\n"
-    )
+    blocker = "src/routes/customer.routes.ts(1,10): error TS2614: Module '\"../middleware/auth\"' has no exported member 'auth'.\n"
     change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
     assert change is not None
     assert len(change.writes) == 1
@@ -232,3 +230,33 @@ def test_auto_fix_ts_auth_export_mismatch(tmp_path: Path, monkeypatch) -> None:
     orch._materialize_code_change(change, actor_agent_id="coder_backend")
     text = (tmp_path / "server" / "src" / "middleware" / "auth.ts").read_text(encoding="utf-8")
     assert "export const auth = authenticate" in text
+
+
+def test_auto_fix_hugo_vendor_copy_to_bin(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    r = runner.invoke(app, ["init"])
+    assert r.exit_code == 0, r.output
+
+    # Simulate hugo-bin layout: real binary under vendor, but .bin/hugo.exe is missing or 0-byte.
+    vendor = tmp_path / "node_modules" / "hugo-bin" / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
+    src = vendor / "hugo.exe"
+    src.write_bytes(b"not-a-real-exe-but-binary-bytes")
+
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    dst = bin_dir / "hugo.exe"
+    dst.write_bytes(b"")
+
+    orch = Orchestrator(tmp_path)
+    cmd = "npm run build"
+    report = _dummy_failed_report(cmd)
+    blocker = f"Hugo binary found but is 0-byte: {dst}\nPlease run 'npm install' or manually install Hugo."
+    change = orch._auto_code_change_for_test_failure(report=report, blocker_text=blocker)
+    assert change is not None
+    assert getattr(change, "copies", None), "expected a copy operation for Hugo vendor fallback"
+
+    orch._materialize_code_change(change, actor_agent_id="coder_backend")
+    assert dst.exists()
+    assert dst.read_bytes() == src.read_bytes()

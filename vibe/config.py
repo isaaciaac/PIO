@@ -197,7 +197,7 @@ def default_config() -> VibeConfig:
                 "CHECKPOINT_CREATED",
                 "BRANCH_CREATED",
             ],
-            tools_allowed=["read_file", "run_cmd", "git", "search", "write_file", "scan_repo"],
+            tools_allowed=["read_file", "run_cmd", "git", "search", "write_file", "copy_file", "scan_repo"],
         ),
         "log_compressor": agent(
             "log_compressor",
@@ -324,7 +324,7 @@ def default_config() -> VibeConfig:
             capabilities=["env", "build", "run", "tests", "node", "python"],
             io_schema="vibe.schemas.packs.EnvSpec",
             ledger_write_types=["ENV_PROBED", "ENV_UPDATED"],
-            tools_allowed=["run_cmd", "read_file", "write_file"],
+            tools_allowed=["run_cmd", "read_file", "write_file", "copy_file"],
         ),
         "devops": agent(
             "devops",
@@ -358,7 +358,7 @@ def default_config() -> VibeConfig:
             capabilities=["code", "backend", "node", "typescript", "eslint", "debug"],
             io_schema="vibe.schemas.packs.CodeChange",
             ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN", "CODE_REFACTOR"],
-            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+            tools_allowed=["read_file", "write_file", "copy_file", "run_cmd", "git", "search"],
         ),
         "coder_frontend": agent(
             "coder_frontend",
@@ -369,7 +369,7 @@ def default_config() -> VibeConfig:
             capabilities=["code", "frontend", "react", "vite", "node", "typescript", "eslint", "debug"],
             io_schema="vibe.schemas.packs.CodeChange",
             ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN", "CODE_REFACTOR"],
-            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+            tools_allowed=["read_file", "write_file", "copy_file", "run_cmd", "git", "search"],
         ),
         "integration_engineer": agent(
             "integration_engineer",
@@ -380,7 +380,7 @@ def default_config() -> VibeConfig:
             capabilities=["code", "integration", "contract", "node", "typescript", "debug"],
             io_schema="vibe.schemas.packs.CodeChange",
             ledger_write_types=["CODE_COMMIT", "PATCH_WRITTEN"],
-            tools_allowed=["read_file", "write_file", "run_cmd", "git", "search"],
+            tools_allowed=["read_file", "write_file", "copy_file", "run_cmd", "git", "search"],
         ),
         "code_reviewer": agent(
             "code_reviewer",
@@ -470,7 +470,7 @@ def default_config() -> VibeConfig:
             capabilities=["ops", "triage", "debug"],
             io_schema="vibe.schemas.packs.FixPlanPack",
             ledger_write_types=[],
-            tools_allowed=["read_file", "read_artifact", "search", "run_cmd"],
+            tools_allowed=["read_file", "read_artifact", "search", "run_cmd", "copy_file"],
         ),
         "specialist": agent(
             "specialist",
@@ -481,7 +481,7 @@ def default_config() -> VibeConfig:
             capabilities=["specialist", "debug", "triage"],
             io_schema="vibe.schemas.packs.ChatReply",
             ledger_write_types=[],
-            tools_allowed=["read_file", "read_artifact", "search", "run_cmd"],
+            tools_allowed=["read_file", "read_artifact", "search", "run_cmd", "copy_file"],
         ),
     }
 
@@ -586,6 +586,15 @@ def _migrate_config_in_memory(cfg: VibeConfig) -> None:
         existing_tools = set(router.tools_allowed or [])
         if not needed_tools.issubset(existing_tools):
             router.tools_allowed = sorted(existing_tools | needed_tools)
+
+    # Tooling: add copy_file to key agents when missing (non-breaking; enables binary workarounds).
+    for aid in ["router", "env_engineer", "coder_backend", "coder_frontend", "integration_engineer", "ops_engineer", "specialist"]:
+        a = cfg.agents.get(aid)
+        if a is None:
+            continue
+        existing_tools = set(a.tools_allowed or [])
+        if "copy_file" not in existing_tools and ("write_file" in existing_tools or aid in {"ops_engineer", "specialist", "router"}):
+            a.tools_allowed = sorted(existing_tools | {"copy_file"})
 
     # Route profiles: older configs may not include env_engineer in L1/L2; we add it only
     # when the profile matches the historical default exactly to avoid surprising custom setups.

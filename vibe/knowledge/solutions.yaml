@@ -31,3 +31,15 @@ entries:
       - "脚本不要 `spawn('.../.bin/<tool>.exe')` 或用 `stat.size>0` 去“验真”；优先执行 `<tool>.cmd`，或直接用 `npm exec -- <tool>` / `npx <tool>`。"
       - "如果脚本同时有 `node_modules/.bin/` 和 `bin/` 手动回退：只把 `.bin` 那段改成 `.cmd`，`bin/` 回退保持原二进制扩展名。"
       - "如果脚本写成了 `node_modules/bin/<tool>.exe`（缺少点）：改为 `node_modules/.bin/<tool>.cmd`。"
+
+  - id: hugo_bin_vendor_fallback
+    title: hugo-bin 在 Windows 下的 vendor 二进制回退（避免 .bin/.exe 入口坑）
+    tags: ["windows", "node", "hugo", "hugo-bin", "tooling"]
+    patterns:
+      - "No valid Hugo binary found|Hugo binary found but is 0-byte"
+      - "hugo-bin"
+      - "node_modules[\\\\/](?:\\.bin|bin)[\\\\/]hugo\\.exe"
+    actions:
+      - "优先入口：`node_modules/.bin/hugo.cmd`（由 npm shim 调用 `hugo-bin/bin/cli.js`，再定位真实二进制）。"
+      - "如果项目脚本硬编码检查 `node_modules/.bin/hugo.exe`：不要做 size>0 校验；改为优先 `.cmd`，并在 Windows 下增加 vendor 回退：`node_modules/hugo-bin/vendor/hugo.exe`。"
+      - "紧急但不推荐：如果你必须满足某个脚本只认 `.bin/hugo.exe`，可把 `node_modules/hugo-bin/vendor/hugo.exe` 复制到 `node_modules/.bin/hugo.exe`（注意：重新 `npm install` 可能覆盖，最好改脚本或加 postinstall）。"

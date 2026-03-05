@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -39,3 +40,18 @@ class FsTool:
         rel = abs_path.relative_to(self.repo_root).as_posix()
         return f"{rel}@sha256:{digest}"
 
+    def copy_file(self, src: str | Path, dst: str | Path) -> str:
+        src_abs = (self.repo_root / src).resolve()
+        dst_abs = (self.repo_root / dst).resolve()
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+
+        h = hashlib.sha256()
+        with src_abs.open("rb") as r, dst_abs.open("wb") as w:
+            shutil.copyfileobj(r, w, length=1024 * 1024)
+        # Hash the destination (single source of truth)
+        with dst_abs.open("rb") as rr:
+            for chunk in iter(lambda: rr.read(1024 * 1024), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+        rel = dst_abs.relative_to(self.repo_root).as_posix()
+        return f"{rel}@sha256:{digest}"

@@ -155,12 +155,39 @@ class FileWrite(BaseModel):
         return out
 
 
+class FileCopy(BaseModel):
+    src: str
+    dst: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        # Models often output {from,to} or {source,target}.
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "src" not in out:
+            for k in ("from", "source", "src_path", "source_path"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["src"] = v.strip()
+                    break
+        if "dst" not in out:
+            for k in ("to", "target", "dst_path", "dest", "dest_path", "destination", "destination_path"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["dst"] = v.strip()
+                    break
+        return out
+
+
 class CodeChange(BaseModel):
     kind: Literal["commit", "patch", "noop"]
     summary: str
     commit_hash: Optional[str] = None
     patch_pointer: Optional[str] = None
     writes: List[FileWrite] = Field(default_factory=list)
+    copies: List[FileCopy] = Field(default_factory=list)
     files_changed: List[str] = Field(default_factory=list)
     blockers: List[str] = Field(default_factory=list)
 
@@ -185,6 +212,14 @@ class CodeChange(BaseModel):
             out["commit_hash"] = out.get("commit")
         if "patch_pointer" not in out and isinstance(out.get("patch"), str):
             out["patch_pointer"] = out.get("patch")
+
+        # Copy operations field variants.
+        if "copies" not in out:
+            for k in ("copy", "file_copies", "copy_ops", "copies_ops"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["copies"] = v
+                    break
 
         # Normalize kind variants.
         kind = out.get("kind")

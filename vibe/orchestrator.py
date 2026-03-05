@@ -2147,7 +2147,7 @@ class Orchestrator:
                     f"请以 `{db_ptr}` 为准统一 DB 用法，让 `npm run build` 通过。"
                 )
 
-        kb = best_knowledge_snippet(text, max_lines=8)
+        kb = best_knowledge_snippet(text, max_lines=8, repo_root=self.repo_root)
         return kb or ""
 
     def _incident_for_tests(
@@ -2383,6 +2383,36 @@ class Orchestrator:
                             summary=f"auto-fix: remove duplicate __dirname/__filename declarations in {rel}",
                             writes=[packs.FileWrite(path=rel, content="".join(out_lines))],
                             files_changed=[rel],
+                            blockers=[],
+                        )
+            except Exception:
+                pass
+
+        # 0a) Hugo (Windows): `hugo-bin` can install the real binary under `node_modules/hugo-bin/vendor/`
+        # while `node_modules/.bin/hugo.exe` is missing or 0-byte (shim). As a last-resort workaround for
+        # scripts that hardcode `.bin/hugo.exe`, copy the vendor binary into `.bin`.
+        if os.name == "nt" and ("hugo" in lower) and ("0-byte" in lower or "0 byte" in lower or "no valid hugo binary found" in lower):
+            try:
+                base = (self.repo_root / failed_node_dir).resolve()
+                src_abs = (base / "node_modules" / "hugo-bin" / "vendor" / "hugo.exe").resolve()
+                dst_abs = (base / "node_modules" / ".bin" / "hugo.exe").resolve()
+                if src_abs.exists() and src_abs.is_file():
+                    try:
+                        src_size = int(src_abs.stat().st_size)
+                    except Exception:
+                        src_size = 0
+                    try:
+                        dst_size = int(dst_abs.stat().st_size) if dst_abs.exists() else 0
+                    except Exception:
+                        dst_size = 0
+                    if src_size > 0 and dst_size == 0:
+                        rel_src = src_abs.relative_to(self.repo_root).as_posix()
+                        rel_dst = dst_abs.relative_to(self.repo_root).as_posix()
+                        return packs.CodeChange(
+                            kind="patch",
+                            summary="auto-fix: copy hugo-bin vendor binary into node_modules/.bin (Windows workaround)",
+                            copies=[packs.FileCopy(src=rel_src, dst=rel_dst)],
+                            files_changed=[rel_dst],
                             blockers=[],
                         )
             except Exception:
@@ -3012,7 +3042,7 @@ class Orchestrator:
         We intentionally keep this best-effort and scoped to *relative* imports in files the model
         writes in this CodeChange, so we don't break existing repos with custom module resolution.
         """
-        if not change.writes:
+        if not change.writes and not getattr(change, "copies", None):
             return
 
         exts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".d.ts"]
@@ -3024,6 +3054,21 @@ class Orchestrator:
         planned = {norm(w.path) for w in change.writes if (w.path or "").strip()}
         planned_lower = {p.lower() for p in planned}
         planned_text_by_path_lower = {norm(w.path).lower(): (w.content or "") for w in change.writes if (w.path or "").strip()}
+
+        # Validate copy operations: source must exist (or be created by this change), destination must be safe.
+        for c in list(getattr(change, "copies", []) or [])[:50]:
+            src = norm(getattr(c, "src", "") or "")
+            dst = norm(getattr(c, "dst", "") or "")
+            if not src or not dst:
+                raise ValueError("Missing src/dst in CodeChange.copies")
+            if src.startswith(".vibe/") or src.startswith(".git/") or dst.startswith(".vibe/") or dst.startswith(".git/"):
+                raise ValueError("Refusing to copy under .vibe/ or .git/")
+            if src.lower() in planned_lower:
+                # Copying from a file written in this change is allowed (text -> binary is still odd,
+                # but we only validate existence at this layer).
+                continue
+            if not (self.repo_root / src).exists():
+                raise ValueError(f"Copy source does not exist: {src}")
 
         def _read_text_best_effort(rel_path: str) -> Optional[str]:
             rel = norm(rel_path)
@@ -3449,8 +3494,11 @@ class Orchestrator:
             return content
 
         write_pointers: List[str] = []
+        write_ops: list[dict[str, str]] = []
+        copy_ops: list[dict[str, str]] = []
+        ptrs: list[Optional[str]] = []
         if change.writes:
-            ptrs: list[Optional[str]] = [None for _ in list(change.writes)]
+            ptrs = [None for _ in list(change.writes)]
             pending: dict[str, list[int]] = {}
             rules: dict[str, Any] = {}
 
@@ -3491,10 +3539,29 @@ class Orchestrator:
                 if p:
                     write_pointers.append(p)
 
+            for w, p in zip(list(change.writes), list(ptrs)):
+                if not p or not w.path:
+                    continue
+                write_ops.append({"path": (w.path or "").replace("\\", "/").lstrip("/"), "pointer": p})
+
             if not change.files_changed:
                 change.files_changed = [w.path for w in change.writes if w.path]
 
-            # Best-effort patch evidence.
+        # Apply binary copy operations (e.g. workarounds for Windows shim issues).
+        if getattr(change, "copies", None):
+            for c in list(change.copies or [])[:80]:
+                src = (c.src or "").replace("\\", "/").lstrip("/")
+                dst = (c.dst or "").replace("\\", "/").lstrip("/")
+                if src.startswith(".vibe/") or src.startswith(".git/") or dst.startswith(".vibe/") or dst.startswith(".git/"):
+                    raise RuntimeError(f"Refusing to copy internal path: {src} -> {dst}")
+                ptr = self.toolbox.copy_file(agent_id=actor_agent_id, src=src, dst=dst)
+                write_pointers.append(ptr)
+                copy_ops.append({"src": src, "dst": dst, "pointer": ptr})
+                if dst and dst not in (change.files_changed or []):
+                    change.files_changed = list(change.files_changed or []) + [dst]
+
+        # Best-effort patch evidence for local file operations (writes/copies) when git is absent.
+        if (write_ops or copy_ops) and not change.commit_hash and not change.patch_pointer:
             patch_ptr: Optional[str] = None
             try:
                 if self.toolbox.git_is_repo(agent_id="router"):
@@ -3504,12 +3571,11 @@ class Orchestrator:
                 patch_ptr = None
 
             if not patch_ptr:
-                files: list[dict[str, str]] = []
-                for w, p in zip(change.writes, ptrs):
-                    if not w.path or not p:
-                        continue
-                    files.append({"path": w.path, "pointer": p})
-                patch_ptr = self.artifacts.put_json({"kind": "writes", "files": files}, suffix=".writes.json", kind="patch").to_pointer()
+                patch_ptr = self.artifacts.put_json(
+                    {"kind": "ops", "writes": write_ops, "copies": copy_ops},
+                    suffix=".ops.json",
+                    kind="patch",
+                ).to_pointer()
 
             change.kind = "patch"
             change.patch_pointer = patch_ptr
@@ -3636,7 +3702,7 @@ class Orchestrator:
                     "- 所有写入路径必须是仓库根目录的相对路径。\n"
                     "- 严禁写入 `.vibe/` 或 `.git/`（这是系统内部目录）。\n"
                     "- 如果你要写文档，请写到 `docs/...` 或 `README.md`，不要写到 `.vibe/docs/...`。\n"
-                    "- 优先使用 `writes` 给出完整文件内容；不要依赖 patch 指针。\n"
+                    "- 优先使用 `writes` 给出完整文件内容；如需二进制拷贝，用 `copies: [{src,dst}]`；不要依赖 patch 指针。\n"
                     "- 如果你新增了相对 import（例如 `../controllers/x`），必须在 writes 里创建对应文件（或改成指向已存在文件）。\n"
                     "- 如果你新增了外部依赖（例如 `import axios from 'axios'`），必须在对应的 `package.json`（dependencies/devDependencies）里声明它。\n"
                     "- 保持原意不变：只修复路径/可落地性问题，不要引入大重构。\n\n"
@@ -3645,10 +3711,11 @@ class Orchestrator:
                 )
                 repair_system = (
                     f"You are {actor_role}. Return JSON only for CodeChange with fields: "
-                    "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                    "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                     "No extra keys. No markdown.\n\n"
                     "Hard rules:\n"
                     "- Do not write under `.vibe/` or `.git/`.\n"
+                    "- Do not copy under `.vibe/` or `.git/`.\n"
                     "- Use only repo-root relative paths.\n"
                     "- Prefer `writes` over `patch_pointer`.\n\n"
                     f"{workflow_hint}"
@@ -4804,7 +4871,7 @@ class Orchestrator:
         def coder_system(*, role: str, task: packs.PlanTask) -> str:
             return (
                 f"You are {role}. Return JSON only for CodeChange with fields: "
-                "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                 "Prefer 'writes' for file changes (especially when starting from an empty repo). "
                 "Each writes item must include the full file content. No extra keys. No markdown.\n\n"
                 "Focus:\n"
@@ -4812,6 +4879,7 @@ class Orchestrator:
                 "- Do not implement other plan tasks yet; keep changes minimal and coherent.\n\n"
                 "Hard rules:\n"
                 "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                "- Never copy under `.vibe/` or `.git/`.\n"
                 "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                 "- Do not introduce new modules/folders unless you ALSO create them in writes.\n"
                 "- Do not import new npm packages unless you ALSO add them to the correct `package.json` (dependencies/devDependencies) in writes.\n"
@@ -5175,10 +5243,11 @@ class Orchestrator:
                     agent_id=primary_coder_id,
                     system=(
                         f"You are {bootstrap_role}. Return JSON only for CodeChange with fields: "
-                        "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                        "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                         "No extra keys. No wrapping object. No markdown.\n\n"
                         "Hard rules:\n"
                         "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                        "- Never copy under `.vibe/` or `.git/`.\n"
                         "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                         "- Prefer 'writes' for file changes.\n"
                         "- Do not import new npm packages unless you ALSO add them to the correct `package.json` in writes.\n\n"
@@ -6192,10 +6261,11 @@ class Orchestrator:
                         agent_id=fix_coder_id,
                         system=(
                             f"You are {fix_role}. Fix the failing command. Batch-fix all related errors from the same failing command output. Return JSON only for CodeChange with fields: "
-                            "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                            "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
                             "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
                             "Hard rules:\n"
                             "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                            "- Never copy under `.vibe/` or `.git/`.\n"
                             "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
                         "- Fix the failing command in the blocker; prefer fixing all ExtractedErrors in one go (still one failing command).\n"
                         "- Do not do architecture refactors during fix-loop.\n"

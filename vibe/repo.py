@@ -28,6 +28,7 @@ def ensure_vibe_dirs(repo_root: Path, *, agent_ids: list[str] | None = None) -> 
     (vibe_dir / "branches").mkdir(parents=True, exist_ok=True)
     (vibe_dir / "views").mkdir(parents=True, exist_ok=True)
     (vibe_dir / "manifests").mkdir(parents=True, exist_ok=True)
+    (vibe_dir / "knowledge").mkdir(parents=True, exist_ok=True)
     (vibe_dir / "ledger.jsonl").touch(exist_ok=True)
     checkpoints_path = vibe_dir / "checkpoints.json"
     if not checkpoints_path.exists():
@@ -36,6 +37,18 @@ def ensure_vibe_dirs(repo_root: Path, *, agent_ids: list[str] | None = None) -> 
     for manifest in (vibe_dir / "manifests" / "project_manifest.md", vibe_dir / "manifests" / "run_manifest.md"):
         if not manifest.exists():
             manifest.write_text("", encoding="utf-8")
+
+    kb_path = vibe_dir / "knowledge" / "solutions.yaml"
+    if not kb_path.exists():
+        kb_path.write_text(
+            "# Workspace-local knowledge entries.\n"
+            "#\n"
+            "# This file is optional. If present, entries here override built-in knowledge by `id`.\n"
+            "# Keep entries short and evidence-oriented.\n"
+            "version: 1\n"
+            "entries: []\n",
+            encoding="utf-8",
+        )
 
     if agent_ids:
         for agent_id in agent_ids:
