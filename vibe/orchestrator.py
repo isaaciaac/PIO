@@ -3779,6 +3779,14 @@ class Orchestrator:
                     "TypeScript 项目 lint 通常还需要 `@typescript-eslint/parser` + plugin。",
                 ],
             )
+        if "node_modules/.bin" in low and ".cmd" in low and "prefer" in low:
+            return (
+                "Windows/npm 的 `node_modules/.bin` 入口通常是 `.cmd`/`.ps1`；`.exe` 可能不存在或是 0 字节占位 shim。",
+                [
+                    "不要在脚本里硬编码/校验 `.bin/<tool>.exe`；优先调用 `.cmd` 或 `npm exec -- <tool>`/`npx <tool>`。",
+                    "如果脚本同时有 `.bin` 与 `bin/` 手动回退：只修 `.bin` 那段，避免误改 `bin/` 回退。",
+                ],
+            )
         return ("", [])
 
     def _determine_test_commands(self, *, profile: str) -> List[str]:

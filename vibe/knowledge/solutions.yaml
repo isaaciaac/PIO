@@ -19,3 +19,14 @@ entries:
     actions:
       - "在 CommonJS 下，`__dirname`/`__filename` 已由 Node 提供；删除脚本里 `const __dirname = ...` / `const __filename = ...` 的重复声明即可。"
       - "如果项目是 ESM（package.json: type=module），不要用 `__dirname`；用 `import.meta.url` + `fileURLToPath()` 计算目录并使用不同变量名（不要叫 `__dirname`）。"
+
+  - id: win_npm_bin_shim_cmd_ps1
+    title: Windows 下 npm 工具 shim：优先使用 .cmd/.ps1，而不是 .exe/无后缀
+    tags: ["windows", "node", "npm", "tooling", "shim"]
+    patterns:
+      - "node_modules[\\\\/]\\.bin[\\\\/].+(?:\\.exe)?"
+      - "No valid .* binary found|binary found but is 0-byte|0-byte|spawn\\s+.+\\s+UNKNOWN"
+    actions:
+      - "Windows/npm 往往只保证 `node_modules/.bin/<tool>.cmd`/`<tool>.ps1` 可用；`.exe` 可能不存在或是 0 字节占位。"
+      - "脚本不要 `spawn('.../.bin/<tool>.exe')` 或用 `stat.size>0` 去“验真”；优先执行 `<tool>.cmd`，或直接用 `npm exec -- <tool>` / `npx <tool>`。"
+      - "如果脚本同时有 `node_modules/.bin/` 和 `bin/` 手动回退：只把 `.bin` 那段改成 `.cmd`，`bin/` 回退保持原二进制扩展名。"
