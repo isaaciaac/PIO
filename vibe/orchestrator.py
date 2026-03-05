@@ -4013,6 +4013,7 @@ class Orchestrator:
         req_analyst = self._agent("requirements_analyst") if "requirements_analyst" in self.config.agents else None
         architect = self._agent("architect") if "architect" in self.config.agents else None
         api_confirm = self._agent("api_confirm") if "api_confirm" in self.config.agents else None
+        web_info = self._agent("web_info") if "web_info" in self.config.agents else None
         env_engineer = self._agent("env_engineer") if "env_engineer" in self.config.agents else None
         coder_backend = self._agent("coder_backend")
         coder_frontend = self._agent("coder_frontend") if "coder_frontend" in self.config.agents else None
@@ -4450,6 +4451,46 @@ class Orchestrator:
                     pass
 
         if (not resume_mode) and route_level in {"L2", "L3", "L4"} and (risks.contract_change or risks.touches_external_api):
+            web_info_ptr: Optional[str] = None
+            if web_info is not None:
+                activate_agent("web_info", reason="gate:web_info")
+                wi_user = (
+                    "你是 web_info：你必须使用联网搜索来做“事实查证”，并只输出 WebInfoPack JSON（不要 markdown）。\n"
+                    "查证目标：\n"
+                    "- 如果需求涉及外部 API/SDK/endpoint/base_url/model 名称/兼容模式：给出最关键的正确值与来源链接。\n"
+                    "- 如果你不确定或无法查到：把 confidence 设为 low，并在 notes 里说明缺口。\n"
+                    "规则：\n"
+                    "- sources.url 必须是完整 URL（不要编造）。\n"
+                    "- 不要输出额外 key；不要套外层对象。\n\n"
+                    f"Task:\n{task_text}\n\nRequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n"
+                )
+                try:
+                    wi_msgs = self._messages_with_memory(
+                        agent_id="web_info",
+                        system="You are web_info. Return JSON only for WebInfoPack. No extra keys. No markdown.\n\n"
+                        + workflow_hint,
+                        user=wi_user,
+                    )
+                    wi, _ = web_info.chat_json(schema=packs.WebInfoPack, messages=wi_msgs, user=wi_user)
+                    web_info_ptr = self.artifacts.put_json(wi.model_dump(), suffix=".web_info.json", kind="web_info").to_pointer()
+                    self._append_guarded(
+                        event=new_event(
+                            agent="web_info",
+                            type="WEB_INFO_FETCHED",
+                            summary="Web info fetched",
+                            branch_id=self.branch_id,
+                            pointers=[web_info_ptr],
+                            meta={"route_level": route_level, "style": resolved_style, "task_id": task_evt.id, "query": wi.query},
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    try:
+                        ctx.log_pointers = list(ctx.log_pointers) + [web_info_ptr]
+                    except Exception:
+                        pass
+                except Exception:
+                    web_info_ptr = None
+
             activate_agent("api_confirm", reason="gate:contract")
             if api_confirm is None:
                 raise RuntimeError("api_confirm is required for contract/external API changes")
@@ -4459,6 +4500,8 @@ class Orchestrator:
             )
             if ctx_excerpts:
                 contract_user = f"{contract_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+            if web_info_ptr:
+                contract_user = f"{contract_user}\n\nWebInfoPointers:\n- {web_info_ptr}"
             contract_msgs = self._messages_with_memory(
                 agent_id="api_confirm",
                 system=(

@@ -27,6 +27,13 @@ class ResearcherAgent(BaseAgent):
     default_model = "qwen-plus"
 
 
+class WebInfoAgent(BaseAgent):
+    agent_id = "web_info"
+    output_schema = packs.WebInfoPack
+    default_provider = "dashscope"
+    default_model = "qwen-plus"
+
+
 class PMAgent(BaseAgent):
     agent_id = "pm"
     output_schema = packs.RequirementPack
@@ -187,6 +194,7 @@ AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
         RouterAgent,
         LogCompressorAgent,
         ResearcherAgent,
+        WebInfoAgent,
         PMAgent,
         IntentExpanderAgent,
         RequirementsAnalystAgent,

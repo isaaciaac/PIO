@@ -313,6 +313,31 @@ class ReferenceItem(BaseModel):
     source: Optional[str] = None
 
 
+class WebInfoSource(BaseModel):
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+
+
+class WebInfoFinding(BaseModel):
+    claim: str
+    sources: List[WebInfoSource] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] = "medium"
+
+
+class WebInfoPack(BaseModel):
+    """
+    Web-backed fact-check output.
+
+    This pack is intended to be pointer-backed (artifacts/refstore) and referenced
+    by other agents, rather than copied as long prose.
+    """
+
+    query: str
+    findings: List[WebInfoFinding] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
 class UseCasePack(BaseModel):
     positive: List[str] = Field(default_factory=list)
     negative: List[str] = Field(default_factory=list)

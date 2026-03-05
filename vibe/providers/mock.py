@@ -170,6 +170,18 @@ class MockProvider:
             out = schemas.LogIndex(items=[])
         elif schema is schemas.ReferenceItem:
             out = schemas.ReferenceItem(id="ref_mock", title="mock ref", tags=["mock"], content="mock content", source="mock")
+        elif schema is schemas.WebInfoPack:
+            out = schemas.WebInfoPack(
+                query="mock query",
+                findings=[
+                    schemas.WebInfoFinding(
+                        claim="mock finding",
+                        sources=[schemas.WebInfoSource(title="mock", url="https://example.com", snippet="mock")],
+                        confidence="low",
+                    )
+                ],
+                notes=["mock note"],
+            )
         elif schema is schemas.UseCasePack:
             out = schemas.UseCasePack(positive=["mock ok"], negative=["mock fail"], edge_cases=["mock edge"])
         elif schema is schemas.UXCopyPack:
