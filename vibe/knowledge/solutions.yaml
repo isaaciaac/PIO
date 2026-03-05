@@ -1,0 +1,21 @@
+version: 1
+entries:
+  - id: win_node_bin_zero_exe_shim
+    title: Windows 下 node_modules/.bin 的 0 字节 .exe 占位 shim
+    tags: ["windows", "node", "tooling", "bin", "shim"]
+    patterns:
+      - "node_modules[\\\\/]\\.bin[\\\\/].+\\.exe"
+      - "0-byte|0 byte|spawn\\s+.+\\s+UNKNOWN|No valid .* binary found"
+    actions:
+      - "不要直接执行/校验 `node_modules/.bin/<tool>.exe`（可能是 0 字节占位）。优先 `npm run <script>` / `npx <tool>`，或在 Windows 上改用 `<tool>.cmd`。"
+      - "如果脚本里硬编码了 `<tool>.exe`：把它替换为 `<tool>.cmd`（让 cmd shim 去定位真实二进制）。"
+
+  - id: node_redeclare_dirname_filename
+    title: Node CommonJS 中重复声明 __dirname/__filename 导致 SyntaxError
+    tags: ["node", "cjs", "syntaxerror"]
+    patterns:
+      - "SyntaxError: Identifier '__dirname' has already been declared|SyntaxError: Identifier '__filename' has already been declared"
+    actions:
+      - "在 CommonJS 下，`__dirname`/`__filename` 已由 Node 提供；删除脚本里 `const __dirname = ...` / `const __filename = ...` 的重复声明即可。"
+      - "如果项目是 ESM（package.json: type=module），不要用 `__dirname`；用 `import.meta.url` + `fileURLToPath()` 计算目录并使用不同变量名（不要叫 `__dirname`）。"
+

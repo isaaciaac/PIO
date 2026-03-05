@@ -25,3 +25,6 @@ vibe = "vibe.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["vibe*"]
+
+[tool.setuptools.package-data]
+vibe = ["knowledge/*.yaml"]

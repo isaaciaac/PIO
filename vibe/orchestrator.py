@@ -32,6 +32,7 @@ from vibe.schemas.memory import ChatDigest, MemoryRecord
 from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
 from vibe.ownership import OwnershipDeniedError
+from vibe.knowledge.base import best_knowledge_snippet
 
 
 @dataclass(frozen=True)
@@ -2146,7 +2147,8 @@ class Orchestrator:
                     f"请以 `{db_ptr}` 为准统一 DB 用法，让 `npm run build` 通过。"
                 )
 
-        return ""
+        kb = best_knowledge_snippet(text, max_lines=8)
+        return kb or ""
 
     def _incident_for_tests(
         self,
@@ -2314,6 +2316,33 @@ class Orchestrator:
             except Exception:
                 failed_node_dir = Path(".")
 
+        def first_error_file_path() -> Optional[Path]:
+            # Prefer absolute Windows paths from Node/Python stack traces.
+            m = re.search(
+                r"(?P<file>[A-Za-z]:[\\/][^:\r\n]+?\.(?:js|cjs|mjs|ts|tsx)):(?P<line>\d+)(?::\d+)?",
+                text,
+            )
+            if not m:
+                return None
+            raw = (m.group("file") or "").strip().strip('"').strip("'")
+            if not raw:
+                return None
+            p = Path(raw)
+            try:
+                if p.is_absolute() and self.repo_root in p.parents:
+                    return p
+            except Exception:
+                pass
+            # Best-effort: treat it as relative to repo_root.
+            try:
+                rel_guess = raw.replace("\\", "/").lstrip("/")
+                p2 = (self.repo_root / rel_guess).resolve()
+                if p2.exists() and p2.is_file():
+                    return p2
+            except Exception:
+                pass
+            return None
+
         def parse_script_name(cmd: str) -> str:
             c = cmd or ""
             # Examples:
@@ -2327,6 +2356,37 @@ class Orchestrator:
             if m:
                 return (m.group("name") or "").strip()
             return ""
+
+        # 0) Node/CJS: models sometimes "polyfill" __dirname/__filename incorrectly and redeclare them.
+        # In CommonJS, these are already defined by Node; redeclaration causes a SyntaxError.
+        if "identifier '__dirname' has already been declared" in lower or "identifier '__filename' has already been declared" in lower:
+            try:
+                p = first_error_file_path()
+                if p and p.exists():
+                    src = p.read_text(encoding="utf-8", errors="replace")
+                    lines = src.splitlines(True)
+                    out_lines: list[str] = []
+                    changed = False
+                    for ln in lines:
+                        s = ln.strip()
+                        if re.match(r"^(?:const|let|var)\s+__dirname\s*=", s):
+                            changed = True
+                            continue
+                        if re.match(r"^(?:const|let|var)\s+__filename\s*=", s):
+                            changed = True
+                            continue
+                        out_lines.append(ln)
+                    if changed:
+                        rel = p.relative_to(self.repo_root).as_posix()
+                        return packs.CodeChange(
+                            kind="patch",
+                            summary=f"auto-fix: remove duplicate __dirname/__filename declarations in {rel}",
+                            writes=[packs.FileWrite(path=rel, content="".join(out_lines))],
+                            files_changed=[rel],
+                            blockers=[],
+                        )
+            except Exception:
+                pass
 
         def extract_missing_bin(err_text: str) -> str:
             t = err_text or ""
@@ -2353,7 +2413,7 @@ class Orchestrator:
 
         # 0) Windows/Node: some packages create 0-byte `.exe` placeholder shims in `node_modules/.bin`.
         # If a script treats that `.exe` as the real binary and fails, prefer the `.cmd` shim.
-        if os.name == "nt" and ("0-byte" in lower or "0 byte" in lower) and "node_modules" in lower and ".bin" in lower:
+        if os.name == "nt" and "node_modules" in lower and ".bin" in lower:
             try:
                 m = re.search(
                     r"node_modules[\\/]\.bin[\\/](?P<tool>[A-Za-z0-9_.-]+)\.exe",
@@ -2370,6 +2430,7 @@ class Orchestrator:
                             exe_size = int(exe_path.stat().st_size)
                         except Exception:
                             exe_size = -1
+                        # Only auto-fix when the `.exe` is clearly bogus (0 bytes), to avoid breaking legit native bins.
                         if exe_size == 0:
                             roots: list[Path] = []
                             for r in [
