@@ -2053,6 +2053,13 @@ class Orchestrator:
             lines.append("- 建议：通过 `npm run <script>` 调用工具（让 PATH shim 生效）；或在 Windows 上优先 `.cmd` 并跳过 size==0 的 `.exe`。")
             return "\n".join(lines).strip()
 
+        if os.name == "nt" and ("0-byte" in lower or "0 byte" in lower) and "node_modules" in lower and ".bin" in lower:
+            return (
+                "检测到 Windows 下 `node_modules/.bin/<tool>.exe` 是 0 字节占位 shim（常见于 npm 工具链）。\n"
+                "- 不要把该 `.exe` 当成真实可执行文件；优先通过 `npm run <script>`/`npx <tool>` 调用。\n"
+                "- 如果脚本硬编码了 `<tool>.exe`：改用 `<tool>.cmd`，或改为调用 npm script（让 shim 自动选择正确入口）。"
+            )
+
         # 1) Missing external CLI (non-npm). Pivot the implementation to avoid requiring a global binary.
         try:
             m = re.search(
@@ -2343,6 +2350,73 @@ class Orchestrator:
             if m:
                 return (m.group("bin") or "").strip()
             return ""
+
+        # 0) Windows/Node: some packages create 0-byte `.exe` placeholder shims in `node_modules/.bin`.
+        # If a script treats that `.exe` as the real binary and fails, prefer the `.cmd` shim.
+        if os.name == "nt" and ("0-byte" in lower or "0 byte" in lower) and "node_modules" in lower and ".bin" in lower:
+            try:
+                m = re.search(
+                    r"node_modules[\\/]\.bin[\\/](?P<tool>[A-Za-z0-9_.-]+)\.exe",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                tool = (m.group("tool") or "").strip() if m else ""
+                if tool and len(tool) <= 60:
+                    bin_dir = (self.repo_root / failed_node_dir / "node_modules" / ".bin").resolve()
+                    exe_path = (bin_dir / f"{tool}.exe").resolve()
+                    cmd_path = (bin_dir / f"{tool}.cmd").resolve()
+                    if exe_path.exists() and cmd_path.exists():
+                        try:
+                            exe_size = int(exe_path.stat().st_size)
+                        except Exception:
+                            exe_size = -1
+                        if exe_size == 0:
+                            roots: list[Path] = []
+                            for r in [
+                                self.repo_root / failed_node_dir / "scripts",
+                                self.repo_root / "scripts",
+                            ]:
+                                if r.exists() and r.is_dir():
+                                    roots.append(r)
+
+                            writes: list[packs.FileWrite] = []
+                            files_changed: list[str] = []
+                            pat = re.compile(rf"(?i)\b{re.escape(tool)}\.exe\b")
+                            for root in roots[:3]:
+                                for p in list(root.rglob("*"))[:300]:
+                                    if not p.is_file():
+                                        continue
+                                    if p.suffix.lower() not in {".js", ".cjs", ".mjs", ".ts", ".json"}:
+                                        continue
+                                    try:
+                                        src = p.read_text(encoding="utf-8", errors="replace")
+                                    except Exception:
+                                        continue
+                                    if not pat.search(src):
+                                        continue
+                                    dst = pat.sub(f"{tool}.cmd", src)
+                                    if dst == src:
+                                        continue
+                                    rel = p.relative_to(self.repo_root).as_posix()
+                                    writes.append(packs.FileWrite(path=rel, content=dst))
+                                    files_changed.append(rel)
+                                    if len(writes) >= 6:
+                                        break
+                                if len(writes) >= 6:
+                                    break
+
+                            if writes:
+                                return packs.CodeChange(
+                                    kind="patch",
+                                    summary=(
+                                        f"auto-fix: avoid 0-byte `{tool}.exe` placeholder shim by using `{tool}.cmd` on Windows"
+                                    ),
+                                    writes=writes,
+                                    files_changed=files_changed,
+                                    blockers=[],
+                                )
+            except Exception:
+                pass
 
         # 0) Windows/Node: `spawn UNKNOWN` often comes from spawning `.bin/*.exe` shims directly.
         # If we can see a `.cmd` wrapper for the same tool, prefer `.cmd` (and avoid 0-byte `.exe` placeholders).
