@@ -215,6 +215,7 @@ class MockProvider:
                 task_scopes=[],
                 fix_allowed_write_globs=[],
                 fix_denied_write_globs=[],
+                fix_work_orders=[],
                 recommended_fix_agent="",
                 consult_agents=[],
                 escalation_reason="",

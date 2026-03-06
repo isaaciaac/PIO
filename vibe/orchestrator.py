@@ -1274,6 +1274,68 @@ class Orchestrator:
 
         return allow_out, deny_out
 
+    def _lead_work_order_scope(
+        self,
+        *,
+        order: Optional[packs.FixWorkOrder],
+        default_allow: list[str],
+        default_deny: list[str],
+        blocker_text: str,
+    ) -> tuple[list[str], list[str]]:
+        allow = [_normalize_scope_pattern(p) for p in list(default_allow or []) if _normalize_scope_pattern(p)]
+        deny = [_normalize_scope_pattern(p) for p in list(default_deny or []) if _normalize_scope_pattern(p)]
+        if order is not None:
+            order_allow = [_normalize_scope_pattern(p) for p in list(order.allowed_write_globs or []) if _normalize_scope_pattern(p)]
+            order_deny = [_normalize_scope_pattern(p) for p in list(order.denied_write_globs or []) if _normalize_scope_pattern(p)]
+            if order_allow:
+                allow = order_allow
+            deny = deny + [p for p in order_deny if p and p not in deny]
+        return self._expand_fix_scope_for_blocker(allow=allow, deny=deny, blocker_text=blocker_text)
+
+    def _select_lead_fix_work_order(
+        self,
+        *,
+        blueprint: Optional[packs.ImplementationBlueprint],
+        error: Optional[packs.ErrorObject],
+        blocker_source: str,
+        blocker_text: str,
+        available_agents: set[str],
+        preferred_fix_agent: str = "",
+    ) -> Optional[packs.FixWorkOrder]:
+        if blueprint is None:
+            return None
+        try:
+            orders = [o for o in list(blueprint.fix_work_orders or []) if str(getattr(o, "owner", "") or "").strip()]
+        except Exception:
+            orders = []
+        if not orders:
+            return None
+
+        available = {str(x).strip() for x in set(available_agents or set()) if str(x).strip()}
+        env_candidate = blocker_source == "tests" and self._is_env_fix_candidate(error=error, blocker_text=blocker_text)
+        preferred = str(preferred_fix_agent or "").strip()
+        priority: list[str] = []
+        if env_candidate:
+            priority.extend(["env_engineer", "ops_engineer"])
+        if preferred:
+            priority.append(preferred)
+        if blocker_source == "tests":
+            priority.extend(["integration_engineer", "coder_backend", "coder_frontend"])
+        priority.extend(["env_engineer", "ops_engineer", "integration_engineer", "coder_backend", "coder_frontend"])
+
+        for owner in priority:
+            if owner not in available:
+                continue
+            for order in orders:
+                if str(getattr(order, "owner", "") or "").strip() == owner:
+                    return order
+
+        for order in orders:
+            owner = str(getattr(order, "owner", "") or "").strip()
+            if owner in available:
+                return order
+        return None
+
     def _recent_changed_files(self, *, limit: int = 12) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
@@ -5636,8 +5698,10 @@ class Orchestrator:
         impl_blueprint_ptr: Optional[str] = None
         lead_fix_blueprint_keys: set[str] = set()
         lead_consult_cache: dict[str, tuple[str, list[str]]] = {}
+        executed_lead_work_orders: set[str] = set()
         lead_fix_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
         lead_consult_advisors = {"architect", "env_engineer", "api_confirm", "ops_engineer"}
+        lead_fix_order_owners = lead_fix_agents | {"env_engineer", "ops_engineer"}
 
         def _sanitize_blueprint(bp: packs.ImplementationBlueprint) -> packs.ImplementationBlueprint:
             def clean(pats: List[str], *, limit: int) -> List[str]:
@@ -5698,6 +5762,45 @@ class Orchestrator:
                 seen_consults.add(aid)
                 consults.append(aid)
             bp.consult_agents = consults
+            work_orders: list[packs.FixWorkOrder] = []
+            try:
+                raw_orders = list(getattr(bp, "fix_work_orders", []) or [])
+            except Exception:
+                raw_orders = []
+            for raw in raw_orders[:8]:
+                try:
+                    order = raw if isinstance(raw, packs.FixWorkOrder) else packs.FixWorkOrder.model_validate(raw)
+                except Exception:
+                    continue
+                owner = str(getattr(order, "owner", "") or "").strip()
+                if owner not in lead_fix_order_owners:
+                    continue
+                allow = clean(list(getattr(order, "allowed_write_globs", []) or []), limit=16)
+                deny = clean(list(getattr(order, "denied_write_globs", []) or []), limit=16)
+                files_to_check = [str(x).strip() for x in list(getattr(order, "files_to_check", []) or []) if str(x).strip()][:12]
+                commands = [str(x).strip() for x in list(getattr(order, "commands", []) or []) if str(x).strip()][:8]
+                verify = [str(x).strip() for x in list(getattr(order, "verify_commands", []) or []) if str(x).strip()][:8]
+                stop_if = [str(x).strip() for x in list(getattr(order, "stop_if", []) or []) if str(x).strip()][:8]
+                pointers = [str(x).strip() for x in list(getattr(order, "pointers", []) or []) if str(x).strip()][:12]
+                summary = str(getattr(order, "summary", "") or "").strip()[:240]
+                if not summary:
+                    continue
+                reason = str(getattr(order, "reason", "") or "").strip()[:240]
+                work_orders.append(
+                    packs.FixWorkOrder(
+                        owner=owner,
+                        summary=summary,
+                        reason=reason,
+                        allowed_write_globs=allow,
+                        denied_write_globs=deny,
+                        files_to_check=files_to_check,
+                        commands=commands,
+                        verify_commands=verify,
+                        stop_if=stop_if,
+                        pointers=pointers,
+                    )
+                )
+            bp.fix_work_orders = work_orders
             bp.escalation_reason = str(getattr(bp, "escalation_reason", "") or "").strip()[:240]
             bp.invariants = [str(x).strip()[:240] for x in list(bp.invariants or []) if str(x).strip()][:16]
             bp.verification = [str(x).strip()[:240] for x in list(bp.verification or []) if str(x).strip()][:12]
@@ -5859,6 +5962,7 @@ class Orchestrator:
                 "重点要求：\n"
                 "- fix_allowed_write_globs：只允许修复当前 blocker 所需的最小范围（可为空表示不限制）。\n"
                 "- fix_denied_write_globs：明确禁止改动的范围（可为空）。\n"
+                "- fix_work_orders：生成 1–3 条按顺序执行的修复工单。每条工单必须指定 owner（coder_backend / coder_frontend / integration_engineer / env_engineer / ops_engineer），并写明 commands / files_to_check / allowed_write_globs / verify_commands / stop_if。\n"
                 "- recommended_fix_agent：如果当前问题应由别的代码工种主修，填 coder_backend / coder_frontend / integration_engineer 之一。\n"
                 "- consult_agents：如果需要额外会诊，填 architect / env_engineer / api_confirm / ops_engineer 的子集。\n"
                 "- escalation_reason：说明为什么要改派/会诊（简短即可）。\n"
@@ -5869,6 +5973,8 @@ class Orchestrator:
                 "- 绝对禁止 `.vibe/**`、`.git/**`。\n"
                 "- 不要凭空编造文件存在；如果你允许新增文件，请在 allow globs 里覆盖它。\n"
                 "- 默认不要修改 node_modules；只有在 Windows shim/binary workaround 等必要时，才允许最小范围 copy/writes。\n\n"
+                "- 对明显属于环境/依赖/命令/安装状态问题的 blocker，优先把首条工单分配给 env_engineer，而不是 coder。\n"
+                "- ops_engineer 负责复现/收集/定位；env_engineer 负责环境修复命令；coder 只负责代码层补丁。\n\n"
                 f"{workflow_hint}"
             )
             bp_user = (
@@ -7330,28 +7436,6 @@ class Orchestrator:
                 stagnating = sig_repeat >= 1
                 stagnating_hard = sig_repeat >= 2
 
-                # Escalation: on higher routes or repeated identical failures, refresh the
-                # implementation_lead blueprint so the system can switch fixer/scope instead of looping.
-                lead_refresh_key = "|".join(
-                    [
-                        blocker_source,
-                        fp_now or blocker_text[:160],
-                        "hard" if stagnating_hard else "first_high",
-                    ]
-                )
-                if ((loop == 1 and route_level in {"L3", "L4"}) or stagnating_hard) and lead_refresh_key not in lead_fix_blueprint_keys:
-                    try:
-                        lead_fix_blueprint_keys.add(lead_refresh_key)
-                        maybe_build_fix_blueprint(
-                            reason="gate:blueprint_fix",
-                            blocker_source=blocker_source,
-                            blocker_text=blocker_text,
-                            extracted=extracted,
-                            report=report,
-                        )
-                    except Exception:
-                        pass
-
                 stagnation_help: str = ""
                 stagnation_ptrs: list[str] = []
                 if stagnating and blocker_source == "tests" and (not mock_mode):
@@ -7480,14 +7564,6 @@ class Orchestrator:
                         incident = None
                         incident_ptr = None
 
-                if blocker_source == "review":
-                    fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=available_agents)
-                elif blocker_source == "tests":
-                    fix_coder_id = (incident.suggested_fix_agent if incident is not None else None) or self._select_fix_coder_for_tests(
-                        report=report, blocker_text=blocker_text, activated_agents=available_agents
-                    )
-                else:
-                    fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=available_agents)
                 current_error_object = getattr(incident, "error_object", None) if incident is not None else None
                 if blocker_source == "tests" and current_error_object is None:
                     try:
@@ -7503,6 +7579,43 @@ class Orchestrator:
                             suspected_root_cause="未能结构化诊断当前失败，需要先补齐错误分类再生成补丁。",
                             failed_command=failed_cmd,
                         )
+
+                env_blocker = blocker_source == "tests" and self._is_env_fix_candidate(
+                    error=current_error_object,
+                    blocker_text=blocker_text,
+                )
+                lead_refresh_key = "|".join(
+                    [
+                        blocker_source,
+                        fp_now or blocker_text[:160],
+                        "env_fast" if env_blocker else ("hard" if stagnating_hard else "first_high"),
+                    ]
+                )
+                if (
+                    (loop == 1 and route_level in {"L3", "L4"})
+                    or stagnating_hard
+                    or env_blocker
+                ) and lead_refresh_key not in lead_fix_blueprint_keys:
+                    try:
+                        lead_fix_blueprint_keys.add(lead_refresh_key)
+                        maybe_build_fix_blueprint(
+                            reason="gate:env_fix_blueprint" if env_blocker else "gate:blueprint_fix",
+                            blocker_source=blocker_source,
+                            blocker_text=blocker_text,
+                            extracted=extracted,
+                            report=report,
+                        )
+                    except Exception:
+                        pass
+
+                if blocker_source == "review":
+                    fix_coder_id = self._select_fix_coder_for_review(review=review, activated_agents=available_agents)
+                elif blocker_source == "tests":
+                    fix_coder_id = (incident.suggested_fix_agent if incident is not None else None) or self._select_fix_coder_for_tests(
+                        report=report, blocker_text=blocker_text, activated_agents=available_agents
+                    )
+                else:
+                    fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=available_agents)
 
                 fix_coder_id = _preferred_fix_agent(fix_coder_id)
                 if fix_coder_id == "coder_frontend" and coder_frontend is None:
@@ -7526,6 +7639,52 @@ class Orchestrator:
                     else coder_backend
                 )
 
+                lead_work_order = self._select_lead_fix_work_order(
+                    blueprint=impl_blueprint,
+                    error=current_error_object,
+                    blocker_source=blocker_source,
+                    blocker_text=blocker_text,
+                    available_agents=available_agents,
+                    preferred_fix_agent=fix_coder_id,
+                )
+                if lead_work_order is not None:
+                    owner = str(getattr(lead_work_order, "owner", "") or "").strip()
+                    if owner in lead_fix_agents:
+                        fix_coder_id = owner
+                        fix_coder = (
+                            coder_frontend
+                            if fix_coder_id == "coder_frontend" and coder_frontend is not None
+                            else integrator
+                            if fix_coder_id == "integration_engineer" and integrator is not None
+                            else coder_backend
+                        )
+
+                lead_work_order_owner = str(getattr(lead_work_order, "owner", "") or "").strip() if lead_work_order is not None else ""
+                lead_work_order_ptrs = [str(x).strip() for x in list(getattr(lead_work_order, "pointers", []) or []) if str(x).strip()] if lead_work_order is not None else []
+                if lead_work_order is not None:
+                    try:
+                        self._append_guarded(
+                            event=new_event(
+                                agent="router",
+                                type="STATE_TRANSITION",
+                                summary=f"Fix-loop {loop}: lead assigned {lead_work_order_owner}",
+                                branch_id=self.branch_id,
+                                pointers=list(lead_work_order_ptrs),
+                                meta={
+                                    "phase": "fix_loop",
+                                    "loop": loop,
+                                    "blocker_source": blocker_source,
+                                    "owner": lead_work_order_owner,
+                                    "summary": str(getattr(lead_work_order, "summary", "") or "").strip()[:240],
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                    except Exception:
+                        pass
+
                 fix_plan: Optional[packs.FixPlanPack] = None
                 fix_plan_ptr: Optional[str] = None
                 try:
@@ -7535,6 +7694,7 @@ class Orchestrator:
                 should_triage = (
                     can_triage
                     and ops_engineer is not None
+                    and lead_work_order_owner not in {"env_engineer", "ops_engineer"}
                     and ((blocker_source != "tests") or (loop == 1) or stagnating or stagnating_hard)
                 )
                 if should_triage:
@@ -7611,7 +7771,7 @@ class Orchestrator:
 
                 lead_consult_text = ""
                 lead_consult_ptrs: list[str] = []
-                if impl_blueprint is not None and (stagnating or route_level in {"L3", "L4"}):
+                if impl_blueprint is not None and (stagnating or route_level in {"L3", "L4"} or lead_work_order is not None):
                     try:
                         lead_consult_text, lead_consult_ptrs = maybe_collect_lead_consults(
                             loop=loop,
@@ -7624,24 +7784,74 @@ class Orchestrator:
                     except Exception:
                         lead_consult_text, lead_consult_ptrs = "", []
 
-                env_remediation_change: Optional[packs.CodeChange] = None
-                env_remediation_ptrs: list[str] = []
-                env_remediation_cmds: list[str] = []
-                if blocker_source == "tests" and env_engineer is not None and self._is_env_fix_candidate(
+                delegated_fix_change: Optional[packs.CodeChange] = None
+                delegated_fix_ptrs: list[str] = []
+                delegated_fix_cmds: list[str] = []
+                delegated_fix_agent_id = ""
+                if blocker_source == "tests" and lead_work_order_owner in {"env_engineer", "ops_engineer"}:
+                    delegated_fix_agent_id = lead_work_order_owner
+                    try:
+                        delegated_fix_cmds = [str(x).strip() for x in list(getattr(lead_work_order, "commands", []) or []) if str(x).strip()][:8]
+                    except Exception:
+                        delegated_fix_cmds = []
+                    if delegated_fix_agent_id == "env_engineer" and not delegated_fix_cmds and env_engineer is not None and env_blocker:
+                        try:
+                            delegated_fix_cmds = self._env_remediation_commands_for_tests(
+                                report=report,
+                                blocker_text=blocker_text,
+                                error=current_error_object,
+                                envspec_commands=envspec_commands,
+                            )
+                        except Exception:
+                            delegated_fix_cmds = []
+                    delegated_key = "|".join(
+                        [
+                            fp_now or blocker_text[:160],
+                            delegated_fix_agent_id,
+                            str(getattr(lead_work_order, "summary", "") or "").strip()[:120],
+                            *delegated_fix_cmds[:4],
+                        ]
+                    )
+                    if delegated_fix_cmds and delegated_key not in executed_lead_work_orders:
+                        executed_lead_work_orders.add(delegated_key)
+                        activate_agent(delegated_fix_agent_id, reason="gate:lead_work_order")
+                        exec_success = True
+                        for cmd in delegated_fix_cmds:
+                            rr = self.toolbox.run_cmd(agent_id=delegated_fix_agent_id, cmd=cmd, cwd=self.repo_root, timeout_s=3600)
+                            delegated_fix_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
+                            if rr.returncode != 0:
+                                exec_success = False
+                            try:
+                                low_cmd = str(cmd or "").lower()
+                                if rr.returncode == 0 and "python -m pip install" in low_cmd:
+                                    self._record_python_install_state(command=cmd)
+                            except Exception:
+                                pass
+                        delegated_summary = str(getattr(lead_work_order, "summary", "") or "").strip()
+                        delegated_fix_change = packs.CodeChange(
+                            kind="noop",
+                            summary=(
+                                f"{delegated_summary}：已执行工单命令"
+                                if exec_success
+                                else f"{delegated_summary}：已执行工单命令但仍失败"
+                            ),
+                            files_changed=[],
+                        )
+                elif blocker_source == "tests" and env_engineer is not None and self._is_env_fix_candidate(
                     error=current_error_object,
                     blocker_text=blocker_text,
                 ):
                     try:
-                        env_remediation_cmds = self._env_remediation_commands_for_tests(
+                        delegated_fix_cmds = self._env_remediation_commands_for_tests(
                             report=report,
                             blocker_text=blocker_text,
                             error=current_error_object,
                             envspec_commands=envspec_commands,
                         )
                     except Exception:
-                        env_remediation_cmds = []
-                    env_key = "|".join([fp_now or blocker_text[:160], *env_remediation_cmds[:4]])
-                    if env_remediation_cmds and env_key not in env_remediation_keys:
+                        delegated_fix_cmds = []
+                    env_key = "|".join([fp_now or blocker_text[:160], *delegated_fix_cmds[:4]])
+                    if delegated_fix_cmds and env_key not in env_remediation_keys:
                         env_remediation_keys.add(env_key)
                         activate_agent("env_engineer", reason="gate:env_fix")
                         self._append_guarded(
@@ -7656,7 +7866,7 @@ class Orchestrator:
                                     "loop": loop,
                                     "blocker_source": blocker_source,
                                     "fix_agent": "env_engineer",
-                                    "commands": env_remediation_cmds,
+                                    "commands": delegated_fix_cmds,
                                     "route_level": route_level,
                                     "style": resolved_style,
                                 },
@@ -7664,9 +7874,9 @@ class Orchestrator:
                             activated_agents=activated_agents,
                         )
                         env_success = True
-                        for cmd in env_remediation_cmds:
+                        for cmd in delegated_fix_cmds:
                             rr = self.toolbox.run_cmd(agent_id="env_engineer", cmd=cmd, cwd=self.repo_root, timeout_s=3600)
-                            env_remediation_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
+                            delegated_fix_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
                             if rr.returncode != 0:
                                 env_success = False
                             try:
@@ -7675,10 +7885,11 @@ class Orchestrator:
                                     self._record_python_install_state(command=cmd)
                             except Exception:
                                 pass
-                        env_summary = " / ".join(env_remediation_cmds[:2]).strip()
-                        if len(env_remediation_cmds) > 2:
+                        env_summary = " / ".join(delegated_fix_cmds[:2]).strip()
+                        if len(delegated_fix_cmds) > 2:
                             env_summary = f"{env_summary} …"
-                        env_remediation_change = packs.CodeChange(
+                        delegated_fix_agent_id = "env_engineer"
+                        delegated_fix_change = packs.CodeChange(
                             kind="noop",
                             summary=(
                                 f"应用环境修复命令：{env_summary}"
@@ -7691,12 +7902,12 @@ class Orchestrator:
                             event=new_event(
                                 agent="env_engineer",
                                 type="ENV_UPDATED",
-                                summary=env_remediation_change.summary,
+                                summary=delegated_fix_change.summary,
                                 branch_id=self.branch_id,
-                                pointers=env_remediation_ptrs,
+                                pointers=delegated_fix_ptrs,
                                 meta={
                                     "loop": loop,
-                                    "commands": env_remediation_cmds,
+                                    "commands": delegated_fix_cmds,
                                     "passed": env_success,
                                     "route_level": route_level,
                                     "style": resolved_style,
@@ -7705,9 +7916,9 @@ class Orchestrator:
                             activated_agents=activated_agents,
                         )
 
-                if env_remediation_change is None:
+                if delegated_fix_change is None:
                     activate_agent(fix_coder_id, reason="gate:fix_loop")
-                dispatch_agent_id = "env_engineer" if env_remediation_change is not None else fix_coder_id
+                dispatch_agent_id = delegated_fix_agent_id or fix_coder_id
 
                 # Audit: record which agent is handling this fix-loop step.
                 self._append_guarded(
@@ -7778,6 +7989,11 @@ class Orchestrator:
                     lead_reason = str(getattr(impl_blueprint, "escalation_reason", "") or "").strip()
                     if lead_reason:
                         fix_user = f"{fix_user}\n\nImplementationLeadReason:\n{lead_reason}"
+                if lead_work_order is not None and lead_work_order_owner in lead_fix_agents:
+                    fix_user = (
+                        f"{fix_user}\n\nLeadWorkOrder（只执行这张工单，不要扩展到其他假设）：\n"
+                        f"{lead_work_order.model_dump_json()}"
+                    )
                 if lead_consult_text:
                     fix_user = f"{fix_user}\n\n{lead_consult_text}"
                 if ctx_excerpts:
@@ -7871,12 +8087,13 @@ class Orchestrator:
                     fix_role = "Integration Engineer (align frontend/backend/contracts)"
                 elif fix_coder_id == "coder_backend":
                     fix_role = "Backend Coder"
-                if env_remediation_change is not None:
-                    fix_role = "Environment Engineer"
+                if delegated_fix_change is not None:
+                    fix_role = "Environment Engineer" if delegated_fix_agent_id == "env_engineer" else "Ops Engineer"
                 fix_allow, fix_deny = _scope_for_fix_loop() if impl_blueprint is not None else ([], [])
-                fix_allow, fix_deny = self._expand_fix_scope_for_blocker(
-                    allow=fix_allow,
-                    deny=fix_deny,
+                fix_allow, fix_deny = self._lead_work_order_scope(
+                    order=lead_work_order if lead_work_order_owner in lead_fix_agents else None,
+                    default_allow=fix_allow,
+                    default_deny=fix_deny,
                     blocker_text=blocker_text,
                 )
                 fix_scope_hint = ""
@@ -7892,9 +8109,9 @@ class Orchestrator:
                     if deny_short:
                         lines.append("Denied write paths/globs:\n" + "\n".join([f"- {p}" for p in deny_short]))
                     fix_scope_hint = "\n\nImplementationLeadWriteScope:\n" + "\n\n".join(lines)
-                if env_remediation_change is not None:
-                    change = env_remediation_change
-                    write_pointers = list(env_remediation_ptrs)
+                if delegated_fix_change is not None:
+                    change = delegated_fix_change
+                    write_pointers = list(delegated_fix_ptrs)
                 elif auto_change is None:
                     fix_msgs = self._messages_with_memory(
                         agent_id=fix_coder_id,
@@ -7910,6 +8127,7 @@ class Orchestrator:
                             "- Do not change unrelated files or batch multiple hypotheses in one patch.\n"
                             "- Fix the failing command in the blocker; prefer fixing the selected root cause completely before touching other symptoms.\n"
                             "- Do not do architecture refactors during fix-loop.\n"
+                            "- If LeadWorkOrder is provided, follow that work order exactly: owner/scope/files/commands/verify take precedence over your own guesses.\n"
                             "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
                             "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
                             "- If Python third-party imports are missing, prefer updating `pyproject.toml` / `requirements.txt` rather than editing business code first.\n"
@@ -7949,7 +8167,7 @@ class Orchestrator:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
                     files_short = ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
-                    history_agent = "env_engineer" if env_remediation_change is not None else fix_coder_id
+                    history_agent = delegated_fix_agent_id or fix_coder_id
                     error_tag = str(getattr(current_error_object, "error_type", "") or "").strip()
                     cause = str(getattr(current_error_object, "suspected_root_cause", "") or "").strip()
                     fix_history.append(
@@ -7976,10 +8194,21 @@ class Orchestrator:
                         meta["failed_command"] = current_error_object.failed_command
                     if current_error_object.traceback_location:
                         meta["traceback_location"] = current_error_object.traceback_location
-                if env_remediation_cmds:
-                    meta["commands"] = env_remediation_cmds
-                event_agent = "env_engineer" if env_remediation_change is not None else fix_coder_id
-                event_type = "ENV_UPDATED" if env_remediation_change is not None else ("PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT")
+                if delegated_fix_cmds:
+                    meta["commands"] = delegated_fix_cmds
+                if lead_work_order is not None:
+                    meta["lead_work_order_owner"] = lead_work_order_owner
+                    meta["lead_work_order_summary"] = str(getattr(lead_work_order, "summary", "") or "").strip()[:240]
+                event_agent = delegated_fix_agent_id or fix_coder_id
+                event_type = (
+                    "ENV_UPDATED"
+                    if delegated_fix_agent_id == "env_engineer"
+                    else "PATCH_WRITTEN"
+                    if delegated_fix_agent_id == "ops_engineer"
+                    else "PATCH_WRITTEN"
+                    if change.kind == "patch"
+                    else "CODE_COMMIT"
+                )
                 self._append_guarded(
                     event=new_event(
                         agent=event_agent,

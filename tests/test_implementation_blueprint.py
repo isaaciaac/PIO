@@ -6,6 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from vibe.cli import app
+from vibe.orchestrator import Orchestrator
 from vibe.providers.base import ProviderMeta, ProviderResult
 from vibe.providers.mock import MockProvider
 from vibe.schemas import packs as schemas
@@ -32,12 +33,25 @@ def test_implementation_blueprint_accepts_fix_agent_consult_aliases() -> None:
             "recommended_agent": "integration_engineer",
             "consult": ["architect", "env_engineer"],
             "reason": "cross-module fix",
+            "work_orders": [
+                {
+                    "agent": "env_engineer",
+                    "title": "install deps",
+                    "commands": ["python -m pip install -e ."],
+                    "allow": ["pyproject.toml", "requirements.txt"],
+                    "verify": ["python -m compileall ."],
+                }
+            ],
         }
     )
     assert bp.global_allowed_write_globs == ["src/**"]
     assert bp.recommended_fix_agent == "integration_engineer"
     assert bp.consult_agents == ["architect", "env_engineer"]
     assert bp.escalation_reason == "cross-module fix"
+    assert len(bp.fix_work_orders) == 1
+    assert bp.fix_work_orders[0].owner == "env_engineer"
+    assert bp.fix_work_orders[0].allowed_write_globs == ["pyproject.toml", "requirements.txt"]
+    assert bp.fix_work_orders[0].verify_commands == ["python -m compileall ."]
 
 
 def test_mock_blueprint_persists_recommended_fix_agent_and_consults(tmp_path: Path, monkeypatch) -> None:
@@ -54,6 +68,14 @@ def test_mock_blueprint_persists_recommended_fix_agent_and_consults(tmp_path: Pa
                     "recommended_agent": "integration_engineer",
                     "consult": ["architect", "env_engineer", "bogus"],
                     "reason": "cross-module coordination required",
+                    "work_orders": [
+                        {
+                            "agent": "env_engineer",
+                            "title": "bootstrap python env",
+                            "commands": ["python -m pip install -e ."],
+                            "allow": ["pyproject.toml", "requirements.txt"],
+                        }
+                    ],
                 }
             )
             meta = ProviderMeta(provider=self.provider_id, model="mock", usage={})
@@ -81,3 +103,34 @@ def test_mock_blueprint_persists_recommended_fix_agent_and_consults(tmp_path: Pa
     assert payload["recommended_fix_agent"] == "integration_engineer"
     assert payload["consult_agents"] == ["architect", "env_engineer"]
     assert payload["escalation_reason"] == "cross-module coordination required"
+    assert payload["fix_work_orders"][0]["owner"] == "env_engineer"
+
+
+def test_select_lead_fix_work_order_prefers_env_for_env_blocker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    bp = schemas.ImplementationBlueprint.model_validate(
+        {
+            "summary": "lead",
+            "allow": ["src/**"],
+            "fix_work_orders": [
+                {"owner": "coder_backend", "summary": "code patch", "allow": ["src/**"]},
+                {"owner": "env_engineer", "summary": "install deps", "commands": ["python -m pip install -e ."]},
+            ],
+        }
+    )
+    err = schemas.ErrorObject(error_type="config_missing", suspected_root_cause="missing dependency", failed_command="pytest -q")
+    selected = orch._select_lead_fix_work_order(
+        blueprint=bp,
+        error=err,
+        blocker_source="tests",
+        blocker_text="ModuleNotFoundError: No module named 'fastapi'",
+        available_agents={"router", "coder_backend", "env_engineer", "qa"},
+        preferred_fix_agent="coder_backend",
+    )
+    assert selected is not None
+    assert selected.owner == "env_engineer"

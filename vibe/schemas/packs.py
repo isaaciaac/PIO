@@ -338,6 +338,74 @@ class FixPlanPack(BaseModel):
     pointers: List[str] = Field(default_factory=list)
 
 
+FixWorkOrderOwner = Literal[
+    "coder_backend",
+    "coder_frontend",
+    "integration_engineer",
+    "env_engineer",
+    "ops_engineer",
+]
+
+
+class FixWorkOrder(BaseModel):
+    owner: FixWorkOrderOwner
+    summary: str
+    reason: str = ""
+    allowed_write_globs: List[str] = Field(default_factory=list)
+    denied_write_globs: List[str] = Field(default_factory=list)
+    files_to_check: List[str] = Field(default_factory=list)
+    commands: List[str] = Field(default_factory=list)
+    verify_commands: List[str] = Field(default_factory=list)
+    stop_if: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data):
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "owner" not in out:
+            for k in ("agent", "assignee", "fix_agent", "executor"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["owner"] = v.strip()
+                    break
+        if "summary" not in out:
+            for k in ("title", "task", "name"):
+                v = out.get(k)
+                if isinstance(v, str) and v.strip():
+                    out["summary"] = v.strip()
+                    break
+        if "allowed_write_globs" not in out:
+            for k in ("allow", "allowed", "allowed_paths", "allowed_globs"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["allowed_write_globs"] = v
+                    break
+        if "denied_write_globs" not in out:
+            for k in ("deny", "denied", "denied_paths", "denied_globs"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["denied_write_globs"] = v
+                    break
+        if "verify_commands" not in out:
+            for k in ("verify", "verification", "checks"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["verify_commands"] = v
+                    break
+        if "files_to_check" not in out:
+            for k in ("files", "targets", "paths"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["files_to_check"] = v
+                    break
+        if "reason" not in out and isinstance(out.get("notes"), str):
+            out["reason"] = out.get("notes")
+        return out
+
+
 class ImplementationBlueprintTaskScope(BaseModel):
     task_id: str
     allowed_write_globs: List[str] = Field(default_factory=list)
@@ -389,6 +457,7 @@ class ImplementationBlueprint(BaseModel):
     task_scopes: List[ImplementationBlueprintTaskScope] = Field(default_factory=list)
     fix_allowed_write_globs: List[str] = Field(default_factory=list)
     fix_denied_write_globs: List[str] = Field(default_factory=list)
+    fix_work_orders: List[FixWorkOrder] = Field(default_factory=list)
     recommended_fix_agent: str = ""
     consult_agents: List[str] = Field(default_factory=list)
     escalation_reason: str = ""
@@ -427,6 +496,12 @@ class ImplementationBlueprint(BaseModel):
                 v = out.get(k)
                 if isinstance(v, list):
                     out["fix_allowed_write_globs"] = v
+                    break
+        if "fix_work_orders" not in out:
+            for k in ("work_orders", "fix_orders", "orders", "fix_workitems"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["fix_work_orders"] = v
                     break
         if "fix_denied_write_globs" not in out:
             for k in ("fix_deny", "fix_denied", "fix_scope_deny", "fix_write_denylist"):

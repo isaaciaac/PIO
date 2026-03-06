@@ -983,7 +983,7 @@ def chat(
     _append_chat_history(hist_path, role="assistant", content=reply.reply)
 
     if json_out:
-        typer.echo(reply.model_dump_json(indent=2, ensure_ascii=False))
+        typer.echo(json.dumps(reply.model_dump(), ensure_ascii=False, indent=2))
     else:
         typer.echo(reply.reply)
 
@@ -1068,7 +1068,7 @@ def vision(
         ptr = store.put_json(report.model_dump(), suffix=".vision.json", kind="vision").to_pointer()
         report = report.model_copy(update={"pointers": [artifact, ptr]})
         if json_out:
-            typer.echo(report.model_dump_json(indent=2, ensure_ascii=False))
+            typer.echo(json.dumps(report.model_dump(), ensure_ascii=False, indent=2))
         else:
             typer.echo(report.summary)
         return
@@ -1130,7 +1130,7 @@ def vision(
     report = report.model_copy(update={"pointers": [*list(report.pointers), ptr]})
 
     if json_out:
-        typer.echo(report.model_dump_json(indent=2, ensure_ascii=False))
+        typer.echo(json.dumps(report.model_dump(), ensure_ascii=False, indent=2))
     else:
         typer.echo(report.summary)
 
