@@ -50,7 +50,7 @@ def test_mock_blueprint_persists_recommended_fix_agent_and_consults(tmp_path: Pa
             out = schemas.ImplementationBlueprint.model_validate(
                 {
                     "summary": "lead blueprint",
-                    "allow": ["src/**"],
+                    "allow": ["**"],
                     "recommended_agent": "integration_engineer",
                     "consult": ["architect", "env_engineer", "bogus"],
                     "reason": "cross-module coordination required",
@@ -81,4 +81,3 @@ def test_mock_blueprint_persists_recommended_fix_agent_and_consults(tmp_path: Pa
     assert payload["recommended_fix_agent"] == "integration_engineer"
     assert payload["consult_agents"] == ["architect", "env_engineer"]
     assert payload["escalation_reason"] == "cross-module coordination required"
-

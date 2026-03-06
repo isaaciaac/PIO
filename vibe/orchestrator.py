@@ -58,6 +58,31 @@ class WriteScopeDeniedError(RuntimeError):
         self.deny = list(deny or [])
 
 
+AUTO_RESUME_REASONS = {"fix_loop_blockers", "qa_no_commands", "replan_required"}
+REPLAN_HINT_KEYWORDS = (
+    "architecture",
+    "architect",
+    "adr",
+    "api",
+    "boundary",
+    "contract",
+    "cross-module",
+    "cross module",
+    "directory",
+    "envspec",
+    "interface",
+    "module",
+    "ownership",
+    "plan",
+    "replan",
+    "route",
+    "router",
+    "schema",
+    "shared_context",
+    "shared context",
+)
+
+
 def _normalize_scope_pattern(pat: str) -> str:
     return (str(pat or "").replace("\\", "/").strip()).lstrip("/")
 
@@ -4267,7 +4292,7 @@ class Orchestrator:
             if str(meta.get("branch_id") or "main") != self.branch_id:
                 continue
             reason = str(meta.get("reason") or "").strip()
-            if reason not in {"fix_loop_blockers", "qa_no_commands"}:
+            if reason not in AUTO_RESUME_REASONS:
                 continue
             label = (cp.label or "").strip().lower()
             if not label:
@@ -4330,7 +4355,7 @@ class Orchestrator:
         resume_reason: Optional[str] = None
         if resume_cp is not None:
             meta = dict(resume_cp.meta or {})
-            if not resume_cp.green and str(meta.get("reason") or "").strip() in {"fix_loop_blockers", "qa_no_commands"}:
+            if not resume_cp.green and str(meta.get("reason") or "").strip() in AUTO_RESUME_REASONS:
                 resume_from = resume_cp.id
                 resume_reason = str(meta.get("reason") or "").strip()
 
@@ -4554,8 +4579,14 @@ class Orchestrator:
         contract_ptr: Optional[str] = None
         plan: Optional[packs.Plan] = None
         plan_ptr: Optional[str] = None
+        resume_impl_blueprint_candidate: Optional[packs.ImplementationBlueprint] = None
+        resume_impl_blueprint_ptr: Optional[str] = None
+        resume_blockers: list[str] = []
+        resume_replan_trigger: str = ""
 
         resume_mode = bool(resume_from)
+        resume_replan_mode = resume_reason == "replan_required"
+        resume_skip_implement = resume_mode and not resume_replan_mode
         if resume_mode:
             self._append_guarded(
                 event=new_event(
@@ -4589,6 +4620,9 @@ class Orchestrator:
             usecases_ptr = str(meta.get("usecases_ptr") or "").strip() or None
             decisions_ptr = str(meta.get("decisions_ptr") or "").strip() or None
             contract_ptr = str(meta.get("contract_ptr") or "").strip() or None
+            resume_impl_blueprint_ptr = str(meta.get("impl_blueprint_ptr") or "").strip() or None
+            resume_blockers = [str(x).strip() for x in list(meta.get("blockers") or []) if str(x).strip()][:12]
+            resume_replan_trigger = str(meta.get("replan_trigger") or "").strip()[:240]
 
             req = _load(req_ptr, packs.RequirementPack) if req_ptr else None
             intent = _load(intent_ptr, packs.IntentExpansionPack) if intent_ptr else None
@@ -4596,6 +4630,9 @@ class Orchestrator:
             usecases = _load(usecases_ptr, packs.UseCasePack) if usecases_ptr else None
             decisions = _load(decisions_ptr, packs.DecisionPack) if decisions_ptr else None
             contract = _load(contract_ptr, packs.ContractPack) if contract_ptr else None
+            resume_impl_blueprint_candidate = (
+                _load(resume_impl_blueprint_ptr, packs.ImplementationBlueprint) if resume_impl_blueprint_ptr else None
+            )
 
             if req is None and route_level != "L0":
                 req = packs.RequirementPack(
@@ -5116,6 +5153,14 @@ class Orchestrator:
             bp.pointers = [str(x).strip() for x in list(bp.pointers or []) if str(x).strip()][:24]
             return bp
 
+        if resume_impl_blueprint_candidate is not None:
+            try:
+                impl_blueprint = _sanitize_blueprint(resume_impl_blueprint_candidate)
+                impl_blueprint_ptr = resume_impl_blueprint_ptr
+            except Exception:
+                impl_blueprint = None
+                impl_blueprint_ptr = None
+
         def _scope_for_plan_task(task: packs.PlanTask) -> tuple[list[str], list[str]]:
             if impl_blueprint is None:
                 return [], []
@@ -5150,7 +5195,9 @@ class Orchestrator:
 
         def maybe_build_implementation_blueprint(*, reason: str) -> None:
             nonlocal impl_blueprint, impl_blueprint_ptr
-            if resume_mode:
+            if resume_mode and not resume_replan_mode:
+                return
+            if resume_replan_mode and impl_blueprint is not None:
                 return
             cfg = self.config.agents.get("implementation_lead")
             if cfg is None or not bool(getattr(cfg, "enabled", True)):
@@ -5426,6 +5473,282 @@ class Orchestrator:
 
         primary_coder, coder_role = coder_actor(primary_coder_id)
 
+        def maybe_prepare_replan(
+            *,
+            loop: int,
+            blocker_source: str,
+            blocker_text: str,
+            extracted: list[str],
+            failure_fingerprint: str,
+            report: packs.TestReport,
+            review: Optional[packs.ReviewReport],
+            security_report: Optional[packs.RiskRegister],
+            compliance_report: Optional[packs.ComplianceReport],
+            perf_report: Optional[packs.PerfReport],
+            incident: Optional[packs.IncidentPack],
+            incident_ptr: Optional[str],
+            fix_plan: Optional[packs.FixPlanPack],
+            fix_plan_ptr: Optional[str],
+            stagnating_hard: bool,
+        ) -> tuple[bool, str]:
+            nonlocal decisions, decisions_ptr, contract, contract_ptr, plan, plan_ptr, impl_blueprint, impl_blueprint_ptr
+            if route_level not in {"L2", "L3", "L4"}:
+                return False, ""
+            if resume_replan_mode:
+                return False, ""
+
+            consults = {
+                str(x).strip()
+                for x in list(getattr(impl_blueprint, "consult_agents", []) or [])
+                if str(x).strip()
+            }
+            escalation_reason = str(getattr(impl_blueprint, "escalation_reason", "") or "").strip()
+            haystack = "\n".join(
+                [
+                    blocker_source,
+                    blocker_text,
+                    escalation_reason,
+                    "\n".join(list(extracted or [])[:12]),
+                    "\n".join(list(getattr(report, "blockers", []) or [])[:8]),
+                ]
+            ).lower()
+
+            trigger_reasons: list[str] = []
+            if blocker_source in {"review", "security", "compliance", "performance"} and loop >= 2:
+                trigger_reasons.append(f"{blocker_source}_gate_stuck")
+            if blocker_source == "tests" and stagnating_hard:
+                if consults.intersection({"architect", "api_confirm"}):
+                    trigger_reasons.append("lead_requested_design_consult")
+                elif any(keyword in haystack for keyword in REPLAN_HINT_KEYWORDS):
+                    trigger_reasons.append("design_level_failure_signature")
+
+            if not trigger_reasons:
+                return False, ""
+            if architect is None:
+                return False, ""
+
+            try:
+                activate_agent("architect", reason="gate:replan")
+            except Exception:
+                pass
+
+            replan_summary = ", ".join(trigger_reasons[:4])
+            arch_user = (
+                f"Task:\n{task_text}\n\n"
+                f"RouteLevel: {route_level}\n"
+                f"ReplanReasons:\n- " + "\n- ".join(trigger_reasons[:6]) + "\n\n"
+                f"BlockerSource: {blocker_source}\n"
+                f"FailureFingerprint: {failure_fingerprint}\n\n"
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\n"
+                f"PreviousDecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"CurrentPlan:\n{plan.model_dump_json() if plan is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"TestReport:\n{report.model_dump_json()}\n\n"
+                f"ReviewReport:\n{review.model_dump_json() if review is not None else '{}'}\n\n"
+                f"SecurityReport:\n{security_report.model_dump_json() if security_report is not None else '{}'}\n\n"
+                f"ComplianceReport:\n{compliance_report.model_dump_json() if compliance_report is not None else '{}'}\n\n"
+                f"PerfReport:\n{perf_report.model_dump_json() if perf_report is not None else '{}'}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}\n\n"
+                f"Blocker:\n{blocker_text}"
+            )
+            if incident is not None:
+                arch_user = f"{arch_user}\n\nIncidentPack:\n{incident.model_dump_json()}"
+            if fix_plan is not None:
+                arch_user = f"{arch_user}\n\nFixPlan:\n{fix_plan.model_dump_json()}"
+            if fix_history:
+                arch_user = f"{arch_user}\n\nRecentFixHistory:\n" + "\n".join(fix_history[-6:])
+            if ctx_excerpts:
+                arch_user = f"{arch_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+
+            try:
+                arch_msgs = self._messages_with_memory(
+                    agent_id="architect",
+                    system=(
+                        "你是架构师（architect）。当前方案已被 blocker 证明存在设计/契约/模块边界层面的缺口，需要做一次“窄重规划”。\n"
+                        "只输出 DecisionPack JSON；不要 markdown；不要额外 key。\n"
+                        "要求：\n"
+                        "- 不要推翻整个方案，只修正导致 blocker 的共享约定、模块边界、目录/命令/env 契约。\n"
+                        "- shared_context 必须继续包含 repo_layout / commands / env_vars。\n"
+                        "- decision 必须面向“下一轮实现能收敛”，而不是泛泛而谈。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=arch_user,
+                )
+                replanned_decisions, _ = architect.chat_json(schema=packs.DecisionPack, messages=arch_msgs, user=arch_user)
+                decisions = replanned_decisions
+                decisions_ptr = self.artifacts.put_json(
+                    decisions.model_dump(),
+                    suffix=".adr.replan.json",
+                    kind="adr",
+                ).to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="architect",
+                        type="ARCH_UPDATED",
+                        summary="Architecture replanned after blockers",
+                        branch_id=self.branch_id,
+                        pointers=[p for p in [decisions_ptr, incident_ptr, fix_plan_ptr] if p],
+                        meta={
+                            "route_level": route_level,
+                            "style": resolved_style,
+                            "phase": "replan",
+                            "reasons": trigger_reasons[:6],
+                            "failure_fingerprint": failure_fingerprint,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                return False, ""
+
+            refresh_contract = route_level in {"L2", "L3", "L4"} and (
+                contract is not None
+                or risks.contract_change
+                or risks.touches_external_api
+                or "api_confirm" in consults
+            )
+            if refresh_contract and api_confirm is not None:
+                try:
+                    activate_agent("api_confirm", reason="gate:replan_contract")
+                    contract_user = (
+                        f"Task:\n{task_text}\n\n"
+                        f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                        f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\n"
+                        f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                        f"PreviousContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                        f"BlockerSource: {blocker_source}\n"
+                        f"FailureFingerprint: {failure_fingerprint}\n\n"
+                        f"Blocker:\n{blocker_text}\n\n"
+                        f"ContextPacket:\n{ctx.model_dump_json()}"
+                    )
+                    if ctx_excerpts:
+                        contract_user = f"{contract_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                    contract_msgs = self._messages_with_memory(
+                        agent_id="api_confirm",
+                        system=(
+                            "你是 API/Contract confirmer。当前 blocker 需要你刷新 ContractPack，使下一轮实现/验证不再基于失效契约。\n"
+                            "只输出 ContractPack JSON；不要 markdown；不要额外 key。\n\n"
+                            f"{workflow_hint}"
+                        ),
+                        user=contract_user,
+                    )
+                    contract, _ = api_confirm.chat_json(schema=packs.ContractPack, messages=contract_msgs, user=contract_user)
+                    contract_ptr = self.artifacts.put_json(
+                        contract.model_dump(),
+                        suffix=".contract.replan.json",
+                        kind="contract",
+                    ).to_pointer()
+                    self._append_guarded(
+                        event=new_event(
+                            agent="api_confirm",
+                            type="CONTRACT_CONFIRMED",
+                            summary="Contract refreshed during replan",
+                            branch_id=self.branch_id,
+                            pointers=[contract_ptr],
+                            meta={
+                                "route_level": route_level,
+                                "style": resolved_style,
+                                "phase": "replan",
+                                "failure_fingerprint": failure_fingerprint,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                except Exception:
+                    pass
+
+            replan_user = (
+                f"Task:\n{task_text}\n\n"
+                f"RequirementPack:\n{req.model_dump_json() if req is not None else '{}'}\n\n"
+                f"IntentExpansionPack:\n{intent.model_dump_json() if intent is not None else '{}'}\n\n"
+                f"UseCasePack:\n{usecases.model_dump_json() if usecases is not None else '{}'}\n\n"
+                f"DecisionPack:\n{decisions.model_dump_json() if decisions is not None else '{}'}\n\n"
+                f"ContractPack:\n{contract.model_dump_json() if contract is not None else '{}'}\n\n"
+                f"PreviousPlan:\n{plan.model_dump_json() if plan is not None else '{}'}\n\n"
+                f"BlockerSource: {blocker_source}\n"
+                f"FailureFingerprint: {failure_fingerprint}\n"
+                f"ReplanReasons:\n- " + "\n- ".join(trigger_reasons[:6]) + "\n\n"
+                f"Blocker:\n{blocker_text}\n\n"
+                f"ContextPacket:\n{ctx.model_dump_json()}"
+            )
+            if fix_history:
+                replan_user = f"{replan_user}\n\nRecentFixHistory:\n" + "\n".join(fix_history[-6:])
+            if ctx_excerpts:
+                replan_user = f"{replan_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+
+            try:
+                replan_msgs = self._messages_with_memory(
+                    agent_id="router",
+                    system=(
+                        f"你是调度器 Router。当前计划在 fix-loop 中被证据证明不收敛，需要输出一版新的执行计划（最多 {max_plan_tasks} 个任务）。\n"
+                        "只输出 Plan JSON；不要 markdown；不要额外 key。\n"
+                        "规则：\n"
+                        f"- tasks <= {max_plan_tasks}。\n"
+                        "- 只重排/补足必要任务，不要把整个计划推翻重写。\n"
+                        "- 先补真正缺失的工程骨架/共享类型/命令/入口，再做业务实现，最后再进 QA。\n"
+                        "- 如果 blocker 暗示跨模块对齐问题，优先给 integration_engineer 明确任务。\n\n"
+                        f"{workflow_hint}"
+                    ),
+                    user=replan_user,
+                )
+                replanned_plan, _ = router.chat_json(schema=packs.Plan, messages=replan_msgs, user=replan_user)
+                plan = augment_plan(
+                    replanned_plan,
+                    req=req,
+                    task_text=task_text,
+                    activated_agents=activated_agents,
+                    max_tasks=max_plan_tasks,
+                )
+                try:
+                    needs_bootstrap = any("工程骨架提示" in str(c) for c in (ctx.constraints or []))
+                except Exception:
+                    needs_bootstrap = False
+                if needs_bootstrap:
+                    try:
+                        blob = "\n".join([f"{t.title}\n{t.description}" for t in list(plan.tasks or [])]).lower()
+                    except Exception:
+                        blob = ""
+                    has_bootstrap = any(
+                        k in blob for k in ["工程骨架", "scaffold", "package.json", "pyproject", "tsconfig", "初始化", "bootstrap"]
+                    )
+                    if not has_bootstrap:
+                        plan.tasks = [
+                            packs.PlanTask(
+                                id="t_bootstrap",
+                                title="工程骨架",
+                                agent=primary_coder_id,
+                                description="补齐最小工程骨架（build/lint/test/README 运行说明），确保至少有一条可执行的本地验证命令。",
+                            )
+                        ] + list(plan.tasks or [])[:4]
+                plan_ptr = self.artifacts.put_json(plan.model_dump(), suffix=".plan.replan.json", kind="plan").to_pointer()
+                self._append_guarded(
+                    event=new_event(
+                        agent="router",
+                        type="PLAN_CREATED",
+                        summary=f"Replanned {len(plan.tasks)} tasks after blockers",
+                        branch_id=self.branch_id,
+                        pointers=[p for p in [plan_ptr, decisions_ptr, contract_ptr] if p],
+                        meta={
+                            "route_level": route_level,
+                            "style": resolved_style,
+                            "phase": "replan",
+                            "task_id": task_evt.id,
+                            "reasons": trigger_reasons[:6],
+                            "failure_fingerprint": failure_fingerprint,
+                        },
+                    ),
+                    activated_agents=activated_agents,
+                )
+            except Exception:
+                return False, ""
+
+            try:
+                maybe_build_implementation_blueprint(reason="gate:blueprint_replan")
+            except Exception:
+                pass
+            return True, replan_summary
+
         def coder_system(*, role: str, task: packs.PlanTask) -> str:
             scope_lines: list[str] = []
             if impl_blueprint is not None:
@@ -5500,12 +5823,13 @@ class Orchestrator:
         # Execute plan tasks sequentially. This avoids the "QA drives progress" anti-pattern:
         # we first complete the planned work, then validate.
         #
-        # Resume mode MUST NOT re-run PLAN/IMPLEMENT. It should continue from
-        # QA + fix-loop to converge on the remaining blockers.
+        # Resume from ordinary non-green checkpoints MUST NOT re-run PLAN/IMPLEMENT.
+        # Replan checkpoints are different: they carry a refreshed plan and should
+        # continue from IMPLEMENT on the next run.
         plan_changes: list[packs.CodeChange] = []
         all_write_pointers: list[str] = []
 
-        if not resume_mode:
+        if not resume_skip_implement:
             code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
             for t in list(plan.tasks or [])[:max_implement_tasks]:
                 agent_id = (t.agent or "").strip() or primary_coder_id
@@ -5660,6 +5984,7 @@ class Orchestrator:
                     "usecases_ptr": usecases_ptr,
                     "decisions_ptr": decisions_ptr,
                     "contract_ptr": contract_ptr,
+                    "impl_blueprint_ptr": impl_blueprint_ptr,
                     "resume_from": resume_from,
                     "doctor_ptr": doctor_ptr,
                 },
@@ -5983,6 +6308,7 @@ class Orchestrator:
                     "usecases_ptr": usecases_ptr,
                     "decisions_ptr": decisions_ptr,
                     "contract_ptr": contract_ptr,
+                    "impl_blueprint_ptr": impl_blueprint_ptr,
                     "resume_from": resume_from,
                     "doctor_ptr": doctor_ptr,
                 },
@@ -7304,8 +7630,34 @@ class Orchestrator:
                         if s:
                             blockers.append(s)
 
+                replan_required = False
+                replan_trigger = ""
+                try:
+                    replan_required, replan_trigger = maybe_prepare_replan(
+                        loop=loop,
+                        blocker_source=blocker_source,
+                        blocker_text=blocker_text,
+                        extracted=extracted,
+                        failure_fingerprint=fp_now,
+                        report=report,
+                        review=review,
+                        security_report=security_report,
+                        compliance_report=compliance_report,
+                        perf_report=perf_report,
+                        incident=incident,
+                        incident_ptr=incident_ptr,
+                        fix_plan=fix_plan,
+                        fix_plan_ptr=fix_plan_ptr,
+                        stagnating_hard=stagnating_hard,
+                    )
+                except Exception:
+                    replan_required = False
+                    replan_trigger = ""
+
                 artifacts_blocked: List[str] = []
-                artifacts_blocked.extend([p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr, security_ptr, compliance_ptr, perf_ptr, envspec_ptr] if p])
+                artifacts_blocked.extend(
+                    [p for p in [usecases_ptr, decisions_ptr, contract_ptr, review_ptr, security_ptr, compliance_ptr, perf_ptr, envspec_ptr, impl_blueprint_ptr] if p]
+                )
                 if change.patch_pointer:
                     artifacts_blocked.append(change.patch_pointer)
                 artifacts_blocked.extend(report.pointers)
@@ -7323,6 +7675,8 @@ class Orchestrator:
                     if repo_ref != "no-git"
                     else [f"vibe checkpoint restore {checkpoint_id}"]
                 )
+                if replan_required:
+                    restore_steps.append("重新运行 `vibe run`：将从本检查点恢复新的计划并继续实现/验证。")
                 if change.patch_pointer:
                     restore_steps.append(f"（如需恢复未提交的变更）应用补丁：{change.patch_pointer}")
 
@@ -7342,8 +7696,9 @@ class Orchestrator:
                         "agents": activated_agents_list,
                         "qa_profile": qa_profile,
                         "qa_required_profile": qa_required_profile,
-                        "reason": "fix_loop_blockers",
+                        "reason": "replan_required" if replan_required else "fix_loop_blockers",
                         "blockers": blockers[:20],
+                        "replan_trigger": replan_trigger,
                         "style": resolved_style,
                         "req_ptr": req_ptr,
                         "intent_ptr": intent_ptr,
@@ -7351,6 +7706,7 @@ class Orchestrator:
                         "usecases_ptr": usecases_ptr,
                         "decisions_ptr": decisions_ptr,
                         "contract_ptr": contract_ptr,
+                        "impl_blueprint_ptr": impl_blueprint_ptr,
                         "resume_from": resume_from,
                         "doctor_ptr": doctor_ptr,
                     },
@@ -7359,7 +7715,11 @@ class Orchestrator:
                     event=new_event(
                         agent="router",
                         type="CHECKPOINT_CREATED",
-                        summary=f"Created checkpoint {cp.id} (non-green, blockers remain)",
+                        summary=(
+                            f"Created checkpoint {cp.id} (non-green, replan required)"
+                            if replan_required
+                            else f"Created checkpoint {cp.id} (non-green, blockers remain)"
+                        ),
                         branch_id=self.branch_id,
                         pointers=artifacts_blocked,
                         meta={
@@ -7368,8 +7728,9 @@ class Orchestrator:
                             "route_level": route_level,
                             "agents": activated_agents_list,
                             "style": resolved_style,
-                            "reason": "fix_loop_blockers",
+                            "reason": "replan_required" if replan_required else "fix_loop_blockers",
                             "blockers": blockers[:20],
+                            "replan_trigger": replan_trigger,
                         },
                     ),
                     activated_agents=activated_agents,
@@ -7626,6 +7987,7 @@ class Orchestrator:
                 "usecases_ptr": usecases_ptr,
                 "decisions_ptr": decisions_ptr,
                 "contract_ptr": contract_ptr,
+                "impl_blueprint_ptr": impl_blueprint_ptr,
                 "resume_from": resume_from,
                 "doctor_ptr": doctor_ptr,
                 "deliverables": {
