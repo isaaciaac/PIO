@@ -6,6 +6,18 @@ from pydantic import BaseModel, Field, model_validator
 
 
 RouteLevel = Literal["L0", "L1", "L2", "L3", "L4"]
+ErrorType = Literal[
+    "missing_import",
+    "missing_export",
+    "symbol_rename",
+    "wrong_import_path",
+    "circular_import",
+    "typing_runtime_issue",
+    "test_assert_mismatch",
+    "config_missing",
+    "syntax_error",
+    "unclassified",
+]
 
 
 class RequirementPack(BaseModel):
@@ -279,6 +291,17 @@ class RouteDecision(BaseModel):
     reasons: List[str] = Field(default_factory=list)
 
 
+class ErrorObject(BaseModel):
+    error_type: ErrorType
+    module: str = ""
+    symbol: str = ""
+    traceback_location: str = ""
+    suspected_root_cause: str = ""
+    failed_command: str = ""
+    related_files: List[str] = Field(default_factory=list)
+    evidence_pointers: List[str] = Field(default_factory=list)
+
+
 class IncidentPack(BaseModel):
     """
     Deterministic incident capsule produced by the orchestrator when a workflow is blocked.
@@ -296,6 +319,7 @@ class IncidentPack(BaseModel):
     required_capabilities: List[str] = Field(default_factory=list)
     suggested_fix_agent: Optional[str] = None
     autohint: Optional[str] = None
+    error_object: Optional[ErrorObject] = None
 
 
 class FixPlanPack(BaseModel):

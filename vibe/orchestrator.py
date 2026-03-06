@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import json
 import fnmatch
 import hashlib
 import os
 import importlib.util
+import tomllib
 import re
 import difflib
 import platform
@@ -269,6 +271,9 @@ class Orchestrator:
         dev_cmds: list[str] = []
         start_cmds: list[str] = []
         install_cmds: list[str] = []
+        for cmd in self._python_setup_commands()[:2]:
+            if cmd not in install_cmds:
+                install_cmds.append(cmd)
         for np in node_projects[:8]:
             rel = str(np.get("dir") or ".").strip() or "."
             pm = str(np.get("package_manager") or "npm").strip() or "npm"
@@ -1130,6 +1135,476 @@ class Orchestrator:
             return False, ""
 
         return False, ""
+
+    def _python_manifest_files(self) -> list[Path]:
+        out: list[Path] = []
+        for rel in ["pyproject.toml", "requirements.txt", "setup.py"]:
+            p = self.repo_root / rel
+            if p.exists():
+                out.append(p)
+        return out
+
+    def _python_setup_commands(self) -> list[str]:
+        root = self.repo_root
+        if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+            return ["python -m pip install -e ."]
+        if (root / "requirements.txt").exists():
+            return ["python -m pip install -r requirements.txt"]
+        return []
+
+    def _python_import_name_for_dependency(self, dep: str) -> str:
+        raw = str(dep or "").strip()
+        if not raw:
+            return ""
+        base = re.split(r"[<>=!~;\[]", raw, maxsplit=1)[0].strip()
+        base = base.replace("-", "_")
+        mapping = {
+            "python_dotenv": "dotenv",
+            "pyyaml": "yaml",
+            "pillow": "PIL",
+            "python_dateutil": "dateutil",
+            "psycopg2_binary": "psycopg2",
+        }
+        return mapping.get(base.lower(), base)
+
+    def _declared_python_imports(self) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+
+        req = self.repo_root / "requirements.txt"
+        if req.exists():
+            try:
+                for raw in req.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = str(raw or "").strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    name = self._python_import_name_for_dependency(line)
+                    if name and name not in seen:
+                        seen.add(name)
+                        out.append(name)
+            except Exception:
+                pass
+
+        pyproject = self.repo_root / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8", errors="replace"))
+                deps = list((((data.get("project") or {}).get("dependencies")) or []))
+                for raw in deps:
+                    name = self._python_import_name_for_dependency(str(raw or ""))
+                    if name and name not in seen:
+                        seen.add(name)
+                        out.append(name)
+            except Exception:
+                pass
+
+        return out
+
+    def _python_install_state_path(self) -> Path:
+        return self.repo_root / ".vibe" / "manifests" / "python_env_state.json"
+
+    def _python_setup_signature(self) -> str:
+        h = hashlib.sha256()
+        for p in self._python_manifest_files():
+            rel = p.relative_to(self.repo_root).as_posix()
+            h.update(rel.encode("utf-8", errors="replace"))
+            try:
+                h.update(p.read_bytes())
+            except Exception:
+                continue
+        return h.hexdigest()
+
+    def _python_install_needed(self) -> tuple[bool, str]:
+        manifests = self._python_manifest_files()
+        if not manifests:
+            return False, ""
+
+        signature = self._python_setup_signature()
+        state_path = self._python_install_state_path()
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            state = {}
+
+        if str(state.get("signature") or "").strip() != signature:
+            return True, "python_manifest_changed"
+
+        for mod in self._declared_python_imports()[:24]:
+            if not mod:
+                continue
+            if not self._python_has_module(mod):
+                return True, f"missing_py_module:{mod}"
+
+        return False, ""
+
+    def _record_python_install_state(self, *, command: str) -> None:
+        path = self._python_install_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "signature": self._python_setup_signature(),
+            "command": str(command or "").strip(),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _expand_fix_scope_for_blocker(self, *, allow: list[str], deny: list[str], blocker_text: str) -> tuple[list[str], list[str]]:
+        allow_out = [_normalize_scope_pattern(p) for p in list(allow or []) if _normalize_scope_pattern(p)]
+        deny_out = [_normalize_scope_pattern(p) for p in list(deny or []) if _normalize_scope_pattern(p)]
+        low = str(blocker_text or "").lower()
+
+        def add_allow(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if p and p not in allow_out:
+                allow_out.append(p)
+
+        if any(k in low for k in ["modulenotfounderror", "no module named", "missing dependency", "importerror"]):
+            missing_mods = [str(m).strip() for m in re.findall(r"No module named ['\"]([^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)]
+            external_missing = False
+            for mod in missing_mods[:8]:
+                rel = mod.replace(".", "/").strip("/")
+                candidates = [f"{rel}.py", f"{rel}/__init__.py"]
+                if not any((self.repo_root / c).exists() for c in candidates):
+                    external_missing = True
+                    break
+            if external_missing or ("requirements.txt" in low) or ("pyproject.toml" in low):
+                for rel in ["pyproject.toml", "requirements.txt", "setup.py", "README.md"]:
+                    if (self.repo_root / rel).exists():
+                        add_allow(rel)
+
+        return allow_out, deny_out
+
+    def _recent_changed_files(self, *, limit: int = 12) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        try:
+            for evt in self.ledger.iter_events(types={"PATCH_WRITTEN", "CODE_COMMIT"}, reverse=True):
+                meta = evt.meta if isinstance(evt.meta, dict) else {}
+                files = meta.get("files_changed")
+                if not isinstance(files, list):
+                    continue
+                for item in files:
+                    rel = str(item or "").replace("\\", "/").lstrip("/")
+                    if not rel or rel.startswith(".vibe/") or rel.startswith(".git/") or rel in seen:
+                        continue
+                    seen.add(rel)
+                    out.append(rel)
+                    if len(out) >= limit:
+                        return out
+        except Exception:
+            return out
+        return out
+
+    def _traceback_location_from_text(self, text: str) -> str:
+        raw = str(text or "")
+        patterns = [
+            r'File ["\'](?P<path>[^"\']+)["\'], line (?P<line>\d+)',
+            r'(?P<path>[A-Za-z0-9_./\\-]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error',
+            r'(?P<path>tests[/\\][^\s\'"()]+?\.py::[A-Za-z0-9_:.\\/-]+)',
+            r'(?P<path>tests[/\\][^\s\'"()]+?\.py)',
+        ]
+        for pat in patterns:
+            try:
+                m = re.search(pat, raw, flags=re.IGNORECASE)
+            except re.error:
+                m = None
+            if not m:
+                continue
+            gd = m.groupdict()
+            path = str(gd.get("path") or "").replace("\\", "/").strip()
+            line = str(gd.get("line") or "").strip()
+            col = str(gd.get("col") or "").strip()
+            if path and line and col:
+                return f"{path}:{line}:{col}"
+            if path and line:
+                return f"{path}:{line}"
+            if path:
+                return path
+        return ""
+
+    def _python_symbol_inventory(self, rel_path: str, *, limit: int = 200) -> list[str]:
+        rel = str(rel_path or "").replace("\\", "/").lstrip("/")
+        if not rel or not rel.endswith(".py"):
+            return []
+        path = self.repo_root / rel
+        if not path.exists():
+            return []
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(name: str) -> None:
+            s = str(name or "").strip()
+            if not s or s in seen:
+                return
+            seen.add(s)
+            out.append(s)
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                add(node.target.id)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    add(alias.asname or alias.name)
+            if len(out) >= limit:
+                break
+        return out[:limit]
+
+    def _observe_test_failure(self, *, report: packs.TestReport, blocker_text: str) -> tuple[dict[str, Any], Optional[str]]:
+        failed_cmd = self._failed_command_from_report(report)
+        traceback_location = self._traceback_location_from_text(blocker_text)
+        related_files: list[str] = []
+        pointers: list[str] = [str(p).strip() for p in (report.pointers or []) if str(p).strip()]
+
+        def add_file(rel: str) -> None:
+            rp = str(rel or "").replace("\\", "/").lstrip("/")
+            if not rp or rp.startswith(".vibe/") or rp.startswith(".git/") or rp in related_files:
+                return
+            related_files.append(rp)
+            try:
+                rr = self.toolbox.read_file(agent_id="router", path=rp, start_line=1, end_line=220)
+                if rr.pointer and rr.pointer not in pointers:
+                    pointers.append(rr.pointer)
+            except Exception:
+                pass
+
+        for rel in self._recent_changed_files(limit=10):
+            add_file(rel)
+
+        if traceback_location:
+            add_file(traceback_location.split(":", 1)[0])
+
+        for m in re.finditer(r"(?P<file>[A-Za-z0-9_./\\-]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error", blocker_text or "", flags=re.IGNORECASE):
+            add_file(m.group("file"))
+            if len(related_files) >= 10:
+                break
+
+        module = ""
+        symbol = ""
+        try:
+            m = re.search(r"cannot import name ['\"](?P<sym>[^'\"]+)['\"] from ['\"](?P<mod>[^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)
+            if m:
+                module = str(m.group("mod") or "").strip()
+                symbol = str(m.group("sym") or "").strip()
+        except Exception:
+            module = ""
+            symbol = ""
+        if not module:
+            try:
+                m = re.search(r"No module named ['\"](?P<mod>[^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)
+                if m:
+                    module = str(m.group("mod") or "").strip()
+            except Exception:
+                module = ""
+        if not symbol:
+            try:
+                m = re.search(r"name ['\"](?P<sym>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined", blocker_text or "", flags=re.IGNORECASE)
+                if m:
+                    symbol = str(m.group("sym") or "").strip()
+            except Exception:
+                symbol = ""
+        if not symbol:
+            try:
+                m = re.search(r"has no attribute ['\"](?P<sym>[A-Za-z_][A-Za-z0-9_]*)['\"]", blocker_text or "", flags=re.IGNORECASE)
+                if m:
+                    symbol = str(m.group("sym") or "").strip()
+            except Exception:
+                symbol = ""
+
+        if module:
+            rel = module.replace(".", "/").strip("/")
+            for candidate in [f"{rel}.py", f"{rel}/__init__.py"]:
+                if (self.repo_root / candidate).exists():
+                    add_file(candidate)
+            if "/" in rel:
+                parent_init = f"{'/'.join(rel.split('/')[:-1])}/__init__.py"
+                if (self.repo_root / parent_init).exists():
+                    add_file(parent_init)
+
+        observation = {
+            "summary": "Observed blocker for diagnoser",
+            "failed_command": failed_cmd,
+            "traceback_location": traceback_location,
+            "module": module,
+            "symbol": symbol,
+            "recent_files": related_files[:10],
+            "related_files": related_files[:12],
+            "evidence_pointers": pointers[:24],
+        }
+        try:
+            ptr = self.artifacts.put_json(observation, suffix=".observer.json", kind="observer").to_pointer()
+        except Exception:
+            ptr = None
+        return observation, ptr
+
+    def _diagnose_test_failure(
+        self,
+        *,
+        report: packs.TestReport,
+        blocker_text: str,
+        observation: Optional[dict[str, Any]] = None,
+    ) -> packs.ErrorObject:
+        text = str(blocker_text or "").strip()
+        low = text.lower()
+        obs = observation or {}
+        failed_cmd = str(obs.get("failed_command") or self._failed_command_from_report(report) or "").strip()
+        module = str(obs.get("module") or "").strip()
+        symbol = str(obs.get("symbol") or "").strip()
+        traceback_location = str(obs.get("traceback_location") or self._traceback_location_from_text(text) or "").strip()
+        related_files = [str(x).strip() for x in list(obs.get("related_files") or []) if str(x).strip()][:12]
+        evidence_pointers = [str(x).strip() for x in list(obs.get("evidence_pointers") or []) if str(x).strip()][:24]
+
+        error_type: packs.ErrorType = "unclassified"
+        root_cause = "需要进一步诊断根因"
+
+        if "syntaxerror" in low or "invalid syntax" in low:
+            error_type = "syntax_error"
+            root_cause = "语法错误导致解释/编译阶段直接失败。"
+        elif "circular import" in low or "partially initialized module" in low:
+            error_type = "circular_import"
+            root_cause = "模块相互导入，解释阶段未完成初始化就访问了符号。"
+        elif "cannot import name" in low or "has no exported member" in low or "has no attribute" in low:
+            error_type = "missing_export"
+            root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
+            if module:
+                rel = module.replace(".", "/").strip("/")
+                inventory: list[str] = []
+                for candidate in [f"{rel}.py", f"{rel}/__init__.py"]:
+                    inventory.extend(self._python_symbol_inventory(candidate))
+                if symbol and inventory and symbol not in inventory:
+                    match = difflib.get_close_matches(symbol, inventory, n=1, cutoff=0.72)
+                    if match:
+                        error_type = "symbol_rename"
+                        root_cause = f"符号 `{symbol}` 很可能已更名/大小写变化，当前模块中更接近的是 `{match[0]}`。"
+        elif "no module named" in low or "module not found" in low or "cannot find module" in low:
+            error_type = "missing_import"
+            local_candidates: list[str] = []
+            if module:
+                rel = module.replace(".", "/").strip("/")
+                local_candidates = [f"{rel}.py", f"{rel}/__init__.py"]
+            local_exists = any((self.repo_root / c).exists() for c in local_candidates)
+            if local_exists:
+                error_type = "wrong_import_path"
+                root_cause = "本地模块存在，但 import 路径/包根引用不正确。"
+            else:
+                error_type = "config_missing"
+                root_cause = "缺少第三方依赖或环境未安装对应包/CLI。"
+        elif "nameerror" in low or ("not defined" in low and any(k in low for k in ["typing", "dict", "list", "any", "optional"])):
+            error_type = "typing_runtime_issue"
+            root_cause = "运行时/导入时缺少 typing 符号或类型别名定义。"
+        elif "assertionerror" in low or re.search(r"(^|\n)\s*e\s+assert\b", text, flags=re.IGNORECASE):
+            error_type = "test_assert_mismatch"
+            root_cause = "目标行为与测试断言不一致，需核对预期与实现。"
+        elif any(k in low for k in ["command not found", "is not recognized as an internal or external command", "enoent", "eacces", "spawn unknown", "missing config", "no such file or directory"]):
+            error_type = "config_missing"
+            root_cause = "命令、配置、依赖或运行环境缺失，导致验证无法执行。"
+
+        return packs.ErrorObject(
+            error_type=error_type,
+            module=module,
+            symbol=symbol,
+            traceback_location=traceback_location,
+            suspected_root_cause=root_cause,
+            failed_command=failed_cmd,
+            related_files=related_files,
+            evidence_pointers=evidence_pointers,
+        )
+
+    def _is_env_fix_candidate(self, *, error: Optional[packs.ErrorObject], blocker_text: str) -> bool:
+        low = str(blocker_text or "").lower()
+        if error is not None and error.error_type == "config_missing":
+            return True
+        if any(k in low for k in ["spawn unknown", "enoent", "eacces", "command not found", "is not recognized as an internal or external command"]):
+            return True
+        if any(k in low for k in ["no module named", "cannot find module", "missing dependency"]):
+            return True
+        return False
+
+    def _env_remediation_commands_for_tests(
+        self,
+        *,
+        report: packs.TestReport,
+        blocker_text: str,
+        error: Optional[packs.ErrorObject],
+        envspec_commands: Optional[list[str]] = None,
+    ) -> list[str]:
+        cmds: list[str] = []
+        seen: set[str] = set()
+        low = str(blocker_text or "").lower()
+
+        def add(cmd: str) -> None:
+            s = str(cmd or "").strip()
+            if not s or s in seen:
+                return
+            seen.add(s)
+            cmds.append(s)
+
+        failed_cmd = ""
+        try:
+            failed_cmd = str(error.failed_command if error is not None else self._failed_command_from_report(report) or "").strip()
+        except Exception:
+            failed_cmd = ""
+        cmd_dir = self._shell_cd_dir(failed_cmd or "")
+
+        py_cmd = bool(re.search(r"\b(?:python|pytest|uvicorn|gunicorn|flask)\b", failed_cmd.lower()))
+        node_cmd = bool(re.search(r"\b(?:npm|pnpm|yarn|npx)\b", failed_cmd.lower()))
+
+        if self._python_setup_commands() and (py_cmd or (error is not None and error.error_type == "config_missing")):
+            for cmd in self._python_setup_commands()[:2]:
+                add(cmd)
+
+        node_dir = cmd_dir
+        if node_dir == Path(".") and self._find_node_project_dirs():
+            node_dir = self._find_node_project_dirs()[0]
+        if node_cmd or any(k in low for k in ["node_modules", ".bin", "npm ", "pnpm ", "yarn ", "hugo", "vite", "eslint", "tsc"]):
+            pkg_json = self.repo_root / node_dir / "package.json"
+            if pkg_json.exists():
+                pm = self._package_manager(node_dir)
+                add(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} install"))
+
+        for cmd in list(envspec_commands or [])[:4]:
+            l = str(cmd or "").lower()
+            if any(token in l for token in [" install", "pip install", "npm install", "pnpm install", "yarn install"]):
+                add(cmd)
+
+        return cmds[:4]
+
+    def _compile_preflight_commands_for_tests(
+        self,
+        *,
+        report: packs.TestReport,
+        blocker_text: str,
+        error: Optional[packs.ErrorObject],
+        focus_commands: list[str],
+    ) -> list[str]:
+        low = str(blocker_text or "").lower()
+        failed_cmd = str(error.failed_command if error is not None else self._failed_command_from_report(report) or "").strip()
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(cmd: str) -> None:
+            s = str(cmd or "").strip()
+            if not s or s in seen or s in focus_commands or s == failed_cmd:
+                return
+            seen.add(s)
+            out.append(s)
+
+        smoke_cmds = [str(c).strip() for c in self._determine_test_commands(profile="smoke") if str(c).strip()]
+        for cmd in smoke_cmds[:4]:
+            if error is not None and error.error_type in {"missing_import", "missing_export", "symbol_rename", "wrong_import_path", "circular_import", "typing_runtime_issue", "syntax_error", "config_missing"}:
+                add(cmd)
+            elif any(k in low for k in ["syntaxerror", "error ts", "typescript", "tsc", "compileall"]):
+                add(cmd)
+        return out[:4]
 
     def _package_manager(self, node_dir: Path) -> str:
         root = self.repo_root
@@ -2277,6 +2752,24 @@ class Orchestrator:
                     "- 同步更新 README：写清楚 `npm install` / `npm run dev` / `npm test` 的可复现步骤。"
                 )
 
+        try:
+            py_missing = re.search(r"No module named ['\"](?P<mod>[^'\"]+)['\"]", text, flags=re.IGNORECASE)
+            missing_mod = (py_missing.group("mod") or "").strip() if py_missing else ""
+        except Exception:
+            missing_mod = ""
+        if missing_mod:
+            rel = missing_mod.replace(".", "/").strip("/")
+            local_candidates = [f"{rel}.py", f"{rel}/__init__.py"]
+            local_module = any((self.repo_root / c).exists() for c in local_candidates)
+            if not local_module and self._python_setup_commands():
+                cmds = " / ".join(self._python_setup_commands())
+                return (
+                    f"检测到 Python 第三方依赖缺失：`{missing_mod}`。\n"
+                    "- 先确认依赖已写入 `pyproject.toml`/`requirements.txt`，不要先改业务代码。\n"
+                    f"- QA/修复应优先执行安装步骤：`{cmds}`，再重跑失败命令。\n"
+                    "- 如果清单缺了这个包，再补依赖清单与 README 的安装步骤。"
+                )
+
         # Only attempt for TS/Node-ish errors.
         if not any(k in lower for k in ["tsc", "error ts", "typescript", "ts2349", "call signatures", "pool"]):
             return ""
@@ -2353,6 +2846,8 @@ class Orchestrator:
 
         text = (blocker_text or "").strip()
         lower = text.lower()
+        observation, observation_ptr = self._observe_test_failure(report=report, blocker_text=text)
+        error_object = self._diagnose_test_failure(report=report, blocker_text=text, observation=observation)
 
         failed_cmd = ""
         cmd_dir = Path(".")
@@ -2370,6 +2865,12 @@ class Orchestrator:
 
         evidence: list[str] = []
         for p in list(report.pointers or [])[:24]:
+            s = str(p).strip()
+            if s and s not in evidence:
+                evidence.append(s)
+        if observation_ptr and observation_ptr not in evidence:
+            evidence.append(observation_ptr)
+        for p in list(getattr(error_object, "evidence_pointers", []) or [])[:12]:
             s = str(p).strip()
             if s and s not in evidence:
                 evidence.append(s)
@@ -2442,6 +2943,15 @@ class Orchestrator:
             next_steps.append("若是本地文件：修正相对路径或在代码变更中创建对应文件。")
             required_caps.extend(["node", "deps"])
 
+        if error_object.error_type == "config_missing":
+            required_caps.extend(["env", "deps"])
+            if "安装" not in "".join(next_steps):
+                next_steps.append("优先补齐环境/依赖/脚本，再重新运行失败命令。")
+        elif error_object.error_type in {"missing_export", "symbol_rename", "wrong_import_path", "missing_import"}:
+            required_caps.extend(["imports"])
+        elif error_object.error_type in {"typing_runtime_issue", "syntax_error"}:
+            required_caps.extend(["python"])
+
         blocker_short = text
         if len(blocker_short) > 1800:
             blocker_short = blocker_short[:1800] + "…（已截断）…"
@@ -2467,6 +2977,7 @@ class Orchestrator:
             required_capabilities=caps[:12],
             suggested_fix_agent=suggested_fix_agent,
             autohint=autohint,
+            error_object=error_object,
         )
 
     def _auto_code_change_for_test_failure(
@@ -4234,6 +4745,46 @@ class Orchestrator:
 
             if pre_cmds:
                 report_cmds.extend(pre_cmds)
+        except Exception:
+            pass
+
+        # Best-effort: for Python projects, ensure declared deps are installed before
+        # running compile/test commands. This avoids fresh-scaffold failures where
+        # `requirements.txt` / `pyproject.toml` exists but pytest imports fail immediately.
+        try:
+            py_cmds = [str(c or "") for c in cmds if isinstance(c, str)]
+            touches_python = any(
+                re.search(r"\b(?:python|pytest|uvicorn|gunicorn|flask)\b", c.lower()) for c in py_cmds
+            )
+            if touches_python:
+                needs, _reason = self._python_install_needed()
+                setup_cmds = self._python_setup_commands()
+                if needs and setup_cmds:
+                    install_cmd = setup_cmds[0]
+                    r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
+                    passed = r.returncode == 0
+                    results.append(
+                        packs.TestResult(
+                            command=install_cmd,
+                            returncode=r.returncode,
+                            passed=passed,
+                            stdout=r.stdout,
+                            stderr=r.stderr,
+                            meta=r.meta,
+                        )
+                    )
+                    pointers.extend([r.stdout, r.stderr, r.meta])
+                    report_cmds.append(install_cmd)
+                    if not passed:
+                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                        excerpt = stderr_tail or stdout_tail
+                        blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}" if excerpt else f"Command failed: {install_cmd}")
+                        return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+                    try:
+                        self._record_python_install_state(command=install_cmd)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -6627,6 +7178,7 @@ class Orchestrator:
             loop = 0
             fix_history: list[str] = []
             harvest_cache: dict[str, tuple[dict[str, Any], str]] = {}
+            env_remediation_keys: set[str] = set()
             sig_last: str = ""
             sig_repeat: int = 0
 
@@ -6936,6 +7488,21 @@ class Orchestrator:
                     )
                 else:
                     fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=available_agents)
+                current_error_object = getattr(incident, "error_object", None) if incident is not None else None
+                if blocker_source == "tests" and current_error_object is None:
+                    try:
+                        current_error_object = self._diagnose_test_failure(report=report, blocker_text=blocker_text, observation={})
+                    except Exception:
+                        failed_cmd = ""
+                        try:
+                            failed_cmd = self._failed_command_from_report(report) or ""
+                        except Exception:
+                            failed_cmd = ""
+                        current_error_object = packs.ErrorObject(
+                            error_type="unclassified",
+                            suspected_root_cause="未能结构化诊断当前失败，需要先补齐错误分类再生成补丁。",
+                            failed_command=failed_cmd,
+                        )
 
                 fix_coder_id = _preferred_fix_agent(fix_coder_id)
                 if fix_coder_id == "coder_frontend" and coder_frontend is None:
@@ -6951,8 +7518,6 @@ class Orchestrator:
                 ):
                     # When we're stuck, prefer an integrator to align modules/contracts/exports holistically.
                     fix_coder_id = "integration_engineer"
-                activate_agent(fix_coder_id, reason="gate:fix_loop")
-
                 fix_coder = (
                     coder_frontend
                     if fix_coder_id == "coder_frontend" and coder_frontend is not None
@@ -7059,19 +7624,104 @@ class Orchestrator:
                     except Exception:
                         lead_consult_text, lead_consult_ptrs = "", []
 
+                env_remediation_change: Optional[packs.CodeChange] = None
+                env_remediation_ptrs: list[str] = []
+                env_remediation_cmds: list[str] = []
+                if blocker_source == "tests" and env_engineer is not None and self._is_env_fix_candidate(
+                    error=current_error_object,
+                    blocker_text=blocker_text,
+                ):
+                    try:
+                        env_remediation_cmds = self._env_remediation_commands_for_tests(
+                            report=report,
+                            blocker_text=blocker_text,
+                            error=current_error_object,
+                            envspec_commands=envspec_commands,
+                        )
+                    except Exception:
+                        env_remediation_cmds = []
+                    env_key = "|".join([fp_now or blocker_text[:160], *env_remediation_cmds[:4]])
+                    if env_remediation_cmds and env_key not in env_remediation_keys:
+                        env_remediation_keys.add(env_key)
+                        activate_agent("env_engineer", reason="gate:env_fix")
+                        self._append_guarded(
+                            event=new_event(
+                                agent="router",
+                                type="STATE_TRANSITION",
+                                summary=f"Fix-loop {loop}: env remediation env_engineer",
+                                branch_id=self.branch_id,
+                                pointers=list(lead_consult_ptrs or []),
+                                meta={
+                                    "phase": "fix_loop",
+                                    "loop": loop,
+                                    "blocker_source": blocker_source,
+                                    "fix_agent": "env_engineer",
+                                    "commands": env_remediation_cmds,
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                        env_success = True
+                        for cmd in env_remediation_cmds:
+                            rr = self.toolbox.run_cmd(agent_id="env_engineer", cmd=cmd, cwd=self.repo_root, timeout_s=3600)
+                            env_remediation_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
+                            if rr.returncode != 0:
+                                env_success = False
+                            try:
+                                low_cmd = str(cmd or "").lower()
+                                if rr.returncode == 0 and "python -m pip install" in low_cmd:
+                                    self._record_python_install_state(command=cmd)
+                            except Exception:
+                                pass
+                        env_summary = " / ".join(env_remediation_cmds[:2]).strip()
+                        if len(env_remediation_cmds) > 2:
+                            env_summary = f"{env_summary} …"
+                        env_remediation_change = packs.CodeChange(
+                            kind="noop",
+                            summary=(
+                                f"应用环境修复命令：{env_summary}"
+                                if env_success
+                                else f"尝试环境修复命令但仍失败：{env_summary}"
+                            ),
+                            files_changed=[],
+                        )
+                        self._append_guarded(
+                            event=new_event(
+                                agent="env_engineer",
+                                type="ENV_UPDATED",
+                                summary=env_remediation_change.summary,
+                                branch_id=self.branch_id,
+                                pointers=env_remediation_ptrs,
+                                meta={
+                                    "loop": loop,
+                                    "commands": env_remediation_cmds,
+                                    "passed": env_success,
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+
+                if env_remediation_change is None:
+                    activate_agent(fix_coder_id, reason="gate:fix_loop")
+                dispatch_agent_id = "env_engineer" if env_remediation_change is not None else fix_coder_id
+
                 # Audit: record which agent is handling this fix-loop step.
                 self._append_guarded(
                     event=new_event(
                         agent="router",
                         type="STATE_TRANSITION",
-                        summary=f"Fix-loop {loop}: dispatch to {fix_coder_id}",
+                        summary=f"Fix-loop {loop}: dispatch to {dispatch_agent_id}",
                         branch_id=self.branch_id,
                         pointers=list(lead_consult_ptrs or []),
                         meta={
                             "phase": "fix_loop",
                             "loop": loop,
                             "blocker_source": blocker_source,
-                            "fix_agent": fix_coder_id,
+                            "fix_agent": dispatch_agent_id,
                             "lead_recommended_fix_agent": str(getattr(impl_blueprint, "recommended_fix_agent", "") or "").strip()
                             if impl_blueprint is not None
                             else "",
@@ -7153,6 +7803,11 @@ class Orchestrator:
                         fix_user = f"{fix_user}\n\nIncidentPack:\n{incident.model_dump_json()}"
                         if incident_ptr:
                             fix_user = f"{fix_user}\n\nIncidentPointer: {incident_ptr}"
+                    if current_error_object is not None:
+                        fix_user = (
+                            f"{fix_user}\n\nErrorObject（必须只处理这个主根因；若根因被证伪，再回到 Diagnoser 重判）：\n"
+                            f"{current_error_object.model_dump_json()}"
+                        )
 
                 auto_change: Optional[packs.CodeChange] = None
                 if blocker_source == "tests":
@@ -7216,7 +7871,14 @@ class Orchestrator:
                     fix_role = "Integration Engineer (align frontend/backend/contracts)"
                 elif fix_coder_id == "coder_backend":
                     fix_role = "Backend Coder"
+                if env_remediation_change is not None:
+                    fix_role = "Environment Engineer"
                 fix_allow, fix_deny = _scope_for_fix_loop() if impl_blueprint is not None else ([], [])
+                fix_allow, fix_deny = self._expand_fix_scope_for_blocker(
+                    allow=fix_allow,
+                    deny=fix_deny,
+                    blocker_text=blocker_text,
+                )
                 fix_scope_hint = ""
                 try:
                     allow_short = [str(x).strip() for x in list(fix_allow or []) if str(x).strip()][:12]
@@ -7230,7 +7892,10 @@ class Orchestrator:
                     if deny_short:
                         lines.append("Denied write paths/globs:\n" + "\n".join([f"- {p}" for p in deny_short]))
                     fix_scope_hint = "\n\nImplementationLeadWriteScope:\n" + "\n\n".join(lines)
-                if auto_change is None:
+                if env_remediation_change is not None:
+                    change = env_remediation_change
+                    write_pointers = list(env_remediation_ptrs)
+                elif auto_change is None:
                     fix_msgs = self._messages_with_memory(
                         agent_id=fix_coder_id,
                         system=(
@@ -7241,17 +7906,20 @@ class Orchestrator:
                             "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
                             "- Never copy under `.vibe/` or `.git/`.\n"
                             "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
-                        "- Fix the failing command in the blocker; prefer fixing all ExtractedErrors in one go (still one failing command).\n"
-                        "- Do not do architecture refactors during fix-loop.\n"
+                            "- Diagnose first, then produce the smallest patch that addresses exactly one primary root cause from ErrorObject.\n"
+                            "- Do not change unrelated files or batch multiple hypotheses in one patch.\n"
+                            "- Fix the failing command in the blocker; prefer fixing the selected root cause completely before touching other symptoms.\n"
+                            "- Do not do architecture refactors during fix-loop.\n"
                             "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
                             "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
+                            "- If Python third-party imports are missing, prefer updating `pyproject.toml` / `requirements.txt` rather than editing business code first.\n"
                             "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
                             "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
                             "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
                             f"{fix_scope_hint}\n\n{workflow_hint}"
                         ),
-                    user=fix_user,
-                )
+                        user=fix_user,
+                    )
                     change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
                     change, write_pointers = self._materialize_code_change_with_repair(
                         change=change,
@@ -7281,7 +7949,12 @@ class Orchestrator:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
                     files_short = ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
-                    fix_history.append(f"- loop {loop} {fix_coder_id}: {change.summary.strip()[:160]} | files: {files_short} | evidence: {evidence}")
+                    history_agent = "env_engineer" if env_remediation_change is not None else fix_coder_id
+                    error_tag = str(getattr(current_error_object, "error_type", "") or "").strip()
+                    cause = str(getattr(current_error_object, "suspected_root_cause", "") or "").strip()
+                    fix_history.append(
+                        f"- loop {loop} {history_agent}: {change.summary.strip()[:160]} | error={error_tag or 'n/a'} | cause={cause[:120]} | files: {files_short} | evidence: {evidence}"
+                    )
                 except Exception:
                     pass
                 meta = {"blocker": blocker_text, "blocker_source": blocker_source, "route_level": route_level, "style": resolved_style}
@@ -7289,10 +7962,28 @@ class Orchestrator:
                     meta["fix_plan"] = fix_plan_ptr
                 if auto_change is not None:
                     meta["auto_fix"] = True
+                if change.files_changed:
+                    meta["files_changed"] = list(change.files_changed or [])[:40]
+                if current_error_object is not None:
+                    meta["error_type"] = current_error_object.error_type
+                    if current_error_object.suspected_root_cause:
+                        meta["root_cause"] = current_error_object.suspected_root_cause
+                    if current_error_object.module:
+                        meta["module"] = current_error_object.module
+                    if current_error_object.symbol:
+                        meta["symbol"] = current_error_object.symbol
+                    if current_error_object.failed_command:
+                        meta["failed_command"] = current_error_object.failed_command
+                    if current_error_object.traceback_location:
+                        meta["traceback_location"] = current_error_object.traceback_location
+                if env_remediation_cmds:
+                    meta["commands"] = env_remediation_cmds
+                event_agent = "env_engineer" if env_remediation_change is not None else fix_coder_id
+                event_type = "ENV_UPDATED" if env_remediation_change is not None else ("PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT")
                 self._append_guarded(
                     event=new_event(
-                        agent=fix_coder_id,
-                        type="PATCH_WRITTEN" if change.kind == "patch" else "CODE_COMMIT",
+                        agent=event_agent,
+                        type=event_type,
                         summary=f"fix-loop {loop}: {change.summary}",
                         branch_id=self.branch_id,
                         pointers=[p for p in [change.patch_pointer, change.commit_hash] if p] + write_pointers,
@@ -7359,6 +8050,56 @@ class Orchestrator:
                 except Exception:
                     pass
 
+                def run_fix_verification_stage(*, label: str, phase: str, profile: str, commands: list[str]) -> packs.TestReport:
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_RUN",
+                            summary=f"Fix-loop {loop}: verifying ({label})",
+                            branch_id=self.branch_id,
+                            pointers=[],
+                            meta={
+                                "profile": profile,
+                                "phase": phase,
+                                "commands": commands,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    stage_report = self._run_tests(profile=profile, commands=commands)
+                    stage_fp = ""
+                    try:
+                        if not stage_report.passed:
+                            b0 = str((stage_report.blockers or [""])[0] or "").strip()
+                            extracted0 = self._extract_error_signals(b0, limit=12)
+                            sig0 = self._failure_signature(report=stage_report, extracted=extracted0, blocker_text=b0)
+                            stage_fp = self._failure_fingerprint(signature=sig0)
+                    except Exception:
+                        stage_fp = ""
+                    self._append_guarded(
+                        event=new_event(
+                            agent="qa",
+                            type="TEST_PASSED" if stage_report.passed else "TEST_FAILED",
+                            summary="Tests passed" if stage_report.passed else "Tests failed",
+                            branch_id=self.branch_id,
+                            pointers=stage_report.pointers,
+                            meta={
+                                "blockers": stage_report.blockers,
+                                "failure_fingerprint": stage_fp,
+                                "commands": stage_report.commands,
+                                "loop": loop,
+                                "profile": profile,
+                                "phase": phase,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    return stage_report
+
                 qa_commands_focus = qa_commands_full
                 if blocker_source == "tests":
                     try:
@@ -7371,130 +8112,67 @@ class Orchestrator:
                     except Exception:
                         qa_commands_focus = qa_commands_full
 
-                self._append_guarded(
-                    event=new_event(
-                        agent="qa",
-                        type="TEST_RUN",
-                        summary=f"Fix-loop {loop}: verifying (focus)",
-                        branch_id=self.branch_id,
-                        pointers=[],
-                        meta={
-                            "profile": qa_profile,
-                            "phase": "fix_focus",
-                            "commands": qa_commands_focus,
-                            "route_level": route_level,
-                            "style": resolved_style,
-                        },
-                    ),
-                    activated_agents=activated_agents,
-                )
-                focus_report = self._run_tests(profile=qa_profile, commands=qa_commands_focus)
-
-                focus_fp = ""
-                try:
-                    if not focus_report.passed:
-                        b0 = str((focus_report.blockers or [""])[0] or "").strip()
-                        extracted0 = self._extract_error_signals(b0, limit=12)
-                        sig0 = self._failure_signature(report=focus_report, extracted=extracted0, blocker_text=b0)
-                        focus_fp = self._failure_fingerprint(signature=sig0)
-                except Exception:
-                    focus_fp = ""
-                self._append_guarded(
-                    event=new_event(
-                        agent="qa",
-                        type="TEST_PASSED" if focus_report.passed else "TEST_FAILED",
-                        summary="Tests passed" if focus_report.passed else "Tests failed",
-                        branch_id=self.branch_id,
-                        pointers=focus_report.pointers,
-                        meta={
-                            "blockers": focus_report.blockers,
-                            "failure_fingerprint": focus_fp,
-                            "commands": focus_report.commands,
-                            "loop": loop,
-                            "profile": qa_profile,
-                            "phase": "fix_focus",
-                            "route_level": route_level,
-                            "style": resolved_style,
-                        },
-                    ),
-                    activated_agents=activated_agents,
-                )
-
-                report = focus_report
-                try:
-                    for r0 in list(focus_report.results or []):
-                        if getattr(r0, "passed", False):
-                            cmd0 = str(getattr(r0, "command", "") or "")
-                            if cmd0 in dirty_full_cmds:
-                                dirty_full_cmds.discard(cmd0)
-                except Exception:
-                    pass
-
-                # If focus passed but we didn't run the full verification list, run only the "dirty"
-                # subset once to surface the *next* blocker early (focus -> full), rather than
-                # re-running the entire full matrix every loop.
-                if (not mock_mode) and report.passed and qa_commands_focus != qa_commands_full:
-                    qa_commands_full_to_run = [
-                        c for c in list(qa_commands_full or []) if str(c or "") in dirty_full_cmds
-                    ]
-                    if qa_commands_full_to_run:
-                        self._append_guarded(
-                            event=new_event(
-                                agent="qa",
-                                type="TEST_RUN",
-                                summary=f"Fix-loop {loop}: verifying (full)",
-                                branch_id=self.branch_id,
-                                pointers=[],
-                                meta={
-                                    "profile": qa_profile,
-                                    "phase": "fix_full",
-                                    "commands": qa_commands_full_to_run,
-                                    "route_level": route_level,
-                                    "style": resolved_style,
-                                },
-                            ),
-                            activated_agents=activated_agents,
+                qa_commands_compile: list[str] = []
+                if blocker_source == "tests":
+                    try:
+                        qa_commands_compile = self._compile_preflight_commands_for_tests(
+                            report=report,
+                            blocker_text=blocker_text,
+                            error=current_error_object,
+                            focus_commands=qa_commands_focus,
                         )
-                        full_report = self._run_tests(profile=qa_profile, commands=qa_commands_full_to_run)
+                    except Exception:
+                        qa_commands_compile = []
 
-                        full_fp = ""
-                        try:
-                            if not full_report.passed:
-                                b0 = str((full_report.blockers or [""])[0] or "").strip()
-                                extracted0 = self._extract_error_signals(b0, limit=12)
-                                sig0 = self._failure_signature(report=full_report, extracted=extracted0, blocker_text=b0)
-                                full_fp = self._failure_fingerprint(signature=sig0)
-                        except Exception:
-                            full_fp = ""
-                        self._append_guarded(
-                            event=new_event(
-                                agent="qa",
-                                type="TEST_PASSED" if full_report.passed else "TEST_FAILED",
-                                summary="Tests passed" if full_report.passed else "Tests failed",
-                                branch_id=self.branch_id,
-                                pointers=full_report.pointers,
-                                meta={
-                                    "blockers": full_report.blockers,
-                                    "failure_fingerprint": full_fp,
-                                    "commands": full_report.commands,
-                                    "loop": loop,
-                                    "profile": qa_profile,
-                                    "phase": "fix_full",
-                                    "route_level": route_level,
-                                    "style": resolved_style,
-                                },
-                            ),
-                            activated_agents=activated_agents,
-                        )
-                        report = full_report
-                        try:
-                            for r0 in list(full_report.results or []):
-                                if getattr(r0, "passed", False):
-                                    cmd0 = str(getattr(r0, "command", "") or "")
-                                    if cmd0 in dirty_full_cmds:
-                                        dirty_full_cmds.discard(cmd0)
-                        except Exception:
-                            pass
+                if qa_commands_compile:
+                    report = run_fix_verification_stage(
+                        label="compile",
+                        phase="fix_compile",
+                        profile="smoke",
+                        commands=qa_commands_compile,
+                    )
+
+                if (not qa_commands_compile) or report.passed:
+                    focus_report = run_fix_verification_stage(
+                        label="focus",
+                        phase="fix_focus",
+                        profile=qa_profile,
+                        commands=qa_commands_focus,
+                    )
+
+                    report = focus_report
+                    try:
+                        for r0 in list(focus_report.results or []):
+                            if getattr(r0, "passed", False):
+                                cmd0 = str(getattr(r0, "command", "") or "")
+                                if cmd0 in dirty_full_cmds:
+                                    dirty_full_cmds.discard(cmd0)
+                    except Exception:
+                        pass
+
+                    # If focus passed but we didn't run the full verification list, run only the "dirty"
+                    # subset once to surface the *next* blocker early (focus -> full), rather than
+                    # re-running the entire full matrix every loop.
+                    if (not mock_mode) and report.passed and qa_commands_focus != qa_commands_full:
+                        qa_commands_full_to_run = [
+                            c for c in list(qa_commands_full or []) if str(c or "") in dirty_full_cmds
+                        ]
+                        if qa_commands_full_to_run:
+                            full_report = run_fix_verification_stage(
+                                label="full",
+                                phase="fix_full",
+                                profile=qa_profile,
+                                commands=qa_commands_full_to_run,
+                            )
+                            report = full_report
+                            try:
+                                for r0 in list(full_report.results or []):
+                                    if getattr(r0, "passed", False):
+                                        cmd0 = str(getattr(r0, "command", "") or "")
+                                        if cmd0 in dirty_full_cmds:
+                                            dirty_full_cmds.discard(cmd0)
+                            except Exception:
+                                pass
 
                 # Persist a compact lesson when we moved past the previous failing command (or fully passed),
                 # so future runs can avoid re-hitting the same pitfall.
