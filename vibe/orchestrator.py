@@ -5046,6 +5046,10 @@ class Orchestrator:
 
         impl_blueprint: Optional[packs.ImplementationBlueprint] = None
         impl_blueprint_ptr: Optional[str] = None
+        lead_fix_blueprint_keys: set[str] = set()
+        lead_consult_cache: dict[str, tuple[str, list[str]]] = {}
+        lead_fix_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
+        lead_consult_advisors = {"architect", "env_engineer", "api_confirm", "ops_engineer"}
 
         def _sanitize_blueprint(bp: packs.ImplementationBlueprint) -> packs.ImplementationBlueprint:
             def clean(pats: List[str], *, limit: int) -> List[str]:
@@ -5095,6 +5099,18 @@ class Orchestrator:
                     )
                 )
             bp.task_scopes = norm_scopes
+            rec_fix = str(getattr(bp, "recommended_fix_agent", "") or "").strip()
+            bp.recommended_fix_agent = rec_fix if rec_fix in lead_fix_agents else ""
+            consults: list[str] = []
+            seen_consults: set[str] = set()
+            for raw in list(getattr(bp, "consult_agents", []) or [])[:16]:
+                aid = str(raw or "").strip()
+                if not aid or aid not in lead_consult_advisors or aid in seen_consults:
+                    continue
+                seen_consults.add(aid)
+                consults.append(aid)
+            bp.consult_agents = consults
+            bp.escalation_reason = str(getattr(bp, "escalation_reason", "") or "").strip()[:240]
             bp.invariants = [str(x).strip()[:240] for x in list(bp.invariants or []) if str(x).strip()][:16]
             bp.verification = [str(x).strip()[:240] for x in list(bp.verification or []) if str(x).strip()][:12]
             bp.pointers = [str(x).strip() for x in list(bp.pointers or []) if str(x).strip()][:24]
@@ -5125,6 +5141,12 @@ class Orchestrator:
                 allow = list(impl_blueprint.global_allowed_write_globs or [])
             deny = list(impl_blueprint.global_denied_write_globs or []) + list(impl_blueprint.fix_denied_write_globs or [])
             return allow, deny
+
+        def _preferred_fix_agent(current_fix_agent: str) -> str:
+            preferred = str(getattr(impl_blueprint, "recommended_fix_agent", "") or "").strip() if impl_blueprint is not None else ""
+            if preferred in lead_fix_agents and preferred in self.config.agents:
+                return preferred
+            return current_fix_agent
 
         def maybe_build_implementation_blueprint(*, reason: str) -> None:
             nonlocal impl_blueprint, impl_blueprint_ptr
@@ -5239,6 +5261,9 @@ class Orchestrator:
                 "重点要求：\n"
                 "- fix_allowed_write_globs：只允许修复当前 blocker 所需的最小范围（可为空表示不限制）。\n"
                 "- fix_denied_write_globs：明确禁止改动的范围（可为空）。\n"
+                "- recommended_fix_agent：如果当前问题应由别的代码工种主修，填 coder_backend / coder_frontend / integration_engineer 之一。\n"
+                "- consult_agents：如果需要额外会诊，填 architect / env_engineer / api_confirm / ops_engineer 的子集。\n"
+                "- escalation_reason：说明为什么要改派/会诊（简短即可）。\n"
                 "- invariants：跨文件必须保持一致的关键约束。\n"
                 "- verification：优先给出最小验证命令集合（围绕失败命令）。\n"
                 "可选：task_scopes 可以留空；global_allowed_write_globs 仅在需要时给出。\n\n"
@@ -5264,6 +5289,8 @@ class Orchestrator:
                 bp_user = f"{bp_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
             if impl_blueprint is not None:
                 bp_user = f"{bp_user}\n\nExistingBlueprint:\n{impl_blueprint.model_dump_json()}"
+            if fix_history:
+                bp_user = f"{bp_user}\n\nRecentFixHistory:\n" + "\n".join(fix_history[-6:])
 
             try:
                 bp_msgs = self._messages_with_memory(agent_id="implementation_lead", system=bp_system, user=bp_user)
@@ -5285,6 +5312,108 @@ class Orchestrator:
                 )
             except Exception:
                 pass
+
+        def maybe_collect_lead_consults(
+            *,
+            loop: int,
+            blocker_source: str,
+            blocker_text: str,
+            extracted: list[str],
+            report: packs.TestReport,
+            failure_fingerprint: str,
+        ) -> tuple[str, list[str]]:
+            if impl_blueprint is None:
+                return "", []
+            advisors = [str(x).strip() for x in list(getattr(impl_blueprint, "consult_agents", []) or []) if str(x).strip()]
+            if not advisors:
+                return "", []
+
+            cache_key = "|".join(
+                [
+                    blocker_source,
+                    failure_fingerprint or blocker_text[:120],
+                    ",".join(advisors[:6]),
+                ]
+            )
+            if cache_key in lead_consult_cache:
+                return lead_consult_cache[cache_key]
+
+            advice_parts: list[str] = []
+            ptrs: list[str] = []
+            for aid in advisors[:3]:
+                cfg = self.config.agents.get(aid)
+                if cfg is None or not bool(getattr(cfg, "enabled", True)):
+                    continue
+                try:
+                    can_call = mock_mode or self._api_key_available_for_agent(aid)
+                except Exception:
+                    can_call = False
+                if not can_call:
+                    continue
+                try:
+                    activate_agent(aid, reason="gate:lead_consult")
+                except Exception:
+                    pass
+                try:
+                    advisor = self._agent(aid)
+                    advice_system = (
+                        f"You are {aid}. The implementation_lead is escalating a blocked workflow and needs advisory input.\n"
+                        "Return JSON only matching ChatReply schema: {reply: string, suggested_actions: string[], pointers: string[]}.\n"
+                        "Rules:\n"
+                        "- Base your advice only on the supplied blocker/test evidence/context.\n"
+                        "- Keep it short and actionable.\n"
+                        "- Do not claim files/commands exist unless the evidence shows it.\n\n"
+                        f"{workflow_hint}"
+                    )
+                    advice_user = (
+                        f"Task:\n{task_text}\n\n"
+                        f"RouteLevel: {route_level}\n"
+                        f"BlockerSource: {blocker_source}\n"
+                        f"FailureFingerprint: {failure_fingerprint}\n"
+                        f"ImplementationLeadReason: {str(getattr(impl_blueprint, 'escalation_reason', '') or '').strip()}\n\n"
+                        f"Blocker:\n{blocker_text}\n\n"
+                        f"TestReport:\n{report.model_dump_json()}\n\n"
+                        f"ContextPacket:\n{ctx.model_dump_json()}"
+                    )
+                    if extracted:
+                        advice_user = f"{advice_user}\n\nExtractedErrors:\n" + "\n".join([f"- {x}" for x in extracted[:20]])
+                    if ctx_excerpts:
+                        advice_user = f"{advice_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
+                    advice_msgs = self._messages_with_memory(agent_id=aid, system=advice_system, user=advice_user)
+                    advice, _ = advisor.chat_json(schema=packs.ChatReply, messages=advice_msgs, user=advice_user)
+                    ptr = self.artifacts.put_json(
+                        {"agent": aid, "advice": advice.model_dump()},
+                        suffix=f".{aid}.advice.json",
+                        kind="lead_consult",
+                    ).to_pointer()
+                    ptrs.append(ptr)
+                    advice_parts.append(f"{aid}: {advice.model_dump_json()}")
+                    self._append_guarded(
+                        event=new_event(
+                            agent="router",
+                            type="STATE_TRANSITION",
+                            summary=f"Fix-loop {loop}: consulted {aid} via implementation_lead",
+                            branch_id=self.branch_id,
+                            pointers=[ptr],
+                            meta={
+                                "phase": "fix_loop",
+                                "loop": loop,
+                                "action": "lead_consult",
+                                "advisor": aid,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                except Exception:
+                    continue
+
+            text = ""
+            if advice_parts:
+                text = "LeadAdvisorNotes:\n" + "\n\n".join(advice_parts)
+            lead_consult_cache[cache_key] = (text, ptrs)
+            return text, ptrs
 
         maybe_build_implementation_blueprint(reason="gate:blueprint")
 
@@ -6323,12 +6452,18 @@ class Orchestrator:
                 stagnating = sig_repeat >= 1
                 stagnating_hard = sig_repeat >= 2
 
-                # Escalation: if we are stuck (or on high routes even on first failure),
-                # consult implementation_lead to set a tighter, file-scoped fix plan.
-                if impl_blueprint is None and (
-                    (loop == 1 and route_level in {"L3", "L4"}) or stagnating_hard
-                ):
+                # Escalation: on higher routes or repeated identical failures, refresh the
+                # implementation_lead blueprint so the system can switch fixer/scope instead of looping.
+                lead_refresh_key = "|".join(
+                    [
+                        blocker_source,
+                        fp_now or blocker_text[:160],
+                        "hard" if stagnating_hard else "first_high",
+                    ]
+                )
+                if ((loop == 1 and route_level in {"L3", "L4"}) or stagnating_hard) and lead_refresh_key not in lead_fix_blueprint_keys:
                     try:
+                        lead_fix_blueprint_keys.add(lead_refresh_key)
                         maybe_build_fix_blueprint(
                             reason="gate:blueprint_fix",
                             blocker_source=blocker_source,
@@ -6476,11 +6611,18 @@ class Orchestrator:
                 else:
                     fix_coder_id = self._select_fix_coder_for_text(text=blocker_text, activated_agents=available_agents)
 
+                fix_coder_id = _preferred_fix_agent(fix_coder_id)
                 if fix_coder_id == "coder_frontend" and coder_frontend is None:
                     fix_coder_id = "coder_backend"
                 if fix_coder_id == "integration_engineer" and integrator is None:
                     fix_coder_id = "coder_backend"
-                if stagnating and blocker_source == "tests" and integrator is not None and fix_coder_id != "integration_engineer":
+                if (
+                    stagnating
+                    and blocker_source == "tests"
+                    and integrator is not None
+                    and fix_coder_id != "integration_engineer"
+                    and not str(getattr(impl_blueprint, "recommended_fix_agent", "") or "").strip()
+                ):
                     # When we're stuck, prefer an integrator to align modules/contracts/exports holistically.
                     fix_coder_id = "integration_engineer"
                 activate_agent(fix_coder_id, reason="gate:fix_loop")
@@ -6576,6 +6718,21 @@ class Orchestrator:
                         fix_plan = None
                         fix_plan_ptr = None
 
+                lead_consult_text = ""
+                lead_consult_ptrs: list[str] = []
+                if impl_blueprint is not None and (stagnating or route_level in {"L3", "L4"}):
+                    try:
+                        lead_consult_text, lead_consult_ptrs = maybe_collect_lead_consults(
+                            loop=loop,
+                            blocker_source=blocker_source,
+                            blocker_text=blocker_text,
+                            extracted=extracted,
+                            report=report,
+                            failure_fingerprint=fp_now,
+                        )
+                    except Exception:
+                        lead_consult_text, lead_consult_ptrs = "", []
+
                 # Audit: record which agent is handling this fix-loop step.
                 self._append_guarded(
                     event=new_event(
@@ -6583,12 +6740,15 @@ class Orchestrator:
                         type="STATE_TRANSITION",
                         summary=f"Fix-loop {loop}: dispatch to {fix_coder_id}",
                         branch_id=self.branch_id,
-                        pointers=[],
+                        pointers=list(lead_consult_ptrs or []),
                         meta={
                             "phase": "fix_loop",
                             "loop": loop,
                             "blocker_source": blocker_source,
                             "fix_agent": fix_coder_id,
+                            "lead_recommended_fix_agent": str(getattr(impl_blueprint, "recommended_fix_agent", "") or "").strip()
+                            if impl_blueprint is not None
+                            else "",
                             "route_level": route_level,
                             "style": resolved_style,
                         },
@@ -6638,6 +6798,12 @@ class Orchestrator:
                 )
                 if sim_agent:
                     fix_user = f"{fix_user}\n\n（本工种相关经验）\n{sim_agent}"
+                if impl_blueprint is not None:
+                    lead_reason = str(getattr(impl_blueprint, "escalation_reason", "") or "").strip()
+                    if lead_reason:
+                        fix_user = f"{fix_user}\n\nImplementationLeadReason:\n{lead_reason}"
+                if lead_consult_text:
+                    fix_user = f"{fix_user}\n\n{lead_consult_text}"
                 if ctx_excerpts:
                     fix_user = f"{fix_user}\n\nRepoExcerpts:\n{ctx_excerpts}"
                 if blocker_source == "tests":

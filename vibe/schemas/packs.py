@@ -365,6 +365,9 @@ class ImplementationBlueprint(BaseModel):
     task_scopes: List[ImplementationBlueprintTaskScope] = Field(default_factory=list)
     fix_allowed_write_globs: List[str] = Field(default_factory=list)
     fix_denied_write_globs: List[str] = Field(default_factory=list)
+    recommended_fix_agent: str = ""
+    consult_agents: List[str] = Field(default_factory=list)
+    escalation_reason: str = ""
     invariants: List[str] = Field(default_factory=list)
     verification: List[str] = Field(default_factory=list)
     pointers: List[str] = Field(default_factory=list)
@@ -406,6 +409,30 @@ class ImplementationBlueprint(BaseModel):
                 v = out.get(k)
                 if isinstance(v, list):
                     out["fix_denied_write_globs"] = v
+                    break
+        if "recommended_fix_agent" not in out:
+            for k in ("fix_agent", "recommended_agent", "recommendedFixAgent", "preferred_fix_agent"):
+                v = out.get(k)
+                if v is not None:
+                    try:
+                        out["recommended_fix_agent"] = str(v)
+                    except Exception:
+                        out["recommended_fix_agent"] = v
+                    break
+        if "consult_agents" not in out:
+            for k in ("consult", "advisors", "advisor_agents", "consultants", "consultAgents"):
+                v = out.get(k)
+                if isinstance(v, list):
+                    out["consult_agents"] = v
+                    break
+        if "escalation_reason" not in out:
+            for k in ("reason", "why", "escalate_reason", "escalationReason"):
+                v = out.get(k)
+                if v is not None:
+                    try:
+                        out["escalation_reason"] = str(v)
+                    except Exception:
+                        out["escalation_reason"] = v
                     break
         return out
 
