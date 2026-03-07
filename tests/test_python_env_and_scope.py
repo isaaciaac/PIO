@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from vibe.cli import app
 from vibe.orchestrator import Orchestrator
 from vibe.schemas import packs
+from vibe.schemas.events import new_event
 
 
 def test_workspace_contract_includes_python_setup_commands(tmp_path: Path, monkeypatch) -> None:
@@ -220,3 +221,47 @@ def test_lead_scope_expands_to_related_test_and_package_files(tmp_path: Path, mo
     assert "src/core/parsers.py" in allow
     assert "src/core/__init__.py" in allow
     assert deny == []
+
+
+def test_source_candidates_for_test_path_maps_to_src_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "parser.py").write_text("class PolicyParser:\n    pass\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_parser.py").write_text("from src.parser import PolicyParser\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    candidates = orch._source_candidates_for_test_path("tests/test_parser.py")
+    assert "src/parser.py" in candidates
+
+
+def test_recent_scope_mismatch_paths_are_reused_for_same_failure_fingerprint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    orch.ledger.append(
+        new_event(
+            agent="router",
+            type="INCIDENT_CREATED",
+            summary="Incident: 修复范围不匹配",
+            branch_id="main",
+            pointers=[],
+            meta={
+                "category": "scope_mismatch",
+                "failure_fingerprint": "fp_same",
+                "path": "src/parser.py",
+                "allow": ["tests/test_parser.py"],
+            },
+        )
+    )
+
+    reused = orch._recent_scope_mismatch_paths(failure_fingerprint="fp_same")
+    assert "src/parser.py" in reused
+    assert "tests/test_parser.py" in reused

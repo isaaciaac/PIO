@@ -1306,6 +1306,86 @@ class Orchestrator:
                     return out[:limit]
         return out[:limit]
 
+    def _source_candidates_for_test_path(self, test_path: str, *, limit: int = 8) -> list[str]:
+        raw = _normalize_scope_pattern(str(test_path or "").split(":", 1)[0])
+        if not raw or not raw.startswith("tests/") or not raw.endswith(".py"):
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p or p in seen:
+                return
+            if not (self.repo_root / p).exists():
+                return
+            seen.add(p)
+            out.append(p)
+
+        parts = [part for part in raw.split("/") if part]
+        if len(parts) < 2:
+            return []
+
+        rel_parts = parts[1:]
+        file_name = rel_parts[-1]
+        file_stem = Path(file_name).stem
+        base_name = file_stem[5:] if file_stem.startswith("test_") else file_stem
+        rel_dirs = rel_parts[:-1]
+        trimmed_dirs = [part for part in rel_dirs if part not in {"unit", "integration", "functional", "e2e", "smoke"}]
+
+        candidate_dirs: list[list[str]] = []
+        for dirs in (rel_dirs, trimmed_dirs):
+            if dirs not in candidate_dirs:
+                candidate_dirs.append(dirs)
+
+        for dirs in candidate_dirs:
+            if base_name:
+                add("/".join(["src", *dirs, f"{base_name}.py"]))
+                add("/".join(["src", *dirs, base_name, "__init__.py"]))
+            if file_stem and file_stem != base_name:
+                add("/".join(["src", *dirs, f"{file_stem}.py"]))
+                add("/".join(["src", *dirs, file_stem, "__init__.py"]))
+            if len(out) >= limit:
+                return out[:limit]
+
+        if base_name:
+            add(f"src/{base_name}.py")
+            add(f"src/{base_name}/__init__.py")
+
+        return out[:limit]
+
+    def _recent_scope_mismatch_paths(self, *, failure_fingerprint: str, limit: int = 16) -> list[str]:
+        fp = str(failure_fingerprint or "").strip()
+        if not fp:
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p or p in seen:
+                return
+            seen.add(p)
+            out.append(p)
+
+        try:
+            for evt in self.ledger.iter_events(types={"INCIDENT_CREATED"}, reverse=True, limit=120):
+                meta = dict(getattr(evt, "meta", {}) or {})
+                if str(meta.get("category") or "").strip() != "scope_mismatch":
+                    continue
+                if str(meta.get("failure_fingerprint") or "").strip() != fp:
+                    continue
+                add(str(meta.get("path") or "").strip())
+                for rel in list(meta.get("allow") or [])[:12]:
+                    add(str(rel))
+                if len(out) >= limit:
+                    break
+        except Exception:
+            return out[:limit]
+        return out[:limit]
+
     def _repair_arena_scope_for_error(
         self,
         *,
@@ -1332,11 +1412,19 @@ class Orchestrator:
         error_type = str(getattr(error, "error_type", "") or "").strip()
         traceback_location = str(getattr(error, "traceback_location", "") or "").strip()
         if traceback_location:
-            add_allow(traceback_location.split(":", 1)[0])
+            trace_path = traceback_location.split(":", 1)[0]
+            add_allow(trace_path)
+            for rel in self._source_candidates_for_test_path(trace_path, limit=6):
+                add_allow(rel)
         for rel in list(getattr(error, "related_files", []) or [])[:16]:
-            add_allow(str(rel))
+            rel_text = str(rel)
+            add_allow(rel_text)
+            for candidate in self._source_candidates_for_test_path(rel_text, limit=6):
+                add_allow(candidate)
         for rel in self._test_paths_from_text(blocker_text, limit=8):
             add_allow(rel)
+            for candidate in self._source_candidates_for_test_path(rel, limit=6):
+                add_allow(candidate)
         for rel in self._module_candidate_paths(str(getattr(error, "module", "") or "").strip()):
             add_allow(rel)
 
@@ -5882,6 +5970,7 @@ class Orchestrator:
         lead_consult_cache: dict[str, tuple[str, list[str]]] = {}
         executed_lead_work_orders: set[str] = set()
         scope_mismatch_counts: dict[str, int] = {}
+        adaptive_scope_paths: dict[str, set[str]] = {}
         lead_fix_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
         lead_consult_advisors = {"architect", "env_engineer", "api_confirm", "ops_engineer"}
         lead_fix_order_owners = lead_fix_agents | {"env_engineer", "ops_engineer"}
@@ -7630,6 +7719,8 @@ class Orchestrator:
                 except Exception:
                     sig_now = ""
                     fp_now = ""
+
+                scope_key = str(fp_now or sig_now or blocker_text[:160]).strip()
                 stagnating = sig_repeat >= 1
                 stagnating_hard = sig_repeat >= 2
 
@@ -8294,6 +8385,23 @@ class Orchestrator:
                     blocker_text=blocker_text,
                     error=current_error_object,
                 )
+                adaptive_paths = list(adaptive_scope_paths.get(scope_key, set()))
+                if fp_now:
+                    adaptive_paths.extend(self._recent_scope_mismatch_paths(failure_fingerprint=fp_now, limit=12))
+                adaptive_seen: set[str] = set()
+                adaptive_paths_clean: list[str] = []
+                for rel in adaptive_paths:
+                    norm = _normalize_scope_pattern(str(rel))
+                    if not norm or norm in adaptive_seen:
+                        continue
+                    adaptive_seen.add(norm)
+                    adaptive_paths_clean.append(norm)
+                if adaptive_paths_clean:
+                    for rel in adaptive_paths_clean:
+                        if rel not in fix_allow:
+                            fix_allow.append(rel)
+                    if fix_scope_level == "L1":
+                        fix_scope_level = "L2-adaptive"
                 fix_scope_hint = ""
                 try:
                     allow_short = [str(x).strip() for x in list(fix_allow or []) if str(x).strip()][:12]
@@ -8427,6 +8535,17 @@ class Orchestrator:
                     )
                     mismatch_key = "|".join([fp_now or blocker_text[:160], e.path])
                     scope_mismatch_counts[mismatch_key] = int(scope_mismatch_counts.get(mismatch_key, 0)) + 1
+                    target_scope = adaptive_scope_paths.setdefault(scope_key or mismatch_key, set())
+                    target_scope.add(_normalize_scope_pattern(e.path))
+                    for rel in list(getattr(current_error_object, "related_files", []) or [])[:24]:
+                        norm = _normalize_scope_pattern(str(rel))
+                        if norm:
+                            target_scope.add(norm)
+                        for candidate in self._source_candidates_for_test_path(str(rel), limit=6):
+                            target_scope.add(candidate)
+                    trace_path = str(getattr(current_error_object, "traceback_location", "") or "").split(":", 1)[0]
+                    for candidate in self._source_candidates_for_test_path(trace_path, limit=6):
+                        target_scope.add(candidate)
                     try:
                         maybe_build_fix_blueprint(
                             reason="gate:scope_mismatch",
