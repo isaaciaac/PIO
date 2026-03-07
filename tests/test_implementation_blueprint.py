@@ -134,3 +134,35 @@ def test_select_lead_fix_work_order_prefers_env_for_env_blocker(tmp_path: Path, 
     )
     assert selected is not None
     assert selected.owner == "env_engineer"
+
+
+def test_replan_gate_skips_low_level_scope_errors(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    err = schemas.ErrorObject(error_type="scope_mismatch", suspected_root_cause="write scope too narrow")
+    assert orch._should_replan_tests_blocker(
+        error=err,
+        consults={"architect"},
+        haystack="architecture contract module boundary",
+        stagnating_hard=True,
+    ) is False
+
+
+def test_replan_gate_allows_unclassified_design_blockers(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    err = schemas.ErrorObject(error_type="unclassified", suspected_root_cause="shared contract drift")
+    assert orch._should_replan_tests_blocker(
+        error=err,
+        consults={"architect"},
+        haystack="contract boundary architecture drift",
+        stagnating_hard=True,
+    ) is True

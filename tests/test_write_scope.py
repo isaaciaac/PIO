@@ -77,3 +77,41 @@ index 0000000..1111111 100644
         orch._materialize_code_change(change, write_allowlist=["src/**"], write_denylist=[])
     assert ei.value.path == "README.md"
 
+
+def test_write_scope_denial_does_not_trigger_same_actor_repair(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    orch = Orchestrator(tmp_path)
+    change = packs.CodeChange.model_validate(
+        {
+            "kind": "patch",
+            "summary": "try write blocked test file",
+            "writes": [{"path": "tests/test_inference.py", "content": "assert True\n"}],
+            "files_changed": ["tests/test_inference.py"],
+        }
+    )
+
+    called = False
+
+    class DummyActor:
+        def chat_json(self, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("repair prompt should not run for scope mismatch")
+
+    with pytest.raises(WriteScopeDeniedError) as ei:
+        orch._materialize_code_change_with_repair(
+            change=change,
+            actor_agent_id="coder_backend",
+            actor=DummyActor(),
+            actor_role="Backend Coder",
+            workflow_hint="",
+            write_allowlist=["src/**"],
+            write_denylist=[],
+        )
+    assert ei.value.path == "tests/test_inference.py"
+    assert called is False

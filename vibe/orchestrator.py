@@ -84,6 +84,17 @@ REPLAN_HINT_KEYWORDS = (
     "shared context",
 )
 
+LOW_LEVEL_SCOPE_ERROR_TYPES = {
+    "missing_import",
+    "missing_export",
+    "symbol_rename",
+    "wrong_import_path",
+    "typing_runtime_issue",
+    "syntax_error",
+    "config_missing",
+    "scope_mismatch",
+}
+
 
 def _normalize_scope_pattern(pat: str) -> str:
     return (str(pat or "").replace("\\", "/").strip()).lstrip("/")
@@ -1248,6 +1259,113 @@ class Orchestrator:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _module_candidate_paths(self, module: str) -> list[str]:
+        rel = str(module or "").replace(".", "/").replace("\\", "/").strip("/")
+        if not rel:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p or p in seen:
+                return
+            seen.add(p)
+            out.append(p)
+
+        add(f"{rel}.py")
+        add(f"{rel}/__init__.py")
+        parts = [part for part in rel.split("/") if part]
+        while len(parts) > 1:
+            parts = parts[:-1]
+            add("/".join(parts) + "/__init__.py")
+        return out
+
+    def _test_paths_from_text(self, text: str, *, limit: int = 8) -> list[str]:
+        raw = str(text or "")
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p or p in seen:
+                return
+            seen.add(p)
+            out.append(p)
+
+        patterns = [
+            r"\b(?P<path>tests[/\\][^\s'\"()]+?\.py::[A-Za-z0-9_:.\\/-]+)\b",
+            r"\b(?P<path>tests[/\\][^\s'\"()]+?\.py)\b",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, raw, flags=re.IGNORECASE):
+                path = str(m.group("path") or "").replace("\\", "/").split("::", 1)[0].strip()
+                if path:
+                    add(path)
+                if len(out) >= limit:
+                    return out[:limit]
+        return out[:limit]
+
+    def _repair_arena_scope_for_error(
+        self,
+        *,
+        error: Optional[packs.ErrorObject],
+        blocker_text: str,
+        allow: list[str],
+        deny: list[str],
+    ) -> tuple[list[str], list[str], str]:
+        allow_out = [_normalize_scope_pattern(p) for p in list(allow or []) if _normalize_scope_pattern(p)]
+        deny_out = [_normalize_scope_pattern(p) for p in list(deny or []) if _normalize_scope_pattern(p)]
+        scope_level = "L1"
+
+        def add_allow(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p:
+                return
+            if p.startswith(".vibe/") or p.startswith(".git/"):
+                return
+            if ":" in p or p.startswith("\\\\") or p.startswith("//") or "/../" in f"/{p}/":
+                return
+            if p not in allow_out:
+                allow_out.append(p)
+
+        error_type = str(getattr(error, "error_type", "") or "").strip()
+        traceback_location = str(getattr(error, "traceback_location", "") or "").strip()
+        if traceback_location:
+            add_allow(traceback_location.split(":", 1)[0])
+        for rel in list(getattr(error, "related_files", []) or [])[:16]:
+            add_allow(str(rel))
+        for rel in self._test_paths_from_text(blocker_text, limit=8):
+            add_allow(rel)
+        for rel in self._module_candidate_paths(str(getattr(error, "module", "") or "").strip()):
+            add_allow(rel)
+
+        if error_type in {"missing_import", "missing_export", "symbol_rename", "wrong_import_path"}:
+            scope_level = "L2"
+            for rel in self._module_candidate_paths(str(getattr(error, "module", "") or "").strip()):
+                add_allow(rel)
+        elif error_type in {"typing_runtime_issue", "syntax_error", "test_assert_mismatch", "scope_mismatch"}:
+            scope_level = "L2"
+        elif error_type == "config_missing":
+            scope_level = "L3"
+            for rel in [
+                "pyproject.toml",
+                "requirements.txt",
+                "setup.py",
+                "README.md",
+                "package.json",
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "pnpm-workspace.yaml",
+                "yarn.lock",
+                "tsconfig.json",
+            ]:
+                if rel in {"README.md", "pyproject.toml", "requirements.txt", "setup.py"} or (self.repo_root / rel).exists():
+                    add_allow(rel)
+            if (self.repo_root / "scripts").exists():
+                add_allow("scripts/**")
+        return allow_out, deny_out, scope_level
+
     def _expand_fix_scope_for_blocker(self, *, allow: list[str], deny: list[str], blocker_text: str) -> tuple[list[str], list[str]]:
         allow_out = [_normalize_scope_pattern(p) for p in list(allow or []) if _normalize_scope_pattern(p)]
         deny_out = [_normalize_scope_pattern(p) for p in list(deny or []) if _normalize_scope_pattern(p)]
@@ -1281,16 +1399,79 @@ class Orchestrator:
         default_allow: list[str],
         default_deny: list[str],
         blocker_text: str,
-    ) -> tuple[list[str], list[str]]:
+        error: Optional[packs.ErrorObject] = None,
+    ) -> tuple[list[str], list[str], str]:
         allow = [_normalize_scope_pattern(p) for p in list(default_allow or []) if _normalize_scope_pattern(p)]
         deny = [_normalize_scope_pattern(p) for p in list(default_deny or []) if _normalize_scope_pattern(p)]
         if order is not None:
             order_allow = [_normalize_scope_pattern(p) for p in list(order.allowed_write_globs or []) if _normalize_scope_pattern(p)]
             order_deny = [_normalize_scope_pattern(p) for p in list(order.denied_write_globs or []) if _normalize_scope_pattern(p)]
             if order_allow:
-                allow = order_allow
+                allow = allow + [p for p in order_allow if p and p not in allow]
             deny = deny + [p for p in order_deny if p and p not in deny]
-        return self._expand_fix_scope_for_blocker(allow=allow, deny=deny, blocker_text=blocker_text)
+        allow, deny = self._expand_fix_scope_for_blocker(allow=allow, deny=deny, blocker_text=blocker_text)
+        return self._repair_arena_scope_for_error(error=error, blocker_text=blocker_text, allow=allow, deny=deny)
+
+    def _scope_mismatch_error_object(
+        self,
+        *,
+        scope_error: WriteScopeDeniedError,
+        current_error: Optional[packs.ErrorObject],
+        blocker_text: str,
+    ) -> packs.ErrorObject:
+        related: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path)
+            if not p or p in seen:
+                return
+            seen.add(p)
+            related.append(p)
+
+        add(scope_error.path)
+        for rel in self._test_paths_from_text(blocker_text, limit=8):
+            add(rel)
+        if current_error is not None:
+            if current_error.traceback_location:
+                add(str(current_error.traceback_location).split(":", 1)[0])
+            for rel in list(current_error.related_files or [])[:16]:
+                add(str(rel))
+            for rel in self._module_candidate_paths(str(current_error.module or "").strip()):
+                add(rel)
+        allow_short = ", ".join(list(scope_error.allow or [])[:6])
+        cause = f"当前修复范围过窄，缺少对 `{scope_error.path}` 的写权限。"
+        if allow_short:
+            cause = f"{cause} 当前 allow 仅覆盖：{allow_short}"
+        return packs.ErrorObject(
+            error_type="scope_mismatch",
+            module=str(getattr(current_error, "module", "") or "").strip(),
+            symbol=str(getattr(current_error, "symbol", "") or "").strip(),
+            traceback_location=str(getattr(current_error, "traceback_location", "") or "").strip(),
+            suspected_root_cause=f"{cause} 需要 implementation_lead 放宽 repair arena，而不是继续让 coder 重试同一范围。",
+            failed_command=str(getattr(current_error, "failed_command", "") or "").strip(),
+            related_files=related[:24],
+            evidence_pointers=list(getattr(current_error, "evidence_pointers", []) or [])[:24],
+        )
+
+    def _should_replan_tests_blocker(
+        self,
+        *,
+        error: Optional[packs.ErrorObject],
+        consults: set[str],
+        haystack: str,
+        stagnating_hard: bool,
+    ) -> bool:
+        if not stagnating_hard:
+            return False
+        error_type = str(getattr(error, "error_type", "") or "").strip()
+        if error_type in LOW_LEVEL_SCOPE_ERROR_TYPES:
+            return False
+        if error_type == "circular_import":
+            return bool(consults.intersection({"architect", "api_confirm"}))
+        if consults.intersection({"architect", "api_confirm"}):
+            return True
+        return error_type in {"test_assert_mismatch", "unclassified"} and any(keyword in haystack for keyword in REPLAN_HINT_KEYWORDS)
 
     def _select_lead_fix_work_order(
         self,
@@ -4456,6 +4637,8 @@ class Orchestrator:
                 )
             except Exception as e:
                 last_err = e
+                if isinstance(e, WriteScopeDeniedError):
+                    raise
                 msg = str(e)
                 repairable = any(
                     k in msg
@@ -4469,7 +4652,6 @@ class Orchestrator:
                         "Missing npm dependencies for imports in CodeChange.writes",
                         "Ownership denied:",
                         "Ownership approval denied",
-                        "Write scope denied:",
                     ]
                 )
                 if not repairable or attempt >= max_repairs:
@@ -5699,6 +5881,7 @@ class Orchestrator:
         lead_fix_blueprint_keys: set[str] = set()
         lead_consult_cache: dict[str, tuple[str, list[str]]] = {}
         executed_lead_work_orders: set[str] = set()
+        scope_mismatch_counts: dict[str, int] = {}
         lead_fix_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
         lead_consult_advisors = {"architect", "env_engineer", "api_confirm", "ops_engineer"}
         lead_fix_order_owners = lead_fix_agents | {"env_engineer", "ops_engineer"}
@@ -5975,6 +6158,7 @@ class Orchestrator:
                 "- 默认不要修改 node_modules；只有在 Windows shim/binary workaround 等必要时，才允许最小范围 copy/writes。\n\n"
                 "- 对明显属于环境/依赖/命令/安装状态问题的 blocker，优先把首条工单分配给 env_engineer，而不是 coder。\n"
                 "- ops_engineer 负责复现/收集/定位；env_engineer 负责环境修复命令；coder 只负责代码层补丁。\n\n"
+                "- 如果当前 blocker 暗示 scope mismatch / 被系统拒写，请优先放宽到 ErrorObject.related_files、失败测试文件、目标模块及其包根 `__init__.py`，不要让 coder 重复撞同一写入限制。\n\n"
                 f"{workflow_hint}"
             )
             bp_user = (
@@ -6146,6 +6330,7 @@ class Orchestrator:
             incident_ptr: Optional[str],
             fix_plan: Optional[packs.FixPlanPack],
             fix_plan_ptr: Optional[str],
+            error: Optional[packs.ErrorObject],
             stagnating_hard: bool,
         ) -> tuple[bool, str]:
             nonlocal decisions, decisions_ptr, contract, contract_ptr, plan, plan_ptr, impl_blueprint, impl_blueprint_ptr
@@ -6169,15 +6354,27 @@ class Orchestrator:
                     "\n".join(list(getattr(report, "blockers", []) or [])[:8]),
                 ]
             ).lower()
+            error_type = str(getattr(error, "error_type", "") or "").strip()
+
+            if blocker_source == "tests" and error_type in LOW_LEVEL_SCOPE_ERROR_TYPES:
+                return False, ""
 
             trigger_reasons: list[str] = []
             if blocker_source in {"review", "security", "compliance", "performance"} and loop >= 2:
                 trigger_reasons.append(f"{blocker_source}_gate_stuck")
             if blocker_source == "tests" and stagnating_hard:
-                if consults.intersection({"architect", "api_confirm"}):
+                if self._should_replan_tests_blocker(
+                    error=error,
+                    consults=consults,
+                    haystack=haystack,
+                    stagnating_hard=stagnating_hard,
+                ):
+                    if consults.intersection({"architect", "api_confirm"}):
+                        trigger_reasons.append("lead_requested_design_consult")
+                    elif any(keyword in haystack for keyword in REPLAN_HINT_KEYWORDS):
+                        trigger_reasons.append("design_level_failure_signature")
+                elif consults.intersection({"architect", "api_confirm"}) and error_type == "circular_import":
                     trigger_reasons.append("lead_requested_design_consult")
-                elif any(keyword in haystack for keyword in REPLAN_HINT_KEYWORDS):
-                    trigger_reasons.append("design_level_failure_signature")
 
             if not trigger_reasons:
                 return False, ""
@@ -8090,11 +8287,12 @@ class Orchestrator:
                 if delegated_fix_change is not None:
                     fix_role = "Environment Engineer" if delegated_fix_agent_id == "env_engineer" else "Ops Engineer"
                 fix_allow, fix_deny = _scope_for_fix_loop() if impl_blueprint is not None else ([], [])
-                fix_allow, fix_deny = self._lead_work_order_scope(
+                fix_allow, fix_deny, fix_scope_level = self._lead_work_order_scope(
                     order=lead_work_order if lead_work_order_owner in lead_fix_agents else None,
                     default_allow=fix_allow,
                     default_deny=fix_deny,
                     blocker_text=blocker_text,
+                    error=current_error_object,
                 )
                 fix_scope_hint = ""
                 try:
@@ -8104,65 +8302,146 @@ class Orchestrator:
                     allow_short, deny_short = [], []
                 if allow_short or deny_short:
                     lines: list[str] = []
+                    lines.append(f"Repair arena level: {fix_scope_level}")
                     if allow_short:
                         lines.append("Allowed write paths/globs (MUST stay within):\n" + "\n".join([f"- {p}" for p in allow_short]))
                     if deny_short:
                         lines.append("Denied write paths/globs:\n" + "\n".join([f"- {p}" for p in deny_short]))
                     fix_scope_hint = "\n\nImplementationLeadWriteScope:\n" + "\n\n".join(lines)
-                if delegated_fix_change is not None:
-                    change = delegated_fix_change
-                    write_pointers = list(delegated_fix_ptrs)
-                elif auto_change is None:
-                    fix_msgs = self._messages_with_memory(
-                        agent_id=fix_coder_id,
-                        system=(
-                            f"You are {fix_role}. Fix the failing command. Batch-fix all related errors from the same failing command output. Return JSON only for CodeChange with fields: "
-                            "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
-                            "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
-                            "Hard rules:\n"
-                            "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
-                            "- Never copy under `.vibe/` or `.git/`.\n"
-                            "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
-                            "- Diagnose first, then produce the smallest patch that addresses exactly one primary root cause from ErrorObject.\n"
-                            "- Do not change unrelated files or batch multiple hypotheses in one patch.\n"
-                            "- Fix the failing command in the blocker; prefer fixing the selected root cause completely before touching other symptoms.\n"
-                            "- Do not do architecture refactors during fix-loop.\n"
-                            "- If LeadWorkOrder is provided, follow that work order exactly: owner/scope/files/commands/verify take precedence over your own guesses.\n"
-                            "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
-                            "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
-                            "- If Python third-party imports are missing, prefer updating `pyproject.toml` / `requirements.txt` rather than editing business code first.\n"
-                            "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
-                            "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
-                            "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
-                            f"{fix_scope_hint}\n\n{workflow_hint}"
+                try:
+                    if delegated_fix_change is not None:
+                        change = delegated_fix_change
+                        write_pointers = list(delegated_fix_ptrs)
+                    elif auto_change is None:
+                        fix_msgs = self._messages_with_memory(
+                            agent_id=fix_coder_id,
+                            system=(
+                                f"You are {fix_role}. Fix the failing command. Batch-fix all related errors from the same failing command output. Return JSON only for CodeChange with fields: "
+                                "kind ('commit'|'patch'|'noop'), summary, writes? (list[{path,content}]), copies? (list[{src,dst}]), commit_hash?, patch_pointer?, files_changed[], blockers[]. "
+                                "Prefer 'writes' for file changes. No extra keys. No markdown.\n\n"
+                                "Hard rules:\n"
+                                "- Never write under `.vibe/` or `.git/` (those are internal system dirs).\n"
+                                "- Never copy under `.vibe/` or `.git/`.\n"
+                                "- Use only repo-root relative paths (no absolute paths / drive letters).\n"
+                                "- Diagnose first, then produce the smallest patch that addresses exactly one primary root cause from ErrorObject.\n"
+                                "- Do not change unrelated files or batch multiple hypotheses in one patch.\n"
+                                "- Fix the failing command in the blocker; prefer fixing the selected root cause completely before touching other symptoms.\n"
+                                "- Do not do architecture refactors during fix-loop.\n"
+                                "- If LeadWorkOrder is provided, follow that work order exactly: owner/scope/files/commands/verify take precedence over your own guesses.\n"
+                                "- If you add/modify an import, ensure the target file exists or create it in writes.\n\n"
+                                "- If you import a new npm package, add it to the correct `package.json` (dependencies/devDependencies).\n\n"
+                                "- If Python third-party imports are missing, prefer updating `pyproject.toml` / `requirements.txt` rather than editing business code first.\n"
+                                "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
+                                "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
+                                "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n\n"
+                                f"{fix_scope_hint}\n\n{workflow_hint}"
+                            ),
+                            user=fix_user,
+                        )
+                        change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
+                        change, write_pointers = self._materialize_code_change_with_repair(
+                            change=change,
+                            actor_agent_id=fix_coder_id,
+                            actor=fix_coder,
+                            actor_role=fix_role,
+                            workflow_hint=workflow_hint,
+                            activated_agents=activated_agents,
+                            activate_agent=activate_agent,
+                            route_level=route_level,
+                            style=resolved_style,
+                            write_allowlist=fix_allow,
+                            write_denylist=fix_deny,
+                        )
+                    else:
+                        change, write_pointers = self._materialize_code_change(
+                            auto_change,
+                            actor_agent_id=fix_coder_id,
+                            activated_agents=activated_agents,
+                            activate_agent=activate_agent,
+                            route_level=route_level,
+                            style=resolved_style,
+                            write_allowlist=fix_allow,
+                            write_denylist=fix_deny,
+                        )
+                except WriteScopeDeniedError as e:
+                    current_error_object = self._scope_mismatch_error_object(
+                        scope_error=e,
+                        current_error=current_error_object,
+                        blocker_text=blocker_text,
+                    )
+                    scope_mismatch_payload = {
+                        "loop": loop,
+                        "path": e.path,
+                        "allow": list(e.allow or [])[:24],
+                        "deny": list(e.deny or [])[:24],
+                        "blocker_source": blocker_source,
+                        "failure_fingerprint": fp_now,
+                        "error_object": current_error_object.model_dump(),
+                    }
+                    scope_mismatch_ptr = self.artifacts.put_json(
+                        scope_mismatch_payload,
+                        suffix=".scope_mismatch.json",
+                        kind="incident",
+                    ).to_pointer()
+                    fix_history.append(
+                        f"- loop {loop} scope_mismatch: blocked on {e.path} | error=scope_mismatch | allow={', '.join(list(e.allow or [])[:6])}"
+                    )
+                    self._append_guarded(
+                        event=new_event(
+                            agent="router",
+                            type="INCIDENT_CREATED",
+                            summary="Incident: 修复范围不匹配",
+                            branch_id=self.branch_id,
+                            pointers=[scope_mismatch_ptr],
+                            meta={
+                                "source": blocker_source,
+                                "category": "scope_mismatch",
+                                "path": e.path,
+                                "allow": list(e.allow or [])[:24],
+                                "deny": list(e.deny or [])[:24],
+                                "loop": loop,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                                "failure_fingerprint": fp_now,
+                            },
                         ),
-                        user=fix_user,
-                    )
-                    change, _ = fix_coder.chat_json(schema=packs.CodeChange, messages=fix_msgs, user=fix_user)
-                    change, write_pointers = self._materialize_code_change_with_repair(
-                        change=change,
-                        actor_agent_id=fix_coder_id,
-                        actor=fix_coder,
-                        actor_role=fix_role,
-                        workflow_hint=workflow_hint,
                         activated_agents=activated_agents,
-                        activate_agent=activate_agent,
-                        route_level=route_level,
-                        style=resolved_style,
-                        write_allowlist=fix_allow,
-                        write_denylist=fix_deny,
                     )
-                else:
-                    change, write_pointers = self._materialize_code_change(
-                        auto_change,
-                        actor_agent_id=fix_coder_id,
+                    self._append_guarded(
+                        event=new_event(
+                            agent="router",
+                            type="STATE_TRANSITION",
+                            summary=f"Fix-loop {loop}: scope mismatch -> refresh implementation_lead",
+                            branch_id=self.branch_id,
+                            pointers=[scope_mismatch_ptr],
+                            meta={
+                                "phase": "fix_loop",
+                                "loop": loop,
+                                "action": "scope_mismatch_refresh",
+                                "path": e.path,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
                         activated_agents=activated_agents,
-                        activate_agent=activate_agent,
-                        route_level=route_level,
-                        style=resolved_style,
-                        write_allowlist=fix_allow,
-                        write_denylist=fix_deny,
                     )
+                    mismatch_key = "|".join([fp_now or blocker_text[:160], e.path])
+                    scope_mismatch_counts[mismatch_key] = int(scope_mismatch_counts.get(mismatch_key, 0)) + 1
+                    try:
+                        maybe_build_fix_blueprint(
+                            reason="gate:scope_mismatch",
+                            blocker_source=blocker_source,
+                            blocker_text=blocker_text,
+                            extracted=extracted,
+                            report=report,
+                        )
+                    except Exception:
+                        pass
+                    sig_repeat = 0
+                    sig_last = ""
+                    if scope_mismatch_counts[mismatch_key] <= 2 and loop > 0:
+                        loop -= 1
+                    continue
                 try:
                     evidence = change.commit_hash or change.patch_pointer or ""
                     files = [str(x).strip() for x in (change.files_changed or []) if str(x).strip()]
@@ -8555,6 +8834,7 @@ class Orchestrator:
                         incident_ptr=incident_ptr,
                         fix_plan=fix_plan,
                         fix_plan_ptr=fix_plan_ptr,
+                        error=current_error_object,
                         stagnating_hard=stagnating_hard,
                     )
                 except Exception:

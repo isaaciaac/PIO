@@ -15,6 +15,7 @@ ErrorType = Literal[
     "typing_runtime_issue",
     "test_assert_mismatch",
     "config_missing",
+    "scope_mismatch",
     "syntax_error",
     "unclassified",
 ]

@@ -184,3 +184,39 @@ def test_compile_preflight_commands_for_python_import_failure_include_compileall
     )
     assert "python -m compileall ." in cmds
     assert "pytest -q --collect-only" not in cmds
+
+
+def test_lead_scope_expands_to_related_test_and_package_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src" / "core").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "core" / "__init__.py").write_text("from .parsers import Parser\n", encoding="utf-8")
+    (tmp_path / "src" / "core" / "parsers.py").write_text("class Parser:\n    pass\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_inference.py").write_text("from src.core import Parser\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    error = packs.ErrorObject(
+        error_type="missing_export",
+        module="src.core.parsers",
+        symbol="Parser",
+        traceback_location="tests/test_inference.py:1",
+        related_files=["tests/test_inference.py"],
+        failed_command="pytest -q",
+    )
+    allow, deny, scope_level = orch._lead_work_order_scope(
+        order=None,
+        default_allow=["pyproject.toml"],
+        default_deny=[],
+        blocker_text="ImportError while importing test module tests/test_inference.py\ncannot import name 'Parser' from 'src.core.parsers'",
+        error=error,
+    )
+    assert scope_level == "L2"
+    assert "pyproject.toml" in allow
+    assert "tests/test_inference.py" in allow
+    assert "src/core/parsers.py" in allow
+    assert "src/core/__init__.py" in allow
+    assert deny == []
