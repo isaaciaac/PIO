@@ -25,18 +25,9 @@ def test_run_creates_non_green_checkpoint_when_fix_loop_exhausted(tmp_path: Path
     # Use mock providers without enabling VIBE_MOCK_MODE, so tests still run locally.
     cfg_path = tmp_path / ".vibe" / "vibe.yaml"
     cfg = VibeConfig.load(cfg_path)
-    for agent_id in [
-        "router",
-        "pm",
-        "coder_backend",
-        "requirements_analyst",
-        "architect",
-        "api_confirm",
-        "code_reviewer",
-    ]:
-        if agent_id in cfg.agents:
-            cfg.agents[agent_id].provider = "mock"
-            cfg.agents[agent_id].model = "mock"
+    for agent in cfg.agents.values():
+        agent.provider = "mock"
+        agent.model = "mock"
     write_default_config(tmp_path, cfg)
 
     r2 = runner.invoke(app, ["task", "add", "trigger failing tests"])

@@ -265,3 +265,110 @@ def test_recent_scope_mismatch_paths_are_reused_for_same_failure_fingerprint(tmp
     reused = orch._recent_scope_mismatch_paths(failure_fingerprint="fp_same")
     assert "src/parser.py" in reused
     assert "tests/test_parser.py" in reused
+
+
+def test_diagnose_local_package_shadow_as_wrong_import_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "app.py").write_text("from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8")
+    (tmp_path / "app" / "__init__.py").write_text("from .app import app\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_integration.py").write_text("from app import app\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    blocker = "ImportError while importing test module tests/test_integration.py\nModuleNotFoundError: No module named 'app.app'"
+    report = packs.TestReport(
+        commands=["pytest -q"],
+        results=[packs.TestResult(command="pytest -q", returncode=1, passed=False, stdout="", stderr=blocker)],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+    observation, _ptr = orch._observe_test_failure(report=report, blocker_text=blocker)
+    error = orch._diagnose_test_failure(report=report, blocker_text=blocker, observation=observation)
+
+    assert error.error_type == "wrong_import_path"
+    assert "py_package_shadow_root_module" in error.static_issue_ids
+    assert "app.py" in list(observation.get("related_files") or [])
+    assert orch._is_env_fix_candidate(error=error, blocker_text=blocker) is False
+
+
+def test_static_python_skeleton_scanner_finds_export_and_signature_pitfalls(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "utils").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "app.py").write_text(
+        "from utils.reasoning_engine import ReasoningEngine\n"
+        "from models.database import insert_rule, init_db\n\n"
+        "def boot():\n"
+        "    init_db('sqlite:///demo.db')\n"
+        "    return insert_rule\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "utils" / "reasoning_engine.py").write_text(
+        "class ReasoningResult:\n    pass\n\n"
+        "def match_and_reason(text: str):\n    return ReasoningResult()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models" / "database.py").write_text(
+        "def init_db():\n    return None\n\n"
+        "def insert_policy_rule(data):\n    return data\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    issues = orch._python_static_skeleton_issues(
+        observation={"module": "", "symbol": "", "related_files": ["app.py"]},
+        blocker_text="ImportError while importing test module tests/test_integration.py",
+    )
+    issue_ids = {str(item.get("id") or "") for item in issues}
+
+    assert "py_missing_local_export_symbol" in issue_ids
+    assert "py_local_call_signature_mismatch" in issue_ids
+
+
+def test_failure_signature_includes_static_issue_ids(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    report = packs.TestReport(
+        commands=["pytest -q"],
+        results=[packs.TestResult(command="pytest -q", returncode=1, passed=False, stdout="", stderr="ImportError")],
+        passed=False,
+        blockers=["ImportError"],
+        pointers=[],
+    )
+    error = packs.ErrorObject(error_type="wrong_import_path", static_issue_ids=["py_package_shadow_root_module"])
+    signature = orch._failure_signature(report=report, extracted=["ImportError"], blocker_text="ImportError", error=error)
+    assert "static:py_package_shadow_root_module" in signature
+
+
+def test_focus_commands_do_not_duplicate_collect_only_or_paths(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    orch = Orchestrator(tmp_path)
+    failed = "pytest -q --collect-only tests/test_integration.py"
+    blocker = "ImportError while importing test module tests/test_integration.py\nModuleNotFoundError: No module named 'app.app'"
+    report = packs.TestReport(
+        commands=[failed],
+        results=[packs.TestResult(command=failed, returncode=1, passed=False, stdout="", stderr=blocker)],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+    cmds = orch._focus_commands_for_test_failure(report=report, blocker_text=blocker)
+    assert cmds == [failed]

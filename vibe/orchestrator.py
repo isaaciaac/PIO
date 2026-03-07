@@ -1259,6 +1259,24 @@ class Orchestrator:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _looks_like_local_python_module(self, module: str) -> bool:
+        mod = str(module or "").strip().strip(".")
+        if not mod:
+            return False
+        if any((self.repo_root / rel).exists() for rel in self._module_candidate_paths(mod)):
+            return True
+        parts = [part for part in mod.split(".") if part]
+        if not parts:
+            return False
+        top = parts[0].replace(".", "/")
+        if (self.repo_root / f"{top}.py").exists() or (self.repo_root / top / "__init__.py").exists():
+            return True
+        if len(parts) > 1:
+            parent_rel = "/".join(parts[:-1])
+            if (self.repo_root / f"{parent_rel}.py").exists() and (self.repo_root / parent_rel / "__init__.py").exists():
+                return True
+        return False
+
     def _module_candidate_paths(self, module: str) -> list[str]:
         rel = str(module or "").replace(".", "/").replace("\\", "/").strip("/")
         if not rel:
@@ -1354,6 +1372,248 @@ class Orchestrator:
             add(f"src/{base_name}/__init__.py")
 
         return out[:limit]
+
+    def _resolve_python_import_module(self, *, importer_rel: str, module: str, level: int) -> str:
+        raw_module = str(module or "").strip().strip(".")
+        mod_parts = [part for part in raw_module.split(".") if part]
+        path_parts = [part for part in str(importer_rel or "").replace("\\", "/").strip("/").split("/") if part]
+        if not path_parts:
+            return ".".join(mod_parts)
+        package_parts = path_parts[:-1]
+        if level > 0:
+            keep = max(0, len(package_parts) - max(0, level - 1))
+            base = package_parts[:keep]
+        else:
+            base = []
+        resolved = [part for part in [*base, *mod_parts] if part]
+        return ".".join(resolved)
+
+    def _python_function_signatures(self, rel_path: str) -> dict[str, dict[str, Any]]:
+        rel = str(rel_path or "").replace("\\", "/").lstrip("/")
+        if not rel or not rel.endswith(".py"):
+            return {}
+        path = self.repo_root / rel
+        if not path.exists():
+            return {}
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return {}
+        signatures: dict[str, dict[str, Any]] = {}
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            positional = list(node.args.posonlyargs) + list(node.args.args)
+            positional_names = [str(arg.arg) for arg in positional]
+            required = max(0, len(positional) - len(list(node.args.defaults or [])))
+            signatures[str(node.name)] = {
+                "required_positional": required,
+                "max_positional": None if node.args.vararg else len(positional),
+                "positional_names": positional_names,
+                "keyword_names": [str(arg.arg) for arg in list(node.args.kwonlyargs or [])],
+                "varargs": bool(node.args.vararg),
+                "varkw": bool(node.args.kwarg),
+            }
+        return signatures
+
+    def _python_static_skeleton_issues(self, *, observation: dict[str, Any], blocker_text: str) -> list[dict[str, Any]]:
+        raw = str(blocker_text or "")
+        low = raw.lower()
+        module = str(observation.get("module") or "").strip()
+        symbol = str(observation.get("symbol") or "").strip()
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+
+        def add(issue_id: str, summary: str, *, files: list[str], details: str = "") -> None:
+            clean_files: list[str] = []
+            file_seen: set[str] = set()
+            for rel in files:
+                norm = _normalize_scope_pattern(rel)
+                if not norm or norm in file_seen:
+                    continue
+                file_seen.add(norm)
+                clean_files.append(norm)
+            key = (issue_id, tuple(clean_files))
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(
+                {
+                    "id": issue_id,
+                    "summary": summary,
+                    "files": clean_files[:8],
+                    "details": str(details or "").strip()[:500],
+                }
+            )
+
+        def existing_module_files(mod_name: str) -> list[str]:
+            return [rel for rel in self._module_candidate_paths(mod_name) if (self.repo_root / rel).exists()]
+
+        if module:
+            parts = [part for part in module.split(".") if part]
+            if len(parts) > 1:
+                parent_rel = "/".join(parts[:-1])
+                missing_rel = "/".join(parts)
+                parent_init = f"{parent_rel}/__init__.py"
+                parent_root = f"{parent_rel}.py"
+                if (
+                    (self.repo_root / parent_init).exists()
+                    and (self.repo_root / parent_root).exists()
+                    and not any((self.repo_root / rel).exists() for rel in [f"{missing_rel}.py", f"{missing_rel}/__init__.py"])
+                ):
+                    add(
+                        "py_package_shadow_root_module",
+                        f"本地包 `{parent_rel}` 与根模块 `{parent_root}` 同名，但 `{missing_rel}` 目标模块不存在。",
+                        files=[parent_init, parent_root],
+                        details=f"StaticIssue: py_package_shadow_root_module | missing={module}",
+                    )
+
+        if module and symbol and self._looks_like_local_python_module(module):
+            target_files = existing_module_files(module)
+            inventory: list[str] = []
+            for candidate in target_files:
+                inventory.extend(self._python_symbol_inventory(candidate))
+            inventory = list(dict.fromkeys(inventory))
+            if inventory and symbol not in inventory:
+                match = difflib.get_close_matches(symbol, inventory, n=1, cutoff=0.72)
+                detail = f"StaticIssue: py_missing_local_export_symbol | module={module} | symbol={symbol}"
+                if match:
+                    detail = f"{detail} | closest={match[0]}"
+                add(
+                    "py_missing_local_export_symbol",
+                    f"本地模块 `{module}` 没有导出 `{symbol}`，调用方与真实符号不一致。",
+                    files=target_files,
+                    details=detail,
+                )
+
+        scan_files: list[str] = []
+        scan_seen: set[str] = set()
+        for rel in list(observation.get("related_files") or []) + self._recent_changed_files(limit=8):
+            norm = _normalize_scope_pattern(rel)
+            if not norm or not norm.endswith(".py") or norm in scan_seen:
+                continue
+            if not (self.repo_root / norm).exists():
+                continue
+            scan_seen.add(norm)
+            scan_files.append(norm)
+            if len(scan_files) >= 8:
+                break
+
+        for rel in scan_files:
+            path = self.repo_root / rel
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            imports: list[dict[str, str]] = []
+            calls_by_name: dict[str, list[dict[str, Any]]] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    resolved = self._resolve_python_import_module(importer_rel=rel, module=str(node.module or ""), level=int(node.level or 0))
+                    if not resolved:
+                        continue
+                    for alias in node.names:
+                        imported_name = str(alias.name or "").strip()
+                        if not imported_name or imported_name == "*":
+                            continue
+                        imports.append(
+                            {
+                                "module": resolved,
+                                "symbol": imported_name,
+                                "name": str(alias.asname or imported_name),
+                            }
+                        )
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    call_name = str(node.func.id or "").strip()
+                    if not call_name:
+                        continue
+                    calls_by_name.setdefault(call_name, []).append(
+                        {
+                            "lineno": int(getattr(node, "lineno", 0) or 0),
+                            "positional": len(list(node.args or [])),
+                            "keywords": [str(kw.arg) for kw in list(node.keywords or []) if getattr(kw, "arg", None)],
+                        }
+                    )
+            for item in imports:
+                resolved = str(item.get("module") or "").strip()
+                imported_name = str(item.get("symbol") or "").strip()
+                alias_name = str(item.get("name") or imported_name).strip()
+                if not resolved or not imported_name or not self._looks_like_local_python_module(resolved):
+                    continue
+                target_files = existing_module_files(resolved)
+                if not target_files:
+                    parts = [part for part in resolved.split(".") if part]
+                    if len(parts) > 1:
+                        parent_rel = "/".join(parts[:-1])
+                        parent_init = f"{parent_rel}/__init__.py"
+                        parent_root = f"{parent_rel}.py"
+                        if (self.repo_root / parent_init).exists() and (self.repo_root / parent_root).exists():
+                            add(
+                                "py_package_shadow_root_module",
+                                f"相对/包导入 `{resolved}` 指向不存在的子模块，但仓库同时存在包 `{parent_rel}` 和根模块 `{parent_root}`。",
+                                files=[rel, parent_init, parent_root],
+                                details=f"StaticIssue: py_package_shadow_root_module | importer={rel} | target={resolved}",
+                            )
+                    continue
+                inventory: list[str] = []
+                for candidate in target_files:
+                    inventory.extend(self._python_symbol_inventory(candidate))
+                inventory = list(dict.fromkeys(inventory))
+                if inventory and imported_name not in inventory:
+                    detail = f"StaticIssue: py_missing_local_export_symbol | importer={rel} | module={resolved} | symbol={imported_name}"
+                    match = difflib.get_close_matches(imported_name, inventory, n=1, cutoff=0.72)
+                    if match:
+                        detail = f"{detail} | closest={match[0]}"
+                    add(
+                        "py_missing_local_export_symbol",
+                        f"`{rel}` 从 `{resolved}` 导入 `{imported_name}`，但目标模块没有这个导出。",
+                        files=[rel, *target_files],
+                        details=detail,
+                    )
+                callsites = list(calls_by_name.get(alias_name) or [])[:3]
+                if not callsites:
+                    continue
+                signatures: dict[str, dict[str, Any]] = {}
+                for candidate in target_files:
+                    signatures.update(self._python_function_signatures(candidate))
+                sig = signatures.get(imported_name)
+                if not sig:
+                    continue
+                max_positional = sig.get("max_positional")
+                required_positional = int(sig.get("required_positional") or 0)
+                positional_names = {str(x) for x in list(sig.get("positional_names") or [])}
+                keyword_names = {str(x) for x in list(sig.get("keyword_names") or [])}
+                for call in callsites:
+                    positional = int(call.get("positional") or 0)
+                    keywords = [str(x) for x in list(call.get("keywords") or []) if str(x)]
+                    if (max_positional is not None and positional > int(max_positional)) or (
+                        positional < required_positional and not keywords
+                    ):
+                        add(
+                            "py_local_call_signature_mismatch",
+                            f"`{rel}` 调用 `{resolved}.{imported_name}` 的参数个数与实现不一致。",
+                            files=[rel, *target_files],
+                            details=(
+                                "StaticIssue: py_local_call_signature_mismatch"
+                                f" | caller={rel} | target={resolved}.{imported_name}"
+                                f" | positional={positional} | required={required_positional} | max={max_positional}"
+                            ),
+                        )
+                        break
+                    if keywords and not bool(sig.get("varkw")):
+                        unknown = [name for name in keywords if name not in positional_names and name not in keyword_names]
+                        if unknown:
+                            add(
+                                "py_local_call_signature_mismatch",
+                                f"`{rel}` 传给 `{resolved}.{imported_name}` 的关键字参数与实现签名不一致。",
+                                files=[rel, *target_files],
+                                details=(
+                                    "StaticIssue: py_local_call_signature_mismatch"
+                                    f" | caller={rel} | target={resolved}.{imported_name} | unknown_keywords={','.join(unknown[:4])}"
+                                ),
+                            )
+                            break
+        return out[:8]
 
     def _recent_scope_mismatch_paths(self, *, failure_fingerprint: str, limit: int = 16) -> list[str]:
         fp = str(failure_fingerprint or "").strip()
@@ -1468,9 +1728,7 @@ class Orchestrator:
             missing_mods = [str(m).strip() for m in re.findall(r"No module named ['\"]([^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)]
             external_missing = False
             for mod in missing_mods[:8]:
-                rel = mod.replace(".", "/").strip("/")
-                candidates = [f"{rel}.py", f"{rel}/__init__.py"]
-                if not any((self.repo_root / c).exists() for c in candidates):
+                if not self._looks_like_local_python_module(mod):
                     external_missing = True
                     break
             if external_missing or ("requirements.txt" in low) or ("pyproject.toml" in low):
@@ -1540,6 +1798,7 @@ class Orchestrator:
             failed_command=str(getattr(current_error, "failed_command", "") or "").strip(),
             related_files=related[:24],
             evidence_pointers=list(getattr(current_error, "evidence_pointers", []) or [])[:24],
+            static_issue_ids=list(getattr(current_error, "static_issue_ids", []) or [])[:8],
         )
 
     def _should_replan_tests_blocker(
@@ -1761,6 +2020,16 @@ class Orchestrator:
                 if (self.repo_root / parent_init).exists():
                     add_file(parent_init)
 
+        observation_seed = {
+            "module": module,
+            "symbol": symbol,
+            "related_files": list(related_files[:12]),
+        }
+        static_issues = self._python_static_skeleton_issues(observation=observation_seed, blocker_text=blocker_text)
+        for issue in static_issues:
+            for rel in list(issue.get("files") or [])[:8]:
+                add_file(str(rel))
+
         observation = {
             "summary": "Observed blocker for diagnoser",
             "failed_command": failed_cmd,
@@ -1770,6 +2039,7 @@ class Orchestrator:
             "recent_files": related_files[:10],
             "related_files": related_files[:12],
             "evidence_pointers": pointers[:24],
+            "static_issues": static_issues,
         }
         try:
             ptr = self.artifacts.put_json(observation, suffix=".observer.json", kind="observer").to_pointer()
@@ -1793,17 +2063,23 @@ class Orchestrator:
         traceback_location = str(obs.get("traceback_location") or self._traceback_location_from_text(text) or "").strip()
         related_files = [str(x).strip() for x in list(obs.get("related_files") or []) if str(x).strip()][:12]
         evidence_pointers = [str(x).strip() for x in list(obs.get("evidence_pointers") or []) if str(x).strip()][:24]
+        static_issues = [x for x in list(obs.get("static_issues") or []) if isinstance(x, dict)]
+        static_issue_ids = [str(x.get("id") or "").strip() for x in static_issues if str(x.get("id") or "").strip()]
+        static_summaries = [str(x.get("summary") or "").strip() for x in static_issues if str(x.get("summary") or "").strip()]
 
         error_type: packs.ErrorType = "unclassified"
         root_cause = "需要进一步诊断根因"
 
-        if "syntaxerror" in low or "invalid syntax" in low:
+        if "py_package_shadow_root_module" in static_issue_ids:
+            error_type = "wrong_import_path"
+            root_cause = "本地 Python 包/根模块骨架不一致，导入链指向了不存在的子模块。"
+        elif "syntaxerror" in low or "invalid syntax" in low:
             error_type = "syntax_error"
             root_cause = "语法错误导致解释/编译阶段直接失败。"
         elif "circular import" in low or "partially initialized module" in low:
             error_type = "circular_import"
             root_cause = "模块相互导入，解释阶段未完成初始化就访问了符号。"
-        elif "cannot import name" in low or "has no exported member" in low or "has no attribute" in low:
+        elif "py_missing_local_export_symbol" in static_issue_ids or "cannot import name" in low or "has no exported member" in low or "has no attribute" in low:
             error_type = "missing_export"
             root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
             if module:
@@ -1818,12 +2094,8 @@ class Orchestrator:
                         root_cause = f"符号 `{symbol}` 很可能已更名/大小写变化，当前模块中更接近的是 `{match[0]}`。"
         elif "no module named" in low or "module not found" in low or "cannot find module" in low:
             error_type = "missing_import"
-            local_candidates: list[str] = []
-            if module:
-                rel = module.replace(".", "/").strip("/")
-                local_candidates = [f"{rel}.py", f"{rel}/__init__.py"]
-            local_exists = any((self.repo_root / c).exists() for c in local_candidates)
-            if local_exists:
+            local_exists = self._looks_like_local_python_module(module)
+            if local_exists or "py_package_shadow_root_module" in static_issue_ids:
                 error_type = "wrong_import_path"
                 root_cause = "本地模块存在，但 import 路径/包根引用不正确。"
             else:
@@ -1839,6 +2111,18 @@ class Orchestrator:
             error_type = "config_missing"
             root_cause = "命令、配置、依赖或运行环境缺失，导致验证无法执行。"
 
+        if static_issue_ids:
+            extra = "; ".join(static_summaries[:3])
+            tagged = ", ".join([f"StaticIssue: {sid}" for sid in static_issue_ids[:4]])
+            root_cause = f"{root_cause} {extra}".strip()
+            if tagged:
+                root_cause = f"{root_cause} ({tagged})".strip()
+            for issue in static_issues[:6]:
+                for rel in list(issue.get("files") or [])[:6]:
+                    norm = _normalize_scope_pattern(str(rel))
+                    if norm and norm not in related_files:
+                        related_files.append(norm)
+
         return packs.ErrorObject(
             error_type=error_type,
             module=module,
@@ -1848,15 +2132,23 @@ class Orchestrator:
             failed_command=failed_cmd,
             related_files=related_files,
             evidence_pointers=evidence_pointers,
+            static_issue_ids=static_issue_ids[:8],
         )
 
     def _is_env_fix_candidate(self, *, error: Optional[packs.ErrorObject], blocker_text: str) -> bool:
         low = str(blocker_text or "").lower()
+        if error is not None and error.error_type in {"wrong_import_path", "missing_export", "symbol_rename", "scope_mismatch"}:
+            return False
+        if error is not None and list(getattr(error, "static_issue_ids", []) or []):
+            return False
         if error is not None and error.error_type == "config_missing":
             return True
         if any(k in low for k in ["spawn unknown", "enoent", "eacces", "command not found", "is not recognized as an internal or external command"]):
             return True
         if any(k in low for k in ["no module named", "cannot find module", "missing dependency"]):
+            module = str(getattr(error, "module", "") or "").strip()
+            if module and self._looks_like_local_python_module(module):
+                return False
             return True
         return False
 
@@ -2557,7 +2849,14 @@ class Orchestrator:
 
         return out[:limit]
 
-    def _failure_signature(self, *, report: packs.TestReport, extracted: list[str], blocker_text: str) -> str:
+    def _failure_signature(
+        self,
+        *,
+        report: packs.TestReport,
+        extracted: list[str],
+        blocker_text: str,
+        error: Optional[packs.ErrorObject] = None,
+    ) -> str:
         """
         A short, stable signature for "did we make progress?" detection.
         """
@@ -2572,6 +2871,11 @@ class Orchestrator:
             if not s2:
                 continue
             parts.append(s2[:220])
+        if error is not None:
+            for sid in list(getattr(error, "static_issue_ids", []) or [])[:4]:
+                tag = str(sid or "").strip().lower()
+                if tag:
+                    parts.append(f"static:{tag}")
         return "|".join(parts)[:1200]
 
     def _failure_fingerprint(self, *, signature: str) -> str:
@@ -2638,14 +2942,18 @@ class Orchestrator:
 
             nodeids = uniq(nodeids)[:3]
             files = uniq(files)[:3]
+            existing_items = set(
+                str(x or "").strip().replace("\\", "/")
+                for x in re.findall(r"\btests[/\\][^\s'\"()]+?\.py(?:::[A-Za-z0-9_:.\\/-]+)?\b", failed_cmd or "")
+            )
 
             extra: list[str] = []
-            if collection_smell:
+            if collection_smell and "--collect-only" not in low_cmd:
                 extra.append("--collect-only")
             if nodeids:
-                extra.extend(nodeids)
+                extra.extend([nodeid for nodeid in nodeids if nodeid not in existing_items])
             elif files:
-                extra.extend(files)
+                extra.extend([path for path in files if path not in existing_items])
 
             if extra:
                 return [failed_cmd + " " + " ".join(extra)]
@@ -3016,7 +3324,13 @@ class Orchestrator:
 
         return "\n".join(lines).strip()
 
-    def _fix_loop_autohint_for_tests(self, *, report: packs.TestReport, blocker_text: str) -> str:
+    def _fix_loop_autohint_for_tests(
+        self,
+        *,
+        report: packs.TestReport,
+        blocker_text: str,
+        error: Optional[packs.ErrorObject] = None,
+    ) -> str:
         """
         Provide a small deterministic hint for common failure patterns to help coders converge.
         This must stay short and evidence-based (point to repo snippets).
@@ -3158,7 +3472,13 @@ class Orchestrator:
                     f"请以 `{db_ptr}` 为准统一 DB 用法，让 `npm run build` 通过。"
                 )
 
-        kb = best_knowledge_snippet(text, max_lines=8, repo_root=self.repo_root)
+        kb_text = text
+        if error is not None:
+            for sid in list(getattr(error, "static_issue_ids", []) or [])[:4]:
+                sid_text = str(sid or "").strip()
+                if sid_text:
+                    kb_text = f"{kb_text}\nStaticIssue: {sid_text}"
+        kb = best_knowledge_snippet(kb_text, max_lines=8, repo_root=self.repo_root)
         return kb or ""
 
     def _incident_for_tests(
@@ -3232,7 +3552,7 @@ class Orchestrator:
         next_steps: list[str] = []
         required_caps: list[str] = []
 
-        autohint = self._fix_loop_autohint_for_tests(report=report, blocker_text=text) or None
+        autohint = self._fix_loop_autohint_for_tests(report=report, blocker_text=text, error=error_object) or None
 
         # Windows + eslint glob quoting pitfall: single quotes become literal in cmd.exe / npm.
         if ("eslint" in lower) and ("no files matching the pattern" in lower or "no matching files" in lower):
@@ -3282,6 +3602,8 @@ class Orchestrator:
             required_caps.extend(["imports"])
         elif error_object.error_type in {"typing_runtime_issue", "syntax_error"}:
             required_caps.extend(["python"])
+        if list(error_object.static_issue_ids or []):
+            diagnosis.append("静态骨架检查发现本地代码结构线索，应优先修本地包/导出/调用关系，不要误判成环境问题。")
 
         blocker_short = text
         if len(blocker_short) > 1800:
@@ -7709,7 +8031,12 @@ class Orchestrator:
                 sig_now = ""
                 fp_now = ""
                 try:
-                    sig_now = self._failure_signature(report=report, extracted=extracted[:12], blocker_text=blocker_text)
+                    sig_now = self._failure_signature(
+                        report=report,
+                        extracted=extracted[:12],
+                        blocker_text=blocker_text,
+                        error=current_error_object if blocker_source == "tests" else None,
+                    )
                     fp_now = self._failure_fingerprint(signature=sig_now) if sig_now else ""
                     if sig_now and sig_now == sig_last:
                         sig_repeat += 1
@@ -8300,7 +8627,7 @@ class Orchestrator:
                         fix_user = f"{fix_user}\n\nOpsFixPlanPointer: {fix_plan_ptr}"
 
                 if blocker_source == "tests":
-                    hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text)
+                    hint = self._fix_loop_autohint_for_tests(report=report, blocker_text=blocker_text, error=current_error_object)
                     if hint:
                         fix_user = f"{fix_user}\n\nAutoHint（硬逻辑，仅供参考，事实以 pointers 展开为准）：\n{hint}"
                     if incident is not None:
@@ -8592,6 +8919,8 @@ class Orchestrator:
                         meta["failed_command"] = current_error_object.failed_command
                     if current_error_object.traceback_location:
                         meta["traceback_location"] = current_error_object.traceback_location
+                    if list(current_error_object.static_issue_ids or []):
+                        meta["static_issue_ids"] = list(current_error_object.static_issue_ids or [])[:8]
                 if delegated_fix_cmds:
                     meta["commands"] = delegated_fix_cmds
                 if lead_work_order is not None:
@@ -8701,7 +9030,12 @@ class Orchestrator:
                         if not stage_report.passed:
                             b0 = str((stage_report.blockers or [""])[0] or "").strip()
                             extracted0 = self._extract_error_signals(b0, limit=12)
-                            sig0 = self._failure_signature(report=stage_report, extracted=extracted0, blocker_text=b0)
+                            sig0 = self._failure_signature(
+                                report=stage_report,
+                                extracted=extracted0,
+                                blocker_text=b0,
+                                error=current_error_object if blocker_source == "tests" else None,
+                            )
                             stage_fp = self._failure_fingerprint(signature=sig0)
                     except Exception:
                         stage_fp = ""

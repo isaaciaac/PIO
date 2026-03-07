@@ -301,6 +301,7 @@ class ErrorObject(BaseModel):
     failed_command: str = ""
     related_files: List[str] = Field(default_factory=list)
     evidence_pointers: List[str] = Field(default_factory=list)
+    static_issue_ids: List[str] = Field(default_factory=list)
 
 
 class IncidentPack(BaseModel):

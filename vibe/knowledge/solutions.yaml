@@ -43,3 +43,39 @@ entries:
       - "优先入口：`node_modules/.bin/hugo.cmd`（由 npm shim 调用 `hugo-bin/bin/cli.js`，再定位真实二进制）。"
       - "如果项目脚本硬编码检查 `node_modules/.bin/hugo.exe`：不要做 size>0 校验；改为优先 `.cmd`，并在 Windows 下增加 vendor 回退：`node_modules/hugo-bin/vendor/hugo.exe`。"
       - "紧急但不推荐：如果你必须满足某个脚本只认 `.bin/hugo.exe`，可把 `node_modules/hugo-bin/vendor/hugo.exe` 复制到 `node_modules/.bin/hugo.exe`（注意：重新 `npm install` 可能覆盖，最好改脚本或加 postinstall）。"
+
+  - id: py_package_shadow_root_module
+    title: Python 同名包/根模块骨架冲突（包入口指向不存在的子模块）
+    tags: ["python", "imports", "package", "skeleton"]
+    patterns:
+      - "StaticIssue:\\s*py_package_shadow_root_module"
+      - "No module named ['\"][A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*['\"]"
+      - "from \\.app import app"
+    actions:
+      - "不要先补依赖；先检查仓库是否同时存在 `foo.py` 和 `foo/__init__.py`。这通常是骨架冲突，不是环境问题。"
+      - "如果 `foo/__init__.py` 写了 `from .foo import ...`，但 `foo/foo.py` 并不存在：要么把真实入口移动到 `foo/foo.py`，要么让 `foo/__init__.py` 直接导出正确入口。"
+      - "统一导入契约：测试、包入口、实际实现文件三者必须一致；不要让测试 `from foo import app`，包却再去引用不存在的 `foo.foo`。"
+
+  - id: py_missing_local_export_symbol
+    title: Python 本地模块导出名与调用方不一致
+    tags: ["python", "imports", "exports", "symbols"]
+    patterns:
+      - "StaticIssue:\\s*py_missing_local_export_symbol"
+      - "cannot import name"
+      - "has no attribute"
+    actions:
+      - "先做静态核对：查看调用方 `from module import name` 里的 `name`，再对照目标模块真实导出符号。"
+      - "如果目标模块定义的是别名或更长名字（如 `insert_policy_rule`），优先决定是补兼容导出，还是统一修改调用方，不要两边同时猜。"
+      - "包根 `__init__.py` 也是导出面的一部分；如果调用方从包根导入，确保 `__all__` 和显式 re-export 一致。"
+
+  - id: py_local_call_signature_mismatch
+    title: Python 本地函数调用签名与实现不一致
+    tags: ["python", "api-shape", "call-signature"]
+    patterns:
+      - "StaticIssue:\\s*py_local_call_signature_mismatch"
+      - "takes \\d+ positional argument"
+      - "got an unexpected keyword argument"
+    actions:
+      - "优先检查调用点与本地函数定义的参数个数/名称是否一致，不要先归因到环境。"
+      - "如果调用方传参而实现不接收，先决定谁是权威接口：是修函数签名，还是修调用点。"
+      - "接口一旦定下来，要同步修改 README/示例/测试，避免后续 fix-loop 再把旧调用方式写回来。"
