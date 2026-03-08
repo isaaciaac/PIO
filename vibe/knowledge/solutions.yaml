@@ -79,3 +79,39 @@ entries:
       - "优先检查调用点与本地函数定义的参数个数/名称是否一致，不要先归因到环境。"
       - "如果调用方传参而实现不接收，先决定谁是权威接口：是修函数签名，还是修调用点。"
       - "接口一旦定下来，要同步修改 README/示例/测试，避免后续 fix-loop 再把旧调用方式写回来。"
+
+  - id: py_exception_taxonomy_split
+    title: Python 异常体系分裂（同名异常在多个本地模块里各自定义）
+    tags: ["python", "exceptions", "contract"]
+    patterns:
+      - "ContractIssue:\\s*py_exception_taxonomy_split"
+      - "exception_taxonomy_mismatch"
+      - "ValidationError"
+    actions:
+      - "确定唯一的异常真相源：例如统一从 `error_handler.py` 导出 `ValidationError` / `PolicyFileNotFoundError`，其余模块只 import，不再重复定义。"
+      - "不要把内置异常名（如 `FileNotFoundError`）重新绑定到自定义类；用新的业务异常名并在捕获内置异常后再转换。"
+      - "测试、API 层、解析层必须共享同一套异常类型，否则 fix-loop 会一直在‘抛错对了但类型不对’上打转。"
+
+  - id: py_engine_interface_drift
+    title: Python 引擎接口漂移（调用层和模型/引擎提供的接口不一致）
+    tags: ["python", "interfaces", "contract", "engine"]
+    patterns:
+      - "ContractIssue:\\s*py_engine_interface_drift"
+      - "engine_interface_mismatch"
+      - "has no attribute"
+    actions:
+      - "先定单一接口契约：例如 `match()` 返回 bool 还是 reason，`is_valid()` 还是 `is_effective()`，由谁作为权威。"
+      - "统一后只改一边：要么补兼容方法/别名，要么统一修改调用方；不要同时猜测多套接口。"
+      - "规则引擎、模型、API 层都要跟着同一接口走，并更新测试样例，避免下一轮又把旧接口写回来。"
+
+  - id: py_data_shape_contract_drift
+    title: Python 数据形状契约漂移（样本 JSON / 测试 / 模型解析不一致）
+    tags: ["python", "data-shape", "json", "contract"]
+    patterns:
+      - "ContractIssue:\\s*py_data_shape_contract_drift"
+      - "data_shape_mismatch"
+      - "AttributeError: 'str' object has no attribute 'get'"
+    actions:
+      - "先决定唯一数据契约：例如 `conditions` 是 `dict` 还是 `list[dict]`，样本、模型、测试只能有一个真相源。"
+      - "如果 `from_dict()` 假设字段是列表，就不要让测试数据继续传字典；反之亦然。"
+      - "统一后同步修模型解析、示例 JSON、测试断言，不要只修其中一层。"

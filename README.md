@@ -2,6 +2,12 @@
 
 本仓库提供一个可本地运行的 “vibe coding / 多代理编排” CLI：`vibe`。
 
+## 维护地图（建议先看）
+
+- `docs/system-map.md`：系统地图、模块分工、运行链路、fix-loop 维护入口
+- `docs/prompt-index.md`：所有主要 runtime prompt 的位置索引
+- `docs/maintenance-guide.md`：当前系统状态、排错顺序、agent 维护边界
+
 ## 提供的能力（MVP）
 
 - `.vibe/ledger.jsonl`：事件账本（JSONL 追加写）

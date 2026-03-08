@@ -372,3 +372,264 @@ def test_focus_commands_do_not_duplicate_collect_only_or_paths(tmp_path: Path, m
     )
     cmds = orch._focus_commands_for_test_failure(report=report, blocker_text=blocker)
     assert cmds == [failed]
+
+
+def test_observe_and_diagnose_exception_taxonomy_mismatch_marks_contract_issue(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "error_handler.py").write_text(
+        "class ValidationError(Exception):\n    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "query_parser.py").write_text(
+        "class ValidationError(Exception):\n    pass\n\n"
+        "def parse_query(text: str):\n    raise ValidationError(text)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_error_handling.py").write_text(
+        "from src.query_parser import parse_query\n\n"
+        "def test_validation_error():\n"
+        "    parse_query('bad')\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    monkeypatch.setattr(orch, "_traceback_location_from_text", lambda _text: "src/query_parser.py:4")
+    monkeypatch.setattr(
+        orch,
+        "_recent_changed_files",
+        lambda limit=10: ["src/query_parser.py", "src/error_handler.py", "tests/test_error_handling.py"],
+    )
+
+    blocker = "ValidationError: invalid query"
+    report = packs.TestReport(
+        commands=["pytest -q tests/test_error_handling.py"],
+        results=[
+            packs.TestResult(
+                command="pytest -q tests/test_error_handling.py",
+                returncode=1,
+                passed=False,
+                stdout="",
+                stderr=blocker,
+            )
+        ],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+
+    observation, observation_ptr = orch._observe_test_failure(report=report, blocker_text=blocker)
+    error = orch._diagnose_test_failure(report=report, blocker_text=blocker, observation=observation)
+
+    assert observation_ptr
+    assert observation["contract_audit_pointer"]
+    assert observation["contract_audit"]["dominant_issue_type"] == "exception_taxonomy_mismatch"
+    assert error.error_type == "exception_taxonomy_mismatch"
+    assert "py_exception_taxonomy_split" in error.contract_issue_ids
+    assert orch._is_env_fix_candidate(error=error, blocker_text=blocker) is False
+
+
+def test_observe_and_diagnose_data_shape_mismatch_marks_contract_issue(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "test_data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "models.py").write_text(
+        "class PolicyRule:\n"
+        "    def __init__(self, conditions):\n"
+        "        self.conditions = conditions\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "policy_parser.py").write_text(
+        "def load_policy(data):\n"
+        "    for cond_data in data.get('conditions', []):\n"
+        "        cond_data.get('field')\n"
+        "    return data\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_data" / "policies.json").write_text(
+        json.dumps([{"conditions": {"country": ["US"]}}]),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_policy_parser.py").write_text(
+        "from src.policy_parser import load_policy\n\n"
+        "def test_policy_shape():\n"
+        "    load_policy({'conditions': {'country': ['US']}})\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    monkeypatch.setattr(orch, "_traceback_location_from_text", lambda _text: "src/policy_parser.py:2")
+    monkeypatch.setattr(
+        orch,
+        "_recent_changed_files",
+        lambda limit=10: ["src/policy_parser.py", "src/models.py", "tests/test_policy_parser.py"],
+    )
+
+    blocker = "AttributeError: 'str' object has no attribute 'get'"
+    report = packs.TestReport(
+        commands=["pytest -q tests/test_policy_parser.py"],
+        results=[
+            packs.TestResult(
+                command="pytest -q tests/test_policy_parser.py",
+                returncode=1,
+                passed=False,
+                stdout="",
+                stderr=blocker,
+            )
+        ],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+
+    observation, _observation_ptr = orch._observe_test_failure(report=report, blocker_text=blocker)
+    error = orch._diagnose_test_failure(report=report, blocker_text=blocker, observation=observation)
+    signature = orch._failure_signature(report=report, extracted=[blocker], blocker_text=blocker, error=error)
+
+    assert observation["contract_audit"]["dominant_issue_type"] == "data_shape_mismatch"
+    assert error.error_type == "data_shape_mismatch"
+    assert "py_data_shape_contract_drift" in error.contract_issue_ids
+    assert "contract:py_data_shape_contract_drift" in signature
+    assert orch._is_env_fix_candidate(error=error, blocker_text=blocker) is False
+
+
+def test_incident_for_tests_carries_engine_contract_audit_and_prefers_integration(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "models.py").write_text(
+        "class PolicyRule:\n"
+        "    def is_effective(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "rule_engine.py").write_text(
+        "from src.models import PolicyRule\n\n"
+        "def reason(rules: list[PolicyRule]):\n"
+        "    for r in rules:\n"
+        "        if r.is_valid():\n"
+        "            return 'ok'\n"
+        "    return ''\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_rule_engine.py").write_text(
+        "from src.rule_engine import reason\n\n"
+        "def test_reason():\n"
+        "    reason([])\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    monkeypatch.setattr(orch, "_traceback_location_from_text", lambda _text: "src/rule_engine.py:5")
+    monkeypatch.setattr(
+        orch,
+        "_recent_changed_files",
+        lambda limit=10: ["src/rule_engine.py", "src/models.py", "tests/test_rule_engine.py"],
+    )
+
+    blocker = "AttributeError: 'PolicyRule' object has no attribute 'is_valid'"
+    report = packs.TestReport(
+        commands=["pytest -q tests/test_rule_engine.py"],
+        results=[
+            packs.TestResult(
+                command="pytest -q tests/test_rule_engine.py",
+                returncode=1,
+                passed=False,
+                stdout="",
+                stderr=blocker,
+            )
+        ],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+
+    incident = orch._incident_for_tests(
+        report=report,
+        blocker_text=blocker,
+        activated_agents={"router", "coder_backend", "qa", "integration_engineer"},
+    )
+
+    assert incident.contract_audit is not None
+    assert incident.contract_audit.dominant_issue_type == "engine_interface_mismatch"
+    assert incident.error_object is not None
+    assert incident.error_object.error_type == "engine_interface_mismatch"
+    assert "py_engine_interface_drift" in incident.error_object.contract_issue_ids
+    assert incident.suggested_fix_agent == "integration_engineer"
+    assert "contracts" in incident.required_capabilities
+    assert "integration" in incident.required_capabilities
+    assert any("契约审计主根因" in item for item in incident.diagnosis)
+
+
+def test_observe_and_diagnose_local_call_signature_mismatch_as_contract_drift(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "models").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "database.py").write_text(
+        "def init_db():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        "from models.database import init_db\n\n"
+        "def boot():\n"
+        "    init_db('sqlite:///demo.db')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_boot.py").write_text(
+        "from app import boot\n\n"
+        "def test_boot():\n"
+        "    boot()\n",
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(tmp_path)
+    monkeypatch.setattr(orch, "_traceback_location_from_text", lambda _text: "app.py:4")
+    monkeypatch.setattr(
+        orch,
+        "_recent_changed_files",
+        lambda limit=10: ["app.py", "models/database.py", "tests/test_boot.py"],
+    )
+
+    blocker = "TypeError: init_db() takes 0 positional arguments but 1 was given"
+    report = packs.TestReport(
+        commands=["pytest -q tests/test_boot.py"],
+        results=[
+            packs.TestResult(
+                command="pytest -q tests/test_boot.py",
+                returncode=1,
+                passed=False,
+                stdout="",
+                stderr=blocker,
+            )
+        ],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+
+    observation, _observation_ptr = orch._observe_test_failure(report=report, blocker_text=blocker)
+    error = orch._diagnose_test_failure(report=report, blocker_text=blocker, observation=observation)
+
+    assert observation["contract_audit"]["dominant_issue_type"] == "call_signature_mismatch"
+    assert error.error_type == "contract_drift"
+    assert "py_local_call_signature_mismatch" in error.contract_issue_ids
+    assert orch._is_env_fix_candidate(error=error, blocker_text=blocker) is False

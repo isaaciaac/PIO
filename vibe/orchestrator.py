@@ -37,6 +37,7 @@ from vibe.style import normalize_style, style_workflow_hint
 from vibe.text import decode_bytes
 from vibe.ownership import OwnershipDeniedError
 from vibe.knowledge.base import best_knowledge_snippet
+from vibe.orchestration import FailureDiagnosisMixin
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,10 @@ LOW_LEVEL_SCOPE_ERROR_TYPES = {
     "syntax_error",
     "config_missing",
     "scope_mismatch",
+    "exception_taxonomy_mismatch",
+    "engine_interface_mismatch",
+    "data_shape_mismatch",
+    "contract_drift",
 }
 
 
@@ -129,7 +134,7 @@ def _in_write_scope(rel: str, *, allow: list[str], deny: list[str]) -> bool:
     return True
 
 
-class Orchestrator:
+class Orchestrator(FailureDiagnosisMixin):
     def __init__(self, repo_root: Path, *, policy_mode: Optional[str] = None) -> None:
         self.repo_root = repo_root
         cfg_path = repo_root / ".vibe" / "vibe.yaml"
@@ -1688,7 +1693,16 @@ class Orchestrator:
         for rel in self._module_candidate_paths(str(getattr(error, "module", "") or "").strip()):
             add_allow(rel)
 
-        if error_type in {"missing_import", "missing_export", "symbol_rename", "wrong_import_path"}:
+        if error_type in {
+            "missing_import",
+            "missing_export",
+            "symbol_rename",
+            "wrong_import_path",
+            "exception_taxonomy_mismatch",
+            "engine_interface_mismatch",
+            "data_shape_mismatch",
+            "contract_drift",
+        }:
             scope_level = "L2"
             for rel in self._module_candidate_paths(str(getattr(error, "module", "") or "").strip()):
                 add_allow(rel)
@@ -1799,6 +1813,7 @@ class Orchestrator:
             related_files=related[:24],
             evidence_pointers=list(getattr(current_error, "evidence_pointers", []) or [])[:24],
             static_issue_ids=list(getattr(current_error, "static_issue_ids", []) or [])[:8],
+            contract_issue_ids=list(getattr(current_error, "contract_issue_ids", []) or [])[:8],
         )
 
     def _should_replan_tests_blocker(
@@ -1950,102 +1965,7 @@ class Orchestrator:
         return out[:limit]
 
     def _observe_test_failure(self, *, report: packs.TestReport, blocker_text: str) -> tuple[dict[str, Any], Optional[str]]:
-        failed_cmd = self._failed_command_from_report(report)
-        traceback_location = self._traceback_location_from_text(blocker_text)
-        related_files: list[str] = []
-        pointers: list[str] = [str(p).strip() for p in (report.pointers or []) if str(p).strip()]
-
-        def add_file(rel: str) -> None:
-            rp = str(rel or "").replace("\\", "/").lstrip("/")
-            if not rp or rp.startswith(".vibe/") or rp.startswith(".git/") or rp in related_files:
-                return
-            related_files.append(rp)
-            try:
-                rr = self.toolbox.read_file(agent_id="router", path=rp, start_line=1, end_line=220)
-                if rr.pointer and rr.pointer not in pointers:
-                    pointers.append(rr.pointer)
-            except Exception:
-                pass
-
-        for rel in self._recent_changed_files(limit=10):
-            add_file(rel)
-
-        if traceback_location:
-            add_file(traceback_location.split(":", 1)[0])
-
-        for m in re.finditer(r"(?P<file>[A-Za-z0-9_./\\-]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error", blocker_text or "", flags=re.IGNORECASE):
-            add_file(m.group("file"))
-            if len(related_files) >= 10:
-                break
-
-        module = ""
-        symbol = ""
-        try:
-            m = re.search(r"cannot import name ['\"](?P<sym>[^'\"]+)['\"] from ['\"](?P<mod>[^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)
-            if m:
-                module = str(m.group("mod") or "").strip()
-                symbol = str(m.group("sym") or "").strip()
-        except Exception:
-            module = ""
-            symbol = ""
-        if not module:
-            try:
-                m = re.search(r"No module named ['\"](?P<mod>[^'\"]+)['\"]", blocker_text or "", flags=re.IGNORECASE)
-                if m:
-                    module = str(m.group("mod") or "").strip()
-            except Exception:
-                module = ""
-        if not symbol:
-            try:
-                m = re.search(r"name ['\"](?P<sym>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined", blocker_text or "", flags=re.IGNORECASE)
-                if m:
-                    symbol = str(m.group("sym") or "").strip()
-            except Exception:
-                symbol = ""
-        if not symbol:
-            try:
-                m = re.search(r"has no attribute ['\"](?P<sym>[A-Za-z_][A-Za-z0-9_]*)['\"]", blocker_text or "", flags=re.IGNORECASE)
-                if m:
-                    symbol = str(m.group("sym") or "").strip()
-            except Exception:
-                symbol = ""
-
-        if module:
-            rel = module.replace(".", "/").strip("/")
-            for candidate in [f"{rel}.py", f"{rel}/__init__.py"]:
-                if (self.repo_root / candidate).exists():
-                    add_file(candidate)
-            if "/" in rel:
-                parent_init = f"{'/'.join(rel.split('/')[:-1])}/__init__.py"
-                if (self.repo_root / parent_init).exists():
-                    add_file(parent_init)
-
-        observation_seed = {
-            "module": module,
-            "symbol": symbol,
-            "related_files": list(related_files[:12]),
-        }
-        static_issues = self._python_static_skeleton_issues(observation=observation_seed, blocker_text=blocker_text)
-        for issue in static_issues:
-            for rel in list(issue.get("files") or [])[:8]:
-                add_file(str(rel))
-
-        observation = {
-            "summary": "Observed blocker for diagnoser",
-            "failed_command": failed_cmd,
-            "traceback_location": traceback_location,
-            "module": module,
-            "symbol": symbol,
-            "recent_files": related_files[:10],
-            "related_files": related_files[:12],
-            "evidence_pointers": pointers[:24],
-            "static_issues": static_issues,
-        }
-        try:
-            ptr = self.artifacts.put_json(observation, suffix=".observer.json", kind="observer").to_pointer()
-        except Exception:
-            ptr = None
-        return observation, ptr
+        return FailureDiagnosisMixin._observe_test_failure(self, report=report, blocker_text=blocker_text)
 
     def _diagnose_test_failure(
         self,
@@ -2054,103 +1974,15 @@ class Orchestrator:
         blocker_text: str,
         observation: Optional[dict[str, Any]] = None,
     ) -> packs.ErrorObject:
-        text = str(blocker_text or "").strip()
-        low = text.lower()
-        obs = observation or {}
-        failed_cmd = str(obs.get("failed_command") or self._failed_command_from_report(report) or "").strip()
-        module = str(obs.get("module") or "").strip()
-        symbol = str(obs.get("symbol") or "").strip()
-        traceback_location = str(obs.get("traceback_location") or self._traceback_location_from_text(text) or "").strip()
-        related_files = [str(x).strip() for x in list(obs.get("related_files") or []) if str(x).strip()][:12]
-        evidence_pointers = [str(x).strip() for x in list(obs.get("evidence_pointers") or []) if str(x).strip()][:24]
-        static_issues = [x for x in list(obs.get("static_issues") or []) if isinstance(x, dict)]
-        static_issue_ids = [str(x.get("id") or "").strip() for x in static_issues if str(x.get("id") or "").strip()]
-        static_summaries = [str(x.get("summary") or "").strip() for x in static_issues if str(x.get("summary") or "").strip()]
-
-        error_type: packs.ErrorType = "unclassified"
-        root_cause = "需要进一步诊断根因"
-
-        if "py_package_shadow_root_module" in static_issue_ids:
-            error_type = "wrong_import_path"
-            root_cause = "本地 Python 包/根模块骨架不一致，导入链指向了不存在的子模块。"
-        elif "syntaxerror" in low or "invalid syntax" in low:
-            error_type = "syntax_error"
-            root_cause = "语法错误导致解释/编译阶段直接失败。"
-        elif "circular import" in low or "partially initialized module" in low:
-            error_type = "circular_import"
-            root_cause = "模块相互导入，解释阶段未完成初始化就访问了符号。"
-        elif "py_missing_local_export_symbol" in static_issue_ids or "cannot import name" in low or "has no exported member" in low or "has no attribute" in low:
-            error_type = "missing_export"
-            root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
-            if module:
-                rel = module.replace(".", "/").strip("/")
-                inventory: list[str] = []
-                for candidate in [f"{rel}.py", f"{rel}/__init__.py"]:
-                    inventory.extend(self._python_symbol_inventory(candidate))
-                if symbol and inventory and symbol not in inventory:
-                    match = difflib.get_close_matches(symbol, inventory, n=1, cutoff=0.72)
-                    if match:
-                        error_type = "symbol_rename"
-                        root_cause = f"符号 `{symbol}` 很可能已更名/大小写变化，当前模块中更接近的是 `{match[0]}`。"
-        elif "no module named" in low or "module not found" in low or "cannot find module" in low:
-            error_type = "missing_import"
-            local_exists = self._looks_like_local_python_module(module)
-            if local_exists or "py_package_shadow_root_module" in static_issue_ids:
-                error_type = "wrong_import_path"
-                root_cause = "本地模块存在，但 import 路径/包根引用不正确。"
-            else:
-                error_type = "config_missing"
-                root_cause = "缺少第三方依赖或环境未安装对应包/CLI。"
-        elif "nameerror" in low or ("not defined" in low and any(k in low for k in ["typing", "dict", "list", "any", "optional"])):
-            error_type = "typing_runtime_issue"
-            root_cause = "运行时/导入时缺少 typing 符号或类型别名定义。"
-        elif "assertionerror" in low or re.search(r"(^|\n)\s*e\s+assert\b", text, flags=re.IGNORECASE):
-            error_type = "test_assert_mismatch"
-            root_cause = "目标行为与测试断言不一致，需核对预期与实现。"
-        elif any(k in low for k in ["command not found", "is not recognized as an internal or external command", "enoent", "eacces", "spawn unknown", "missing config", "no such file or directory"]):
-            error_type = "config_missing"
-            root_cause = "命令、配置、依赖或运行环境缺失，导致验证无法执行。"
-
-        if static_issue_ids:
-            extra = "; ".join(static_summaries[:3])
-            tagged = ", ".join([f"StaticIssue: {sid}" for sid in static_issue_ids[:4]])
-            root_cause = f"{root_cause} {extra}".strip()
-            if tagged:
-                root_cause = f"{root_cause} ({tagged})".strip()
-            for issue in static_issues[:6]:
-                for rel in list(issue.get("files") or [])[:6]:
-                    norm = _normalize_scope_pattern(str(rel))
-                    if norm and norm not in related_files:
-                        related_files.append(norm)
-
-        return packs.ErrorObject(
-            error_type=error_type,
-            module=module,
-            symbol=symbol,
-            traceback_location=traceback_location,
-            suspected_root_cause=root_cause,
-            failed_command=failed_cmd,
-            related_files=related_files,
-            evidence_pointers=evidence_pointers,
-            static_issue_ids=static_issue_ids[:8],
+        return FailureDiagnosisMixin._diagnose_test_failure(
+            self,
+            report=report,
+            blocker_text=blocker_text,
+            observation=observation,
         )
 
     def _is_env_fix_candidate(self, *, error: Optional[packs.ErrorObject], blocker_text: str) -> bool:
-        low = str(blocker_text or "").lower()
-        if error is not None and error.error_type in {"wrong_import_path", "missing_export", "symbol_rename", "scope_mismatch"}:
-            return False
-        if error is not None and list(getattr(error, "static_issue_ids", []) or []):
-            return False
-        if error is not None and error.error_type == "config_missing":
-            return True
-        if any(k in low for k in ["spawn unknown", "enoent", "eacces", "command not found", "is not recognized as an internal or external command"]):
-            return True
-        if any(k in low for k in ["no module named", "cannot find module", "missing dependency"]):
-            module = str(getattr(error, "module", "") or "").strip()
-            if module and self._looks_like_local_python_module(module):
-                return False
-            return True
-        return False
+        return FailureDiagnosisMixin._is_env_fix_candidate(self, error=error, blocker_text=blocker_text)
 
     def _env_remediation_commands_for_tests(
         self,
@@ -2160,46 +1992,13 @@ class Orchestrator:
         error: Optional[packs.ErrorObject],
         envspec_commands: Optional[list[str]] = None,
     ) -> list[str]:
-        cmds: list[str] = []
-        seen: set[str] = set()
-        low = str(blocker_text or "").lower()
-
-        def add(cmd: str) -> None:
-            s = str(cmd or "").strip()
-            if not s or s in seen:
-                return
-            seen.add(s)
-            cmds.append(s)
-
-        failed_cmd = ""
-        try:
-            failed_cmd = str(error.failed_command if error is not None else self._failed_command_from_report(report) or "").strip()
-        except Exception:
-            failed_cmd = ""
-        cmd_dir = self._shell_cd_dir(failed_cmd or "")
-
-        py_cmd = bool(re.search(r"\b(?:python|pytest|uvicorn|gunicorn|flask)\b", failed_cmd.lower()))
-        node_cmd = bool(re.search(r"\b(?:npm|pnpm|yarn|npx)\b", failed_cmd.lower()))
-
-        if self._python_setup_commands() and (py_cmd or (error is not None and error.error_type == "config_missing")):
-            for cmd in self._python_setup_commands()[:2]:
-                add(cmd)
-
-        node_dir = cmd_dir
-        if node_dir == Path(".") and self._find_node_project_dirs():
-            node_dir = self._find_node_project_dirs()[0]
-        if node_cmd or any(k in low for k in ["node_modules", ".bin", "npm ", "pnpm ", "yarn ", "hugo", "vite", "eslint", "tsc"]):
-            pkg_json = self.repo_root / node_dir / "package.json"
-            if pkg_json.exists():
-                pm = self._package_manager(node_dir)
-                add(self._shell_cmd_in_dir(rel_dir=node_dir, cmd=f"{pm} install"))
-
-        for cmd in list(envspec_commands or [])[:4]:
-            l = str(cmd or "").lower()
-            if any(token in l for token in [" install", "pip install", "npm install", "pnpm install", "yarn install"]):
-                add(cmd)
-
-        return cmds[:4]
+        return FailureDiagnosisMixin._env_remediation_commands_for_tests(
+            self,
+            report=report,
+            blocker_text=blocker_text,
+            error=error,
+            envspec_commands=envspec_commands,
+        )
 
     def _compile_preflight_commands_for_tests(
         self,
@@ -2209,25 +2008,13 @@ class Orchestrator:
         error: Optional[packs.ErrorObject],
         focus_commands: list[str],
     ) -> list[str]:
-        low = str(blocker_text or "").lower()
-        failed_cmd = str(error.failed_command if error is not None else self._failed_command_from_report(report) or "").strip()
-        out: list[str] = []
-        seen: set[str] = set()
-
-        def add(cmd: str) -> None:
-            s = str(cmd or "").strip()
-            if not s or s in seen or s in focus_commands or s == failed_cmd:
-                return
-            seen.add(s)
-            out.append(s)
-
-        smoke_cmds = [str(c).strip() for c in self._determine_test_commands(profile="smoke") if str(c).strip()]
-        for cmd in smoke_cmds[:4]:
-            if error is not None and error.error_type in {"missing_import", "missing_export", "symbol_rename", "wrong_import_path", "circular_import", "typing_runtime_issue", "syntax_error", "config_missing"}:
-                add(cmd)
-            elif any(k in low for k in ["syntaxerror", "error ts", "typescript", "tsc", "compileall"]):
-                add(cmd)
-        return out[:4]
+        return FailureDiagnosisMixin._compile_preflight_commands_for_tests(
+            self,
+            report=report,
+            blocker_text=blocker_text,
+            error=error,
+            focus_commands=focus_commands,
+        )
 
     def _package_manager(self, node_dir: Path) -> str:
         root = self.repo_root
@@ -2857,26 +2644,13 @@ class Orchestrator:
         blocker_text: str,
         error: Optional[packs.ErrorObject] = None,
     ) -> str:
-        """
-        A short, stable signature for "did we make progress?" detection.
-        """
-
-        cmd = self._failed_command_from_report(report)
-        parts: list[str] = []
-        if cmd:
-            parts.append("cmd:" + " ".join(cmd.strip().split())[:220].lower())
-        sigs = extracted or self._extract_error_signals(blocker_text, limit=10)
-        for s in [str(x or "") for x in sigs[:10]]:
-            s2 = " ".join(s.strip().split()).lower()
-            if not s2:
-                continue
-            parts.append(s2[:220])
-        if error is not None:
-            for sid in list(getattr(error, "static_issue_ids", []) or [])[:4]:
-                tag = str(sid or "").strip().lower()
-                if tag:
-                    parts.append(f"static:{tag}")
-        return "|".join(parts)[:1200]
+        return FailureDiagnosisMixin._failure_signature(
+            self,
+            report=report,
+            extracted=extracted,
+            blocker_text=blocker_text,
+            error=error,
+        )
 
     def _failure_fingerprint(self, *, signature: str) -> str:
         """
@@ -3478,6 +3252,10 @@ class Orchestrator:
                 sid_text = str(sid or "").strip()
                 if sid_text:
                     kb_text = f"{kb_text}\nStaticIssue: {sid_text}"
+            for cid in list(getattr(error, "contract_issue_ids", []) or [])[:4]:
+                cid_text = str(cid or "").strip()
+                if cid_text:
+                    kb_text = f"{kb_text}\nContractIssue: {cid_text}"
         kb = best_knowledge_snippet(kb_text, max_lines=8, repo_root=self.repo_root)
         return kb or ""
 
@@ -3499,6 +3277,14 @@ class Orchestrator:
         lower = text.lower()
         observation, observation_ptr = self._observe_test_failure(report=report, blocker_text=text)
         error_object = self._diagnose_test_failure(report=report, blocker_text=text, observation=observation)
+        contract_audit: Optional[packs.ContractAuditReport] = None
+        try:
+            raw_contract = observation.get("contract_audit") if isinstance(observation, dict) else None
+            if isinstance(raw_contract, dict):
+                contract_audit = packs.ContractAuditReport.model_validate(raw_contract)
+        except Exception:
+            contract_audit = None
+        contract_audit_ptr = str(observation.get("contract_audit_pointer") or "").strip() if isinstance(observation, dict) else ""
 
         failed_cmd = ""
         cmd_dir = Path(".")
@@ -3525,6 +3311,8 @@ class Orchestrator:
             s = str(p).strip()
             if s and s not in evidence:
                 evidence.append(s)
+        if contract_audit_ptr and contract_audit_ptr not in evidence:
+            evidence.append(contract_audit_ptr)
 
         # Add quick pointers to the local node workspace config when present.
         try:
@@ -3602,6 +3390,15 @@ class Orchestrator:
             required_caps.extend(["imports"])
         elif error_object.error_type in {"typing_runtime_issue", "syntax_error"}:
             required_caps.extend(["python"])
+        elif error_object.error_type in {"exception_taxonomy_mismatch", "engine_interface_mismatch", "data_shape_mismatch", "contract_drift"}:
+            required_caps.extend(["contracts", "integration", "python"])
+            if contract_audit is not None and contract_audit.primary_root_cause:
+                diagnosis.append(f"契约审计主根因：{contract_audit.primary_root_cause}")
+            else:
+                diagnosis.append("契约审计发现本地模块接口/数据形状/异常体系不一致，应先统一契约，再继续修实现。")
+            next_steps.append("优先统一模型、异常或引擎接口的唯一契约，然后重跑 compile/focus/full 分层验证。")
+            if "integration_engineer" in activated_agents:
+                suggested_fix_agent = "integration_engineer"
         if list(error_object.static_issue_ids or []):
             diagnosis.append("静态骨架检查发现本地代码结构线索，应优先修本地包/导出/调用关系，不要误判成环境问题。")
 
@@ -3631,6 +3428,7 @@ class Orchestrator:
             suggested_fix_agent=suggested_fix_agent,
             autohint=autohint,
             error_object=error_object,
+            contract_audit=contract_audit,
         )
 
     def _auto_code_change_for_test_failure(
@@ -8051,6 +7849,21 @@ class Orchestrator:
                 stagnating = sig_repeat >= 1
                 stagnating_hard = sig_repeat >= 2
 
+                adaptive_paths_clean: list[str] = []
+                try:
+                    adaptive_paths = list(adaptive_scope_paths.get(scope_key, set()))
+                    if fp_now:
+                        adaptive_paths.extend(self._recent_scope_mismatch_paths(failure_fingerprint=fp_now, limit=12))
+                    adaptive_seen: set[str] = set()
+                    for rel in adaptive_paths:
+                        norm = _normalize_scope_pattern(str(rel))
+                        if not norm or norm in adaptive_seen:
+                            continue
+                        adaptive_seen.add(norm)
+                        adaptive_paths_clean.append(norm)
+                except Exception:
+                    adaptive_paths_clean = []
+
                 stagnation_help: str = ""
                 stagnation_ptrs: list[str] = []
                 if stagnating and blocker_source == "tests" and (not mock_mode):
@@ -8297,6 +8110,101 @@ class Orchestrator:
                             ),
                             activated_agents=activated_agents,
                         )
+                    except Exception:
+                        pass
+
+                # If a previous attempt was blocked by write scope (same fingerprint), do not
+                # let the router silently fall back to a coder without a convergent work order.
+                # Synthesize a minimal scope-unblock work order so the fix agent can actually
+                # touch the denied path(s) and related files.
+                if blocker_source == "tests" and lead_work_order is None and adaptive_paths_clean:
+                    try:
+                        can_integrate = (
+                            integrator is not None
+                            and ("integration_engineer" in self.config.agents)
+                            and bool(getattr(self.config.agents.get("integration_engineer"), "enabled", True))
+                        )
+                    except Exception:
+                        can_integrate = False
+                    if can_integrate and "integration_engineer" not in available_agents:
+                        try:
+                            can_call = mock_mode or self._api_key_available_for_agent("integration_engineer")
+                        except Exception:
+                            can_call = False
+                        if can_call:
+                            try:
+                                activate_agent("integration_engineer", reason="gate:scope_unblock")
+                                available_agents.add("integration_engineer")
+                            except Exception:
+                                pass
+                    synth_owner = "integration_engineer" if (integrator is not None and "integration_engineer" in available_agents) else fix_coder_id
+                    base_allow, base_deny = _scope_for_fix_loop() if impl_blueprint is not None else ([], [])
+                    synth_allow: list[str] = list(base_allow or [])
+                    for rel in adaptive_paths_clean[:24]:
+                        if rel not in synth_allow:
+                            synth_allow.append(rel)
+                    lead_work_order = packs.FixWorkOrder(
+                        owner=synth_owner,
+                        summary="Scope unblock: expand repair arena based on prior WriteScopeDeniedError",
+                        reason="Previous fix attempt was blocked by write scope; expanding allowed globs is required to proceed.",
+                        allowed_write_globs=synth_allow[:32],
+                        denied_write_globs=list(base_deny or [])[:32],
+                        files_to_check=list(adaptive_paths_clean)[:12],
+                        commands=[],
+                        verify_commands=[],
+                        stop_if=["Write scope denied repeats"],
+                        pointers=[],
+                    )
+                    lead_work_order_owner = synth_owner
+                    lead_work_order_ptrs = []
+                    if synth_owner in lead_fix_agents:
+                        fix_coder_id = synth_owner
+                        fix_coder = (
+                            coder_frontend
+                            if fix_coder_id == "coder_frontend" and coder_frontend is not None
+                            else integrator
+                            if fix_coder_id == "integration_engineer" and integrator is not None
+                            else coder_backend
+                        )
+                    try:
+                        self._append_guarded(
+                            event=new_event(
+                                agent="router",
+                                type="STATE_TRANSITION",
+                                summary=f"Fix-loop {loop}: synthesized work order {lead_work_order_owner}",
+                                branch_id=self.branch_id,
+                                pointers=[],
+                                meta={
+                                    "phase": "fix_loop",
+                                    "loop": loop,
+                                    "action": "synthesize_scope_unblock",
+                                    "owner": lead_work_order_owner,
+                                    "route_level": route_level,
+                                    "style": resolved_style,
+                                    "failure_fingerprint": fp_now,
+                                },
+                            ),
+                            activated_agents=activated_agents,
+                        )
+                    except Exception:
+                        pass
+                elif (
+                    blocker_source == "tests"
+                    and lead_work_order is not None
+                    and lead_work_order_owner in lead_fix_agents
+                    and adaptive_paths_clean
+                ):
+                    # Align the work order scope with the adaptive repair arena so the coder sees
+                    # what the system will actually allow.
+                    try:
+                        cur = [str(x).strip() for x in list(getattr(lead_work_order, "allowed_write_globs", []) or []) if str(x).strip()]
+                    except Exception:
+                        cur = []
+                    for rel in adaptive_paths_clean[:24]:
+                        if rel not in cur:
+                            cur.append(rel)
+                    try:
+                        lead_work_order.allowed_write_globs = cur[:32]
                     except Exception:
                         pass
 
@@ -8712,17 +8620,6 @@ class Orchestrator:
                     blocker_text=blocker_text,
                     error=current_error_object,
                 )
-                adaptive_paths = list(adaptive_scope_paths.get(scope_key, set()))
-                if fp_now:
-                    adaptive_paths.extend(self._recent_scope_mismatch_paths(failure_fingerprint=fp_now, limit=12))
-                adaptive_seen: set[str] = set()
-                adaptive_paths_clean: list[str] = []
-                for rel in adaptive_paths:
-                    norm = _normalize_scope_pattern(str(rel))
-                    if not norm or norm in adaptive_seen:
-                        continue
-                    adaptive_seen.add(norm)
-                    adaptive_paths_clean.append(norm)
                 if adaptive_paths_clean:
                     for rel in adaptive_paths_clean:
                         if rel not in fix_allow:
@@ -8864,6 +8761,15 @@ class Orchestrator:
                     scope_mismatch_counts[mismatch_key] = int(scope_mismatch_counts.get(mismatch_key, 0)) + 1
                     target_scope = adaptive_scope_paths.setdefault(scope_key or mismatch_key, set())
                     target_scope.add(_normalize_scope_pattern(e.path))
+                    try:
+                        parent = _normalize_scope_pattern(Path(_normalize_scope_pattern(e.path)).parent.as_posix())
+                        if parent and parent not in {".", ""}:
+                            # For tests, allow the whole tests/ subtree; otherwise expand to the parent dir
+                            # after the same path is blocked twice to avoid repeated scope thrash.
+                            if str(e.path or "").replace("\\", "/").startswith("tests/") or scope_mismatch_counts[mismatch_key] >= 2:
+                                target_scope.add(parent)
+                    except Exception:
+                        pass
                     for rel in list(getattr(current_error_object, "related_files", []) or [])[:24]:
                         norm = _normalize_scope_pattern(str(rel))
                         if norm:

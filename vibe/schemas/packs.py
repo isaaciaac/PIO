@@ -14,6 +14,10 @@ ErrorType = Literal[
     "circular_import",
     "typing_runtime_issue",
     "test_assert_mismatch",
+    "exception_taxonomy_mismatch",
+    "engine_interface_mismatch",
+    "data_shape_mismatch",
+    "contract_drift",
     "config_missing",
     "scope_mismatch",
     "syntax_error",
@@ -302,6 +306,37 @@ class ErrorObject(BaseModel):
     related_files: List[str] = Field(default_factory=list)
     evidence_pointers: List[str] = Field(default_factory=list)
     static_issue_ids: List[str] = Field(default_factory=list)
+    contract_issue_ids: List[str] = Field(default_factory=list)
+
+
+ContractIssueType = Literal[
+    "package_shadow",
+    "missing_export",
+    "call_signature_mismatch",
+    "exception_taxonomy_mismatch",
+    "engine_interface_mismatch",
+    "data_shape_mismatch",
+    "contract_drift",
+]
+
+
+class ContractIssue(BaseModel):
+    issue_type: ContractIssueType
+    issue_id: str
+    summary: str
+    files: List[str] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)
+    suspected_owner: str = ""
+    confidence: Literal["high", "medium", "low"] = "medium"
+
+
+class ContractAuditReport(BaseModel):
+    summary: str
+    primary_root_cause: str = ""
+    dominant_issue_type: str = ""
+    issues: List[ContractIssue] = Field(default_factory=list)
+    affected_files: List[str] = Field(default_factory=list)
+    pointers: List[str] = Field(default_factory=list)
 
 
 class IncidentPack(BaseModel):
@@ -322,6 +357,7 @@ class IncidentPack(BaseModel):
     suggested_fix_agent: Optional[str] = None
     autohint: Optional[str] = None
     error_object: Optional[ErrorObject] = None
+    contract_audit: Optional[ContractAuditReport] = None
 
 
 class FixPlanPack(BaseModel):
