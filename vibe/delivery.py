@@ -122,6 +122,49 @@ def augment_plan(
 
     cap = max(1, int(max_tasks))
 
+    def _bucket(t: packs.PlanTask) -> tuple[int, int]:
+        # Stable bucketing to reduce "QA drives progress" churn:
+        # 1) bootstrap/skeleton, 2) core impl, 3) integration/contracts, 4) tests/qa-ish, 5) docs/release.
+        title = (t.title or "").strip()
+        desc = (t.description or "").strip()
+        blob = f"{title}\n{desc}".lower()
+
+        # Bootstrap/skeleton/entrypoints/config/deps come first.
+        if any(
+            k in blob
+            for k in [
+                "工程骨架",
+                "bootstrap",
+                "scaffold",
+                "初始化",
+                "依赖",
+                "requirements",
+                "pyproject",
+                "package.json",
+                "tsconfig",
+                "eslint",
+                "vite",
+                "entry",
+                "入口",
+            ]
+        ):
+            return (0, 0)
+
+        # Integration alignment (frontend/backend/contracts) before tests.
+        if any(k in blob for k in ["integration", "联调", "对齐", "契约", "contract", "schema", "openapi"]):
+            return (2, 0)
+
+        # Tests and QA-ish items should be late.
+        if any(k in blob for k in ["测试", "test", "pytest", "vitest", "jest", "lint", "ci", "检查"]):
+            return (3, 0)
+
+        # Docs/handoff at the end.
+        if any(k in blob for k in ["readme", "文档", "交付", "changelog", "release", "runbook"]):
+            return (4, 0)
+
+        # Default: core implementation.
+        return (1, 0)
+
     if not has_hint(["readme", "运行", "启动", "how to run", "getting started"]):
         if len(tasks) < cap:
             tasks.append(
@@ -156,6 +199,11 @@ def augment_plan(
                 update={"description": (last.description or "").rstrip() + "\n\n数据源补充：实现可配置真实数据源；失败回退 mock，并标注 source。"}
             )
             tasks[-1] = last
+
+    # Deterministic ordering: keep the plan runnable early, keep QA late.
+    indexed = list(enumerate(tasks))
+    indexed.sort(key=lambda it: (_bucket(it[1])[0], it[0]))
+    tasks = [t for _i, t in indexed]
 
     out.tasks = tasks[:cap]
     return out

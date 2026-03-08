@@ -259,6 +259,9 @@ flowchart TD
 - `.vibe/checkpoints.json`
   - checkpoint 元数据
   - 恢复 / resume / replan 入口
+  - 行为配置：
+    - `behavior.auto_replan_continue`：当出现 `replan_required` 时自动创建 checkpoint 并在同一轮 `vibe run` 里继续（避免让用户手动 rerun）
+    - `behavior.max_replans_per_run`：单次 `vibe run` 内最多自动 replan 次数（硬上限）
 
 - `.vibe/artifacts/sha256/...`
   - 所有真实命令输出、patch、incident、fixplan、vision、chat archive
@@ -554,6 +557,13 @@ flowchart TD
 
 - `vibe/orchestrator.py:7186` 一带开始
 - `vibe/orchestrator.py:8053` 分层验证
+
+#### PlanTask 分段验证（提高第一次成功率）
+
+为了减少“先生成一堆 → 最后 QA 一次性爆炸（26 测试只过 3 个）→ fix-loop 长时间修补”的低效模式，系统支持在 **每个 plan task 落盘后**先跑一轮轻量验证：
+
+- 配置：`.vibe/vibe.yaml -> behavior.plan_task_verify_profile = off|smoke|unit`（默认 `smoke`）
+- 行为：每个 plan task 执行后运行 smoke/unit；一旦失败就**停止继续实现后续任务**，让 QA/fix-loop 先收敛到首因再继续。
 
 ### 11.3 当前 fix-loop 的真实角色分工
 

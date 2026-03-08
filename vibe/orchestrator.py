@@ -591,6 +591,15 @@ class Orchestrator(FailureDiagnosisMixin):
                     "工程骨架提示：当前仓库未检测到可运行的 build/lint/test 配置（如 package.json/pyproject.toml）。"
                     "若目标是从 0 搭建项目，请优先生成工程骨架与最小可验证命令，再继续实现功能。"
                 )
+            else:
+                # Even with language markers, a repo may still have no runnable scripts/tests.
+                # Use the same smoke heuristics QA uses to emit a deterministic bootstrap hint.
+                smoke_cmds = self._determine_test_commands(profile="smoke")
+                if not smoke_cmds:
+                    ctx.constraints.append(
+                        "工程骨架提示：当前仓库虽检测到语言/配置标记，但未检测到可执行的 smoke 验证命令（build/lint/compile）。"
+                        "请优先补齐最小工程骨架（package.json/pyproject/脚本/入口）与 smoke 命令，再继续实现功能。"
+                    )
         except Exception:
             pass
 
@@ -5316,6 +5325,7 @@ class Orchestrator(FailureDiagnosisMixin):
         route: Optional[str] = None,
         style: Optional[str] = None,
         resume: bool = True,
+        _replan_depth: int = 0,
     ) -> RunResult:
         task_evt = self._find_task(task_id)
         task_text = str(task_evt.meta.get("text") or task_evt.summary)
@@ -6855,6 +6865,7 @@ class Orchestrator(FailureDiagnosisMixin):
                 "- For TypeScript repos, aim to make `npm run build` pass in affected node project(s).\n"
                 "- If you add a Vite app, include `index.html` at that app root.\n"
                 "- If you add/enable ESLint, include an ESLint config and required TS parser/plugins.\n"
+                "- Do not add/modify tests unless this PlanTask explicitly mentions tests/QA/验证（否则先把工程与核心功能跑通，再由后续任务补测试）。\n"
                 "- NPM scripts must be Windows-compatible: avoid single quotes around globs; prefer double quotes.\n"
                 "- Windows/Node: do NOT hardcode or spawn `node_modules/.bin/<tool>.exe` (may be a 0-byte shim). Prefer `npm run <script>` or `<tool>.cmd` on Windows.\n"
                 "- For env vars in scripts (e.g. NODE_ENV=production), prefer `cross-env` for cross-platform.\n"
@@ -6891,6 +6902,15 @@ class Orchestrator(FailureDiagnosisMixin):
         # continue from IMPLEMENT on the next run.
         plan_changes: list[packs.CodeChange] = []
         all_write_pointers: list[str] = []
+        forced_report: Optional[packs.TestReport] = None
+        forced_qa_profile: Optional[str] = None
+        forced_qa_commands: list[str] = []
+
+        # Improve first-pass success: verify after each plan task (smoke/unit) so we don't
+        # accumulate many independent failures and then discover them all at the final QA gate.
+        verify_profile_cfg = str(getattr(self.config.behavior, "plan_task_verify_profile", "smoke") or "smoke").strip().lower()
+        if verify_profile_cfg not in {"off", "smoke", "unit"}:
+            verify_profile_cfg = "smoke"
 
         if not resume_skip_implement:
             code_agents = {"coder_backend", "coder_frontend", "integration_engineer"}
@@ -6979,6 +6999,84 @@ class Orchestrator(FailureDiagnosisMixin):
                     ctx, ctx_excerpts = self._build_context_packet(task_evt=task_evt)
                 except Exception:
                     pass
+
+                # Per-task verification gate (deterministic, fast). If it fails, stop implementing
+                # further tasks and let QA/fix-loop converge on the first causal failure.
+                if (
+                    forced_report is None
+                    and (not mock_mode)
+                    and route_level != "L0"
+                    and verify_profile_cfg != "off"
+                    and task_change.kind != "noop"
+                    and list(task_change.files_changed or [])
+                ):
+                    try:
+                        blob = f"{t.title}\n{t.description}".lower()
+                    except Exception:
+                        blob = ""
+                    if not any(k in blob for k in ["readme", "文档", "changelog", "release", "runbook"]):
+                        try:
+                            verify_cmds = self._determine_test_commands(profile=verify_profile_cfg)
+                        except Exception:
+                            verify_cmds = []
+                        if verify_cmds:
+                            try:
+                                activate_agent("qa", reason=f"gate:plan_task_verify:{t.id}")
+                            except Exception:
+                                pass
+                            self._append_guarded(
+                                event=new_event(
+                                    agent="qa",
+                                    type="TEST_RUN",
+                                    summary=f"PlanTask verify ({verify_profile_cfg}) after {t.id}",
+                                    branch_id=self.branch_id,
+                                    pointers=[],
+                                    meta={
+                                        "profile": verify_profile_cfg,
+                                        "phase": "plan_task_verify",
+                                        "plan_task_id": t.id,
+                                        "commands": verify_cmds,
+                                        "route_level": route_level,
+                                        "style": resolved_style,
+                                    },
+                                ),
+                                activated_agents=activated_agents,
+                            )
+                            vr = self._run_tests(profile=verify_profile_cfg, commands=verify_cmds)
+                            failure_fp = ""
+                            try:
+                                if not vr.passed:
+                                    b0 = str((vr.blockers or [""])[0] or "").strip()
+                                    extracted0 = self._extract_error_signals(b0, limit=12)
+                                    sig0 = self._failure_signature(report=vr, extracted=extracted0, blocker_text=b0)
+                                    failure_fp = self._failure_fingerprint(signature=sig0)
+                            except Exception:
+                                failure_fp = ""
+                            self._append_guarded(
+                                event=new_event(
+                                    agent="qa",
+                                    type="TEST_PASSED" if vr.passed else "TEST_FAILED",
+                                    summary="Tests passed" if vr.passed else "Tests failed",
+                                    branch_id=self.branch_id,
+                                    pointers=vr.pointers,
+                                    meta={
+                                        "blockers": vr.blockers,
+                                        "failure_fingerprint": failure_fp,
+                                        "profile": verify_profile_cfg,
+                                        "phase": "plan_task_verify",
+                                        "plan_task_id": t.id,
+                                        "commands": vr.commands,
+                                        "route_level": route_level,
+                                        "style": resolved_style,
+                                    },
+                                ),
+                                activated_agents=activated_agents,
+                            )
+                            if not vr.passed:
+                                forced_report = vr
+                                forced_qa_profile = verify_profile_cfg
+                                forced_qa_commands = verify_cmds
+                                break
 
         # Aggregate evidence for downstream gates (review/security) without embedding full file contents.
         files_changed: list[str] = []
@@ -7326,10 +7424,15 @@ class Orchestrator(FailureDiagnosisMixin):
             return report
 
         # Phase 1: preflight / minimal verification.
-        report = run_qa_step(phase="preflight" if qa_profile != qa_required_profile else "final")
+        if forced_report is not None:
+            qa_profile = forced_qa_profile or qa_profile
+            qa_commands = forced_qa_commands or qa_commands
+            report = forced_report
+        else:
+            report = run_qa_step(phase="preflight" if qa_profile != qa_required_profile else "final")
 
         # Phase 2 (L2+): if preflight passed, escalate to the required profile for full verification.
-        if (not mock_mode) and report.passed and qa_profile != qa_required_profile:
+        if (forced_report is None) and (not mock_mode) and report.passed and qa_profile != qa_required_profile:
             qa_profile = qa_required_profile
             qa_commands = self._determine_test_commands(profile=qa_profile)
             if (not qa_commands) and envspec_commands:
@@ -9281,6 +9384,34 @@ class Orchestrator(FailureDiagnosisMixin):
                     ),
                     activated_agents=activated_agents,
                 )
+                # Auto-continue: replan checkpoints are resumable. When enabled, we resume
+                # immediately so the user doesn't have to re-run manually.
+                try:
+                    auto_replan = bool(getattr(self.config.behavior, "auto_replan_continue", True))
+                    max_replans = int(getattr(self.config.behavior, "max_replans_per_run", 2) or 2)
+                    max_replans = max(0, min(max_replans, 6))
+                except Exception:
+                    auto_replan = True
+                    max_replans = 2
+                if replan_required and auto_replan and (_replan_depth < max_replans):
+                    self._append_guarded(
+                        event=new_event(
+                            agent="router",
+                            type="STATE_TRANSITION",
+                            summary=f"Auto-continue from replan checkpoint {cp.id}",
+                            branch_id=self.branch_id,
+                            pointers=[],
+                            meta={
+                                "phase": "replan_continue",
+                                "from_checkpoint": cp.id,
+                                "depth": _replan_depth + 1,
+                                "route_level": route_level,
+                                "style": resolved_style,
+                            },
+                        ),
+                        activated_agents=activated_agents,
+                    )
+                    return self.run(task_id=task_evt.id, route=route, style=resolved_style, resume=True, _replan_depth=_replan_depth + 1)
                 return RunResult(checkpoint_id=cp.id, green=False)
 
         doc_ptr: Optional[str] = None

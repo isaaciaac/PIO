@@ -55,6 +55,21 @@ class BehaviorConfig(BaseModel):
     # also do multi-round retries on top of this.
     fix_loop_max_loops: int = 3
 
+    # When a run becomes "replan_required" (design/contract/skeleton issues), automatically
+    # create a replan checkpoint and continue within the same `vibe run` invocation by
+    # resuming from that checkpoint. This improves first-pass success and reduces the
+    # "stop and ask user to rerun" friction.
+    auto_replan_continue: bool = True
+    max_replans_per_run: int = 2
+
+    # Improve first-pass generation quality by running a lightweight verification after
+    # each plan task, so we catch broken scaffolds early (before many tasks accumulate).
+    #
+    # off: disabled
+    # smoke: compile/build/lint (fast)
+    # unit: compile + unit/lint where available (slower)
+    plan_task_verify_profile: Literal["off", "smoke", "unit"] = "smoke"
+
 
 class AgentContextConfig(BaseModel):
     # A lightweight, provider-agnostic budget (char-based heuristic).

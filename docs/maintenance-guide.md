@@ -18,6 +18,8 @@
 - `env_engineer / ops_engineer / qa / architect` 分层参与
 - `ledger + artifacts + checkpoints + views + knowledge`
 - 基于真实命令输出的 QA / fix-loop
+- **PlanTask 分段验证**（每个任务落盘后先 smoke/unit，降低“最后一次性爆炸”概率）
+- **自动 replan 续跑**（出现 `replan_required` 时自动创建 checkpoint 并继续，不要求用户手动 rerun）
 
 但它的主要问题已经变成**系统性维护问题**，不是单点功能缺失：
 
@@ -25,6 +27,8 @@
 - 诊断和修复虽然成型，但还不够“像工程师”
 - 对 contract/接口/数据形状类错误，仍然会有误判到 `env_engineer` 的情况
 - `scope mismatch` 已引入 repair arena，并新增“合成工单”避免无效回退；但仍需要继续观察是否还有边界条件导致空转
+  - 可通过 `.vibe/vibe.yaml -> behavior.plan_task_verify_profile` 调整分段验证力度
+  - 可通过 `.vibe/vibe.yaml -> behavior.auto_replan_continue / max_replans_per_run` 调整 replan 续跑策略
 
 ## 2. 当前最重要的经验结论
 
