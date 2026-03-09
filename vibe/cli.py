@@ -29,6 +29,7 @@ from vibe.toolbox import Toolbox
 from vibe.style import normalize_style, style_prompt, style_temperature
 from vibe.secrets import apply_workspace_secrets
 from vibe.storage.artifacts import ArtifactsStore
+from vibe.providers.base import ProviderError
 
 
 def _pointer_sha256(pointer: str) -> str:
@@ -934,7 +935,16 @@ def chat(
         messages.append({"role": "system", "content": mem_text})
     messages.extend(past)
     messages.append({"role": "user", "content": message})
-    reply, _meta = a.chat_json(schema=packs.ChatReply, messages=messages, user=message, temperature=style_temperature(resolved_style))
+    try:
+        reply, _meta = a.chat_json(
+            schema=packs.ChatReply,
+            messages=messages,
+            user=message,
+            temperature=style_temperature(resolved_style),
+        )
+    except ProviderError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=2)
 
     # Normalize/repair pointers:
     # - Prefer verifiable pointers (path#Lx-Ly@sha256 / artifact@sha256)
@@ -1015,6 +1025,9 @@ def run(
     except PolicyDeniedError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=3)
+    except ProviderError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=2)
 
 
 @app.command()
@@ -1084,7 +1097,18 @@ def vision(
         typer.echo(f"Missing env var {api_key_env} for provider dashscope", err=True)
         raise typer.Exit(code=2)
 
-    from openai import OpenAI
+    try:
+        from openai import OpenAI  # type: ignore[import-not-found]
+    except Exception as e:
+        msg = str(e or "")
+        hint = ""
+        if "BaseTransport" in msg and "httpx" in msg:
+            hint = (
+                "（检测到 openai SDK 与 httpx 版本不兼容：通常是 httpx 被降级导致。"
+                "建议修复：`python -m pip install -U \"httpx>=0.24,<1\" \"openai>=1.30\"`。）"
+            )
+        typer.echo(f"Failed to import OpenAI SDK. {hint}\n{msg}", err=True)
+        raise typer.Exit(code=2)
 
     client = OpenAI(api_key=api_key, base_url=prov.base_url)
     mime = _guess_image_mime(pointer_path)

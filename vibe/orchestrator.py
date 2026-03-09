@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import os
 import importlib.util
+import sys
 import tomllib
 import re
 import difflib
@@ -1029,9 +1030,32 @@ class Orchestrator(FailureDiagnosisMixin):
         msgs.append({"role": "user", "content": user})
         return msgs
 
-    def _python_has_module(self, name: str) -> bool:
+    def _python_has_module(self, name: str, *, python_exe_path: Optional[str] = None) -> bool:
+        """
+        Check module availability.
+
+        Prefer the repo-local sandbox venv when it exists (to avoid global interpreter drift),
+        but fall back to the current interpreter for read-only heuristics.
+        """
+        mod = str(name or "").strip()
+        if not mod:
+            return False
+        exe = str(python_exe_path or "").strip()
+        if not exe:
+            py_path = self._python_sandbox_python_path()
+            exe = str(py_path) if py_path.exists() else ""
+        if exe:
+            try:
+                code = (
+                    "import importlib.util,sys;"
+                    f"sys.exit(0 if importlib.util.find_spec({mod!r}) is not None else 1)"
+                )
+                r = self.toolbox.run_cmd(agent_id="router", cmd=[exe, "-c", code], cwd=self.repo_root, timeout_s=30)
+                return r.returncode == 0
+            except Exception:
+                return False
         try:
-            return importlib.util.find_spec(name) is not None
+            return importlib.util.find_spec(mod) is not None
         except Exception:
             return False
 
@@ -1169,12 +1193,13 @@ class Orchestrator(FailureDiagnosisMixin):
                 out.append(p)
         return out
 
-    def _python_setup_commands(self) -> list[str]:
+    def _python_setup_commands(self, *, py: Optional[str] = None) -> list[str]:
         root = self.repo_root
+        py_cmd = (py or self._python_sandbox_python() or "python").strip() or "python"
         if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
-            return ["python -m pip install -e ."]
+            return [f"{py_cmd} -m pip install -e ."]
         if (root / "requirements.txt").exists():
-            return ["python -m pip install -r requirements.txt"]
+            return [f"{py_cmd} -m pip install -r requirements.txt"]
         return []
 
     def _python_import_name_for_dependency(self, dep: str) -> str:
@@ -1244,6 +1269,11 @@ class Orchestrator(FailureDiagnosisMixin):
         if not manifests:
             return False, ""
 
+        # Ensure we don't mutate the interpreter running vibe: installs happen in a repo-local venv.
+        py_path = self._python_sandbox_python_path()
+        if not py_path.exists():
+            return True, "python_sandbox_missing"
+
         signature = self._python_setup_signature()
         state_path = self._python_install_state_path()
         try:
@@ -1257,7 +1287,7 @@ class Orchestrator(FailureDiagnosisMixin):
         for mod in self._declared_python_imports()[:24]:
             if not mod:
                 continue
-            if not self._python_has_module(mod):
+            if not self._python_has_module(mod, python_exe_path=str(py_path)):
                 return True, f"missing_py_module:{mod}"
 
         return False, ""
@@ -2040,6 +2070,130 @@ class Orchestrator(FailureDiagnosisMixin):
         if os.name == "nt":
             return f'cd /d "{d}" && {cmd}'
         return f'cd "{d}" && {cmd}'
+
+    def _shell_quote_exe(self, exe: str) -> str:
+        """
+        Quote an executable path for shell=True execution.
+
+        Our command runner uses shell=True for string commands, so paths with spaces
+        must be quoted to avoid "is not recognized" style failures on Windows.
+        """
+        s = str(exe or "").strip()
+        if not s:
+            return s
+        if os.name == "nt":
+            # cmd.exe quoting: simplest safe choice is double quotes.
+            if s.startswith('"') and s.endswith('"'):
+                return s
+            return f"\"{s}\""
+        try:
+            import shlex
+
+            return shlex.quote(s)
+        except Exception:
+            return s
+
+    def _python_sandbox_dir(self) -> Path:
+        # Per-repo isolated Python environment to avoid "project pip install" breaking vibe's own deps.
+        return self.repo_root / ".vibe" / "sandboxes" / "python"
+
+    def _python_sandbox_python_path(self) -> Path:
+        venv = self._python_sandbox_dir()
+        if os.name == "nt":
+            return venv / "Scripts" / "python.exe"
+        return venv / "bin" / "python"
+
+    def _python_sandbox_python(self) -> str:
+        py_path = self._python_sandbox_python_path()
+        if py_path.exists():
+            return self._shell_quote_exe(str(py_path))
+        return "python"
+
+    def _ensure_python_sandbox(self, *, agent_id: str) -> str:
+        """
+        Ensure the per-repo venv exists and return its python executable (quoted for shell).
+        """
+        py_path = self._python_sandbox_python_path()
+        if py_path.exists():
+            return self._shell_quote_exe(str(py_path))
+
+        venv_dir = self._python_sandbox_dir()
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        r = self.toolbox.run_cmd(
+            agent_id=agent_id,
+            cmd=[sys.executable, "-m", "venv", str(venv_dir)],
+            cwd=self.repo_root,
+            timeout_s=600,
+        )
+        if r.returncode != 0:
+            tail = self._artifact_tail_text(r.stderr, max_bytes=8000) if r.stderr else ""
+            raise RuntimeError(f"Failed to create python sandbox venv: {venv_dir}\n{tail}".strip())
+
+        py = self._shell_quote_exe(str(py_path))
+        # Best-effort: ensure pip exists/usable (skip upgrades to keep offline-friendly).
+        try:
+            self.toolbox.run_cmd(agent_id=agent_id, cmd=f"{py} -m pip --version", cwd=self.repo_root, timeout_s=120)
+        except Exception:
+            pass
+        return py
+
+    def _rewrite_python_command(self, cmd: str, *, py: str) -> str:
+        """
+        Rewrite common Python invocations to use the repo sandbox interpreter.
+        """
+        raw = str(cmd or "").strip()
+        if not raw:
+            return raw
+        low = raw.lower().lstrip()
+
+        # Rewrite leading `python ...`
+        if low.startswith("python ") or low == "python":
+            return f"{py}{raw[len('python'):]}"
+        if low.startswith("pytest ") or low == "pytest":
+            return f"{py} -m pytest{raw[len('pytest'):]}"
+        if low.startswith("pip ") or low == "pip":
+            return f"{py} -m pip{raw[len('pip'):]}"
+
+        out = raw
+        # Rewrite common chained forms: `cd ... && python ...`
+        out = re.sub(
+            r"(\&\&\s*)python(\s|$)",
+            lambda m: f"{m.group(1)}{py}{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
+            r"(\&\&\s*)pytest(\s|$)",
+            lambda m: f"{m.group(1)}{py} -m pytest{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
+            r"(\&\&\s*)pip(\s|$)",
+            lambda m: f"{m.group(1)}{py} -m pip{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        # POSIX-ish separators.
+        out = re.sub(
+            r"(;\s*)python(\s|$)",
+            lambda m: f"{m.group(1)}{py}{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
+            r"(;\s*)pytest(\s|$)",
+            lambda m: f"{m.group(1)}{py} -m pytest{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
+            r"(;\s*)pip(\s|$)",
+            lambda m: f"{m.group(1)}{py} -m pip{m.group(2)}",
+            out,
+            flags=re.IGNORECASE,
+        )
+        return out
 
     def _node_external_pkg_name(self, spec: str) -> Optional[str]:
         s = (spec or "").strip()
@@ -5094,8 +5248,8 @@ class Orchestrator(FailureDiagnosisMixin):
 
         if is_py:
             # Prefer pytest when available and the project appears to have tests.
-            if has_py_tests and self._python_has_module("pytest"):
-                return ["python -m compileall .", "pytest -q"]
+            if has_py_tests:
+                return ["python -m compileall .", "python -m pytest -q"]
             return ["python -m compileall .", "python -m unittest -q"]
         if is_node:
             cmds: list[str] = []
@@ -5212,42 +5366,86 @@ class Orchestrator(FailureDiagnosisMixin):
         # Best-effort: for Python projects, ensure declared deps are installed before
         # running compile/test commands. This avoids fresh-scaffold failures where
         # `requirements.txt` / `pyproject.toml` exists but pytest imports fail immediately.
-        try:
-            py_cmds = [str(c or "") for c in cmds if isinstance(c, str)]
-            touches_python = any(
-                re.search(r"\b(?:python|pytest|uvicorn|gunicorn|flask)\b", c.lower()) for c in py_cmds
-            )
-            if touches_python:
-                needs, _reason = self._python_install_needed()
-                setup_cmds = self._python_setup_commands()
-                if needs and setup_cmds:
-                    install_cmd = setup_cmds[0]
-                    r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
-                    passed = r.returncode == 0
+        py_cmds = [str(c or "") for c in cmds if isinstance(c, str)]
+        touches_python = any(re.search(r"\b(?:python|pytest|uvicorn|gunicorn|flask)\b", c.lower()) for c in py_cmds)
+        if touches_python:
+            try:
+                py = self._ensure_python_sandbox(agent_id="qa")
+            except Exception as e:
+                blockers.append(f"Python sandbox setup failed: {e}")
+                return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+
+            needs, _reason = self._python_install_needed()
+            setup_cmds = self._python_setup_commands(py=py)
+            if needs and setup_cmds:
+                install_cmd = setup_cmds[0]
+                r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
+                passed = r.returncode == 0
+                results.append(
+                    packs.TestResult(
+                        command=install_cmd,
+                        returncode=r.returncode,
+                        passed=passed,
+                        stdout=r.stdout,
+                        stderr=r.stderr,
+                        meta=r.meta,
+                    )
+                )
+                pointers.extend([r.stdout, r.stderr, r.meta])
+                report_cmds.append(install_cmd)
+                if not passed:
+                    stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                    stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                    excerpt = stderr_tail or stdout_tail
+                    blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}" if excerpt else f"Command failed: {install_cmd}")
+                    return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+                try:
+                    self._record_python_install_state(command=install_cmd)
+                except Exception:
+                    pass
+
+            # Ensure pytest is available in the sandbox when the repo has pytest-style tests.
+            has_py_tests = False
+            try:
+                tests_dir = self.repo_root / "tests"
+                if tests_dir.exists():
+                    has_py_tests = any(p.is_file() for p in tests_dir.rglob("test*.py"))
+            except Exception:
+                has_py_tests = False
+            try:
+                if has_py_tests and not self._python_has_module("pytest", python_exe_path=str(self._python_sandbox_python_path())):
+                    rr = self.toolbox.run_cmd(agent_id="qa", cmd=f"{py} -m pip install pytest", cwd=self.repo_root, timeout_s=1800)
+                    passed = rr.returncode == 0
                     results.append(
                         packs.TestResult(
-                            command=install_cmd,
-                            returncode=r.returncode,
+                            command=f"{py} -m pip install pytest",
+                            returncode=rr.returncode,
                             passed=passed,
-                            stdout=r.stdout,
-                            stderr=r.stderr,
-                            meta=r.meta,
+                            stdout=rr.stdout,
+                            stderr=rr.stderr,
+                            meta=rr.meta,
                         )
                     )
-                    pointers.extend([r.stdout, r.stderr, r.meta])
-                    report_cmds.append(install_cmd)
+                    pointers.extend([rr.stdout, rr.stderr, rr.meta])
+                    report_cmds.append(f"{py} -m pip install pytest")
                     if not passed:
-                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
-                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(rr.stderr, max_bytes=12000))
+                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(rr.stdout, max_bytes=12000))
                         excerpt = stderr_tail or stdout_tail
-                        blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}" if excerpt else f"Command failed: {install_cmd}")
+                        blockers.append(
+                            f"Command failed: {py} -m pip install pytest\n\n{excerpt}" if excerpt else f"Command failed: {py} -m pip install pytest"
+                        )
                         return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
-                    try:
-                        self._record_python_install_state(command=install_cmd)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+            # Rewrite python invocations to use the sandbox interpreter.
+            new_cmds: list[str] = []
+            for c in cmds:
+                if isinstance(c, str):
+                    new_cmds.append(self._rewrite_python_command(c, py=py))
+            if new_cmds:
+                cmds = new_cmds
 
         for cmd in cmds:
             r = self.toolbox.run_cmd(agent_id="qa", cmd=cmd, cwd=self.repo_root, timeout_s=1800)
@@ -8442,6 +8640,12 @@ class Orchestrator(FailureDiagnosisMixin):
                         executed_lead_work_orders.add(delegated_key)
                         activate_agent(delegated_fix_agent_id, reason="gate:lead_work_order")
                         exec_success = True
+                        try:
+                            if any(re.search(r"\b(?:python|pip|pytest)\b", str(c).lower()) for c in delegated_fix_cmds):
+                                py = self._ensure_python_sandbox(agent_id=delegated_fix_agent_id)
+                                delegated_fix_cmds = [self._rewrite_python_command(str(c), py=py) for c in delegated_fix_cmds]
+                        except Exception:
+                            pass
                         for cmd in delegated_fix_cmds:
                             rr = self.toolbox.run_cmd(agent_id=delegated_fix_agent_id, cmd=cmd, cwd=self.repo_root, timeout_s=3600)
                             delegated_fix_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
@@ -8449,7 +8653,7 @@ class Orchestrator(FailureDiagnosisMixin):
                                 exec_success = False
                             try:
                                 low_cmd = str(cmd or "").lower()
-                                if rr.returncode == 0 and "python -m pip install" in low_cmd:
+                                if rr.returncode == 0 and "-m pip install" in low_cmd:
                                     self._record_python_install_state(command=cmd)
                             except Exception:
                                 pass
@@ -8500,6 +8704,12 @@ class Orchestrator(FailureDiagnosisMixin):
                             activated_agents=activated_agents,
                         )
                         env_success = True
+                        try:
+                            if any(re.search(r"\b(?:python|pip|pytest)\b", str(c).lower()) for c in delegated_fix_cmds):
+                                py = self._ensure_python_sandbox(agent_id="env_engineer")
+                                delegated_fix_cmds = [self._rewrite_python_command(str(c), py=py) for c in delegated_fix_cmds]
+                        except Exception:
+                            pass
                         for cmd in delegated_fix_cmds:
                             rr = self.toolbox.run_cmd(agent_id="env_engineer", cmd=cmd, cwd=self.repo_root, timeout_s=3600)
                             delegated_fix_ptrs.extend([rr.stdout, rr.stderr, rr.meta])
@@ -8507,7 +8717,7 @@ class Orchestrator(FailureDiagnosisMixin):
                                 env_success = False
                             try:
                                 low_cmd = str(cmd or "").lower()
-                                if rr.returncode == 0 and "python -m pip install" in low_cmd:
+                                if rr.returncode == 0 and "-m pip install" in low_cmd:
                                     self._record_python_install_state(command=cmd)
                             except Exception:
                                 pass

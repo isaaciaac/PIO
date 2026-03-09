@@ -9,14 +9,6 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
-from openai import (
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    InternalServerError,
-    OpenAI,
-    RateLimitError,
-)
 from pydantic import BaseModel, ValidationError
 
 
@@ -41,9 +33,13 @@ class ProviderResult:
 
 
 def _is_retryable_openai_error(e: Exception) -> bool:
-    if isinstance(e, (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)):
+    # Do not import provider SDKs at module import time: user projects may install
+    # incompatible shared dependencies (e.g. downgrading `httpx`) and break imports.
+    # Use heuristics based on exception class name and status code.
+    name = e.__class__.__name__
+    if name in {"RateLimitError", "APITimeoutError", "APIConnectionError", "InternalServerError"}:
         return True
-    if isinstance(e, APIStatusError):
+    if name == "APIStatusError":
         try:
             sc = int(getattr(e, "status_code", 0) or 0)
         except Exception:
@@ -61,7 +57,7 @@ def _retry_after_seconds(e: Exception) -> Optional[float]:
     """
     Extract retry-after seconds when available (best-effort).
     """
-    if isinstance(e, APIStatusError):
+    if e.__class__.__name__ == "APIStatusError":
         try:
             resp = getattr(e, "response", None)
             if resp is not None:
@@ -501,7 +497,25 @@ class OpenAICompatProvider:
             raise ProviderError(f"Missing env var {self.api_key_env} for provider {self.provider_id}")
         return key
 
-    def _client(self) -> OpenAI:
+    def _client(self) -> Any:
+        """
+        Lazy-import the OpenAI SDK.
+
+        This keeps `vibe` usable even if a user project installs incompatible versions of
+        shared deps into the same interpreter (e.g. downgrading `httpx` can break `openai`).
+        """
+        try:
+            from openai import OpenAI  # type: ignore[import-not-found]
+        except Exception as e:
+            msg = str(e or "")
+            hint = ""
+            if "BaseTransport" in msg and "httpx" in msg:
+                hint = (
+                    "（检测到 openai SDK 与 httpx 版本不兼容：通常是 httpx 被降级导致。"
+                    "建议修复：`python -m pip install -U \"httpx>=0.24,<1\" \"openai>=1.30\"`；"
+                    "并避免在运行 vibe 的同一个解释器里对项目执行 `pip install -r requirements.txt`。）"
+                )
+            raise ProviderError(f"Failed to import OpenAI SDK. {hint}\n{msg}") from e
         return OpenAI(api_key=self._api_key(), base_url=self.base_url)
 
     def normalize_messages(self, messages: List[Dict[str, str]], *, model: str) -> List[Dict[str, str]]:

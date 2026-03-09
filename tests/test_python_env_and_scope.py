@@ -51,7 +51,7 @@ def test_run_tests_preinstalls_python_dependencies(tmp_path: Path, monkeypatch) 
     orch = Orchestrator(tmp_path)
     calls: list[str] = []
 
-    def fake_has_module(name: str) -> bool:
+    def fake_has_module(name: str, *, python_exe_path: str | None = None) -> bool:
         return name != "fastapi"
 
     def fake_run_cmd(*, agent_id: str, cmd, cwd=None, timeout_s=None):
@@ -64,7 +64,9 @@ def test_run_tests_preinstalls_python_dependencies(tmp_path: Path, monkeypatch) 
 
     report = orch._run_tests(profile="unit", commands=["pytest -q"])
     assert report.passed is True
-    assert calls[:2] == ["python -m pip install -e .", "pytest -q"]
+    assert any(" -m venv " in c for c in calls), calls
+    assert any(" -m pip install -e ." in c for c in calls), calls
+    assert any(" -m pytest -q" in c for c in calls), calls
     assert (tmp_path / ".vibe" / "manifests" / "python_env_state.json").exists()
 
 
