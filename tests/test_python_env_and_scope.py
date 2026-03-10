@@ -70,6 +70,41 @@ def test_run_tests_preinstalls_python_dependencies(tmp_path: Path, monkeypatch) 
     assert (tmp_path / ".vibe" / "manifests" / "python_env_state.json").exists()
 
 
+def test_run_tests_installs_requirements_txt_when_present(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "pyproject.toml").write_text(
+        "[build-system]\nrequires = [\"setuptools>=61.0\"]\nbuild-backend = \"setuptools.build_meta\"\n"
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\ndependencies = [\"fastapi>=0.104.0\"]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("requests>=2.32.0\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    calls: list[str] = []
+
+    def fake_has_module(name: str, *, python_exe_path: str | None = None) -> bool:
+        # Simulate the common failure mode: requirements exist but deps are not installed yet.
+        return name not in {"fastapi", "requests"}
+
+    def fake_run_cmd(*, agent_id: str, cmd, cwd=None, timeout_s=None):
+        command = cmd if isinstance(cmd, str) else " ".join(cmd)
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="stdout", stderr="", meta="")
+
+    monkeypatch.setattr(orch, "_python_has_module", fake_has_module)
+    monkeypatch.setattr(orch.toolbox, "run_cmd", fake_run_cmd)
+
+    report = orch._run_tests(profile="unit", commands=["pytest -q"])
+    assert report.passed is True
+    assert any(" -m pip install -e ." in c for c in calls), calls
+    assert any(" -m pip install -r requirements.txt" in c for c in calls), calls
+    assert any(" -m pytest -q" in c for c in calls), calls
+
+
 def test_expand_fix_scope_for_missing_python_dependency_adds_manifests(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()

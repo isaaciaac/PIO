@@ -1196,11 +1196,15 @@ class Orchestrator(FailureDiagnosisMixin):
     def _python_setup_commands(self, *, py: Optional[str] = None) -> list[str]:
         root = self.repo_root
         py_cmd = (py or self._python_sandbox_python() or "python").strip() or "python"
+        cmds: list[str] = []
+
+        # Prefer editable install when the project is a Python package, but still honor
+        # `requirements.txt` when present: many scaffolds keep extra runtime deps there.
         if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
-            return [f"{py_cmd} -m pip install -e ."]
+            cmds.append(f"{py_cmd} -m pip install -e .")
         if (root / "requirements.txt").exists():
-            return [f"{py_cmd} -m pip install -r requirements.txt"]
-        return []
+            cmds.append(f"{py_cmd} -m pip install -r requirements.txt")
+        return cmds
 
     def _python_import_name_for_dependency(self, dep: str) -> str:
         raw = str(dep or "").strip()
@@ -5378,31 +5382,31 @@ class Orchestrator(FailureDiagnosisMixin):
             needs, _reason = self._python_install_needed()
             setup_cmds = self._python_setup_commands(py=py)
             if needs and setup_cmds:
-                install_cmd = setup_cmds[0]
-                r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
-                passed = r.returncode == 0
-                results.append(
-                    packs.TestResult(
-                        command=install_cmd,
-                        returncode=r.returncode,
-                        passed=passed,
-                        stdout=r.stdout,
-                        stderr=r.stderr,
-                        meta=r.meta,
+                for install_cmd in setup_cmds:
+                    r = self.toolbox.run_cmd(agent_id="qa", cmd=install_cmd, cwd=self.repo_root, timeout_s=3600)
+                    passed = r.returncode == 0
+                    results.append(
+                        packs.TestResult(
+                            command=install_cmd,
+                            returncode=r.returncode,
+                            passed=passed,
+                            stdout=r.stdout,
+                            stderr=r.stderr,
+                            meta=r.meta,
+                        )
                     )
-                )
-                pointers.extend([r.stdout, r.stderr, r.meta])
-                report_cmds.append(install_cmd)
-                if not passed:
-                    stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
-                    stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
-                    excerpt = stderr_tail or stdout_tail
-                    blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}" if excerpt else f"Command failed: {install_cmd}")
-                    return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
-                try:
-                    self._record_python_install_state(command=install_cmd)
-                except Exception:
-                    pass
+                    pointers.extend([r.stdout, r.stderr, r.meta])
+                    report_cmds.append(install_cmd)
+                    if not passed:
+                        stderr_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stderr, max_bytes=12000))
+                        stdout_tail = self._compact_error_excerpt(self._artifact_tail_text(r.stdout, max_bytes=12000))
+                        excerpt = stderr_tail or stdout_tail
+                        blockers.append(f"Command failed: {install_cmd}\n\n{excerpt}" if excerpt else f"Command failed: {install_cmd}")
+                        return packs.TestReport(commands=report_cmds, results=results, passed=False, blockers=blockers, pointers=pointers)
+                    try:
+                        self._record_python_install_state(command=install_cmd)
+                    except Exception:
+                        pass
 
             # Ensure pytest is available in the sandbox when the repo has pytest-style tests.
             has_py_tests = False
