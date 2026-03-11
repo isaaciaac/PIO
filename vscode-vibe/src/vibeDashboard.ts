@@ -14,6 +14,9 @@ type ChatMessage = {
 
 type EnvOverridesProvider = () => Promise<NodeJS.ProcessEnv>;
 
+type FileDiffStat = { path: string; added: number | null; deleted: number | null; binary?: boolean };
+type PatchDiffSummary = { fileCount: number; totalAdded: number; totalDeleted: number; files: FileDiffStat[] };
+
 function newId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
@@ -150,6 +153,67 @@ function formatRunSummary(checkpointId: string, green: boolean | undefined, even
   return lines.join("\n");
 }
 
+function summarizeUnifiedDiff(patchText: string): PatchDiffSummary | undefined {
+  const text = String(patchText || "");
+  if (!text.trim()) return undefined;
+
+  const byPath = new Map<string, FileDiffStat>();
+  let current: string | undefined = undefined;
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = String(raw || "");
+
+    const m = line.match(/^diff --git a\/(.+?) b\/(.+)\s*$/);
+    if (m) {
+      current = m[2].trim();
+      if (!byPath.has(current)) byPath.set(current, { path: current, added: 0, deleted: 0 });
+      continue;
+    }
+
+    if (line.startsWith("+++ ")) {
+      const p = line.slice(4).trim();
+      if (p && p !== "/dev/null") {
+        current = p.startsWith("b/") ? p.slice(2) : p;
+        if (!byPath.has(current)) byPath.set(current, { path: current, added: 0, deleted: 0 });
+      }
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (line.startsWith("Binary files ")) {
+      const st = byPath.get(current);
+      if (st) {
+        st.binary = true;
+        st.added = null;
+        st.deleted = null;
+      }
+      continue;
+    }
+
+    if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
+    if (line.startsWith("+")) {
+      const st = byPath.get(current);
+      if (st && typeof st.added === "number") st.added += 1;
+      continue;
+    }
+    if (line.startsWith("-")) {
+      const st = byPath.get(current);
+      if (st && typeof st.deleted === "number") st.deleted += 1;
+      continue;
+    }
+  }
+
+  const files = Array.from(byPath.values()).sort((a, b) => a.path.localeCompare(b.path));
+  let totalAdded = 0;
+  let totalDeleted = 0;
+  for (const f of files) {
+    if (typeof f.added === "number") totalAdded += f.added;
+    if (typeof f.deleted === "number") totalDeleted += f.deleted;
+  }
+  return { fileCount: files.length, totalAdded, totalDeleted, files };
+}
+
 export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private running = false;
@@ -204,6 +268,23 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           this.postState();
           return;
         }
+        if (msg?.type === "openFile") {
+          const raw = String(msg?.path || "").trim();
+          const rel = raw.split("@sha256:", 1)[0].replace(/\\/g, "/").replace(/^\/+/, "").trim();
+          if (!rel) return;
+          const abs = path.resolve(path.join(root, rel));
+          const rootAbs = path.resolve(root);
+          const relToRoot = path.relative(rootAbs, abs);
+          if (!relToRoot || relToRoot.startsWith("..") || path.isAbsolute(relToRoot)) return;
+          const uri = vscode.Uri.file(abs);
+          if (!(await exists(uri))) {
+            vscode.window.showErrorMessage(`File not found: ${rel}`);
+            return;
+          }
+          const doc = await vscode.workspace.openTextDocument(uri);
+          await vscode.window.showTextDocument(doc, { preview: false });
+          return;
+        }
         if (msg?.type === "pasteImage") {
           const dataUrl = String(msg?.dataUrl || "").trim();
           const mime = String(msg?.mime || "").trim().toLowerCase();
@@ -236,14 +317,31 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         if (msg?.type === "chatSend") {
-          const text = String(msg?.text || "").trim();
+          const textRaw = String(msg?.text || "");
+          const text = textRaw.trim();
           const mock = Boolean(msg?.mock);
           const permissionMode = String(msg?.mode || "chat_only").trim();
           let route = String(msg?.route || "auto").trim();
           const agent = String(msg?.agent || "pm").trim();
           const style = String(msg?.style || "balanced").trim();
-          if (!text) return;
-          const withVision = this.consumePendingVision(text);
+          const rawImages = Array.isArray(msg?.images) ? msg.images : [];
+          const images = rawImages
+            .map((x: any) => ({
+              dataUrl: String(x?.dataUrl || "").trim(),
+              mime: String(x?.mime || "image/png").trim().toLowerCase(),
+            }))
+            .filter((x: any) => x.dataUrl.startsWith("data:") && x.dataUrl.includes("base64,"))
+            .slice(0, 3);
+
+          if (!text && !images.length) return;
+          if (this.running) return;
+
+          if (images.length) {
+            await this.processVisionImagesOnSend(root, images, { mode: permissionMode, agent }, envOverrides);
+          }
+
+          const effectiveText = text || (images.length ? "（仅图片）" : "");
+          const withVision = this.consumePendingVision(effectiveText);
           await this.handleSend(root, withVision, mock, permissionMode, route, agent, style);
           return;
         }
@@ -272,6 +370,69 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.postState();
   }
 
+  private pickPatchRelpath(cp: any, events: LedgerEvent[]): string | undefined {
+    const artifacts: string[] = Array.isArray(cp?.artifacts)
+      ? cp.artifacts.map((x: any) => String(x).trim()).filter((s: string) => s.trim().length > 0)
+      : [];
+    const fromCp: string[] = artifacts
+      .map((p: string) => p.split("@sha256:", 1)[0])
+      .filter(
+        (p: string) =>
+          p.includes(".vibe/artifacts/") &&
+          (p.endsWith(".patch.diff") || p.endsWith(".patch") || p.endsWith(".diff") || p.endsWith(".ops.json"))
+      );
+
+    if (fromCp.length) {
+      return fromCp.find((p) => p.endsWith(".patch.diff")) || fromCp.find((p) => p.endsWith(".patch")) || fromCp[0];
+    }
+
+    for (let i = (events || []).length - 1; i >= 0; i--) {
+      const e = events[i];
+      const ptrs = Array.isArray(e?.pointers) ? e.pointers : [];
+      for (const p of ptrs) {
+        const s = String(p || "").trim();
+        const rel = s.split("@sha256:", 1)[0];
+        if (
+          rel.includes(".vibe/artifacts/") &&
+          (rel.endsWith(".patch.diff") || rel.endsWith(".patch") || rel.endsWith(".diff") || rel.endsWith(".ops.json"))
+        ) {
+          return rel;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private async addDiffOverview(root: string, cp: any, events: LedgerEvent[]): Promise<void> {
+    try {
+      const rel = this.pickPatchRelpath(cp, events);
+      if (!rel) return;
+      const uri = vscode.Uri.file(path.join(root, rel));
+      if (!(await exists(uri))) return;
+
+      const patchText = await readTextFile(uri);
+      const summary = summarizeUnifiedDiff(patchText);
+      if (!summary || !summary.fileCount) return;
+
+      const maxFiles = 40;
+      const lines: string[] = [];
+      lines.push(`改动概览：${summary.fileCount} 个文件，+${summary.totalAdded}/-${summary.totalDeleted}`);
+      lines.push("");
+      for (const f of summary.files.slice(0, maxFiles)) {
+        const a = typeof f.added === "number" ? String(f.added) : "?";
+        const d = typeof f.deleted === "number" ? String(f.deleted) : "?";
+        lines.push(`- ${f.path}  +${a}  -${d}${f.binary ? "  (binary)" : ""}`);
+      }
+      if (summary.files.length > maxFiles) lines.push(`- ……（还有 ${summary.files.length - maxFiles} 个文件）`);
+      lines.push("");
+      lines.push(`查看详细 Diff：${rel}`);
+
+      this.addMessage("assistant", lines.join("\n").trim(), "改动概览");
+    } catch {
+      // best-effort only
+    }
+  }
+
   private addMessage(role: ChatRole, text: string, title?: string): void {
     this.messages.push({ id: newId("m"), role, title, text, ts: Date.now() });
     this.postState();
@@ -289,6 +450,94 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
     this.pendingVisionContext = [];
     if (!ctx) return t;
     return `${ctx}\n\n用户问题/需求：\n${t}`.trim();
+  }
+
+  private async processVisionImagesOnSend(
+    root: string,
+    images: Array<{ dataUrl: string; mime: string }>,
+    opts: { mode: string; agent: string },
+    envOverrides: NodeJS.ProcessEnv | undefined
+  ): Promise<void> {
+    const list = (images || []).slice(0, 3);
+    if (!list.length) return;
+
+    this.setStatus(`正在识别图片（1/${list.length}）…`);
+    this.addMessage("system", `已收到 ${list.length} 张图片，正在识别…`, "系统");
+    this.postState();
+
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const img = list[i];
+        this.setStatus(`正在识别图片（${i + 1}/${list.length}）…`);
+        this.postState();
+
+        const parts = String(img.dataUrl || "").split(",", 2);
+        const b64 = parts.length === 2 ? parts[1] : "";
+        const bytes = Buffer.from(b64, "base64");
+        if (!bytes.length) {
+          this.addMessage("assistant", `第 ${i + 1} 张图片解析失败：剪贴板为空或格式不支持。`, "错误");
+          continue;
+        }
+
+        const ext = this.extFromMime(img.mime);
+        const pointer = await this.storeArtifactBytes(root, bytes, ext);
+
+        const res = await runVibeCapture(["vision", "--artifact", pointer, "--path", root, "--json"], {
+          cwd: root,
+          mock: false,
+          output: this.output,
+          title: "Vibe：识别图片",
+          envOverrides,
+        });
+
+        let payload: any = undefined;
+        try {
+          payload = JSON.parse(res.stdout);
+        } catch {
+          payload = undefined;
+        }
+        const summary = String(payload?.summary || "").trim();
+        const description = String(payload?.description || "").trim();
+        const ocr = String(payload?.ocr_text || "").trim();
+        const keyPoints = Array.isArray(payload?.key_points)
+          ? payload.key_points.map((x: any) => String(x)).filter((x: string) => x.trim().length > 0)
+          : [];
+
+        const lines: string[] = [];
+        lines.push(summary ? `图片识别（${i + 1}/${list.length}）：${summary}` : `图片识别（${i + 1}/${list.length}）完成。`);
+        if (description) lines.push(`\n描述：\n${description}`);
+        if (keyPoints.length) lines.push(`\n要点：\n- ${keyPoints.join("\n- ")}`);
+        if (ocr) lines.push(`\nOCR：\n${ocr}`);
+        this.addMessage("assistant", lines.join("\n").trim() || `图片识别（${i + 1}/${list.length}）完成。`, "图片");
+
+        const ctx: string[] = [];
+        ctx.push("【图片识别结果】");
+        ctx.push(`- 工件：${pointer}`);
+        if (summary) ctx.push(`- 总结：${summary}`);
+        if (description) ctx.push(`- 描述：${description}`);
+        if (keyPoints.length) ctx.push(`- 要点：${keyPoints.join("；")}`);
+        if (ocr) ctx.push(`- OCR：\n${ocr}`);
+        const ctxText = ctx.join("\n").trim();
+        this.pendingVisionContext.push(ctxText);
+        if (opts.mode && opts.mode !== "chat_only") {
+          this.draftParts.push(ctxText);
+        }
+      }
+    } catch (e) {
+      if (e instanceof VibeRunError) {
+        const hint =
+          (e.stderr || "").includes("Missing env var") || (e.stdout || "").includes("Missing env var")
+            ? "\n\n提示：请先设置 DashScope 密钥（DASHSCOPE_API_KEY）。"
+            : "";
+        this.addMessage("assistant", `${formatRunError(e)}${hint}`, "错误");
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        this.addMessage("assistant", message, "错误");
+      }
+    } finally {
+      this.setStatus("");
+      this.postState();
+    }
   }
 
   private async handlePasteImage(
@@ -1405,6 +1654,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       stopWatcher = undefined;
       this.setStatus("正在生成总结…");
 
+      await this.addDiffOverview(root, cp, events);
+
       const facts = this.collectWorkflowFacts(taskText, taskId, checkpointId, cp, events, { attempts: attempt });
       try {
         const summary = await this.summarizeWorkflowWithPm(root, facts, mock, style, envOverrides, abort.signal);
@@ -1660,6 +1911,8 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       stopWatcher = undefined;
       this.setStatus("正在生成总结…");
 
+      await this.addDiffOverview(root, cp, events);
+
       const facts = this.collectWorkflowFacts(taskText || "继续执行工作流", taskId, checkpointId, cp, events, { attempts: attempt });
       try {
         const summary = await this.summarizeWorkflowWithPm(root, facts, mock, style, envOverrides, abort.signal);
@@ -1798,6 +2051,13 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         background: var(--vscode-notifications-background, rgba(70, 130, 180, 0.10));
         border-color: var(--vscode-notifications-border, var(--vscode-panel-border));
       }
+
+      .msg .actions {
+        margin-top: 8px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
       /* 进度行：更紧凑，不显示卡片边框 */
       .msg.progress {
         max-width: 100%;
@@ -1855,6 +2115,60 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
         outline: none;
       }
       textarea:focus { border-color: var(--vscode-focusBorder); }
+
+      .stagedWrap {
+        display: none;
+        margin-top: 8px;
+      }
+
+      .stagedHint {
+        font-size: 11px;
+        color: var(--vscode-descriptionForeground);
+        margin: 0 0 6px 0;
+      }
+
+      .stagedList {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .stagedItem {
+        position: relative;
+        width: 56px;
+        height: 56px;
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid var(--vscode-panel-border);
+        background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+      }
+
+      .stagedItem img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .stagedItem button {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        width: 18px;
+        height: 18px;
+        line-height: 18px;
+        padding: 0;
+        border-radius: 999px;
+        border: 1px solid var(--vscode-panel-border);
+        background: var(--vscode-editorWidget-background, rgba(0,0,0,0.35));
+        color: var(--vscode-button-foreground);
+        font-size: 12px;
+      }
+
+      .stagedItem button:hover {
+        background: var(--vscode-list-hoverBackground);
+        color: var(--vscode-foreground);
+      }
 
       .sendRow {
         display: flex;
@@ -1946,6 +2260,11 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
         <textarea id="input" placeholder="请输入你的问题或需求…（Ctrl/⌘ + Enter 发送）"></textarea>
 
+        <div class="stagedWrap" id="stagedWrap">
+          <div class="stagedHint" id="stagedHint"></div>
+          <div class="stagedList" id="stagedList"></div>
+        </div>
+
         <div class="sendRow">
           <div class="status" id="status"></div>
           <div class="btnRow">
@@ -1967,6 +2286,65 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
       const elAgentWrap = document.getElementById('agentWrap');
       const elRoute = document.getElementById('route');
       const elStyle = document.getElementById('style');
+      const elStagedWrap = document.getElementById('stagedWrap');
+      const elStagedHint = document.getElementById('stagedHint');
+      const elStagedList = document.getElementById('stagedList');
+
+      const MAX_STAGED_IMAGES = 3;
+      /** @type {Array<{id:string, dataUrl:string, mime:string}>} */
+      let stagedImages = [];
+
+      function newStagedId() {
+        return 'img_' + Date.now() + '_' + Math.random().toString(16).slice(2);
+      }
+
+      function flashStatus(text) {
+        try {
+          if (!elStatus) return;
+          const value = String(text || '');
+          elStatus.textContent = value;
+          setTimeout(() => {
+            // best-effort: avoid clearing real running status
+            if (elStatus.textContent === value) elStatus.textContent = '';
+          }, 1600);
+        } catch {}
+      }
+
+      function renderStagedImages() {
+        try {
+          if (!elStagedWrap || !elStagedList || !elStagedHint) return;
+          if (!stagedImages.length) {
+            elStagedWrap.style.display = 'none';
+            elStagedList.innerHTML = '';
+            elStagedHint.textContent = '';
+            return;
+          }
+          elStagedWrap.style.display = 'block';
+          elStagedHint.textContent = '已添加 ' + stagedImages.length + '/' + MAX_STAGED_IMAGES + ' 张图片（点击发送后再识别，可删除）';
+          elStagedList.innerHTML = '';
+          for (const img of stagedImages) {
+            const item = document.createElement('div');
+            item.className = 'stagedItem';
+
+            const elImg = document.createElement('img');
+            elImg.src = img.dataUrl;
+            elImg.alt = 'staged image';
+
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.title = '删除';
+            del.textContent = '×';
+            del.addEventListener('click', () => {
+              stagedImages = stagedImages.filter((x) => x.id !== img.id);
+              renderStagedImages();
+            });
+
+            item.appendChild(elImg);
+            item.appendChild(del);
+            elStagedList.appendChild(item);
+          }
+        } catch {}
+      }
 
       function escapeHtml(s) {
         return s.replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c] || c));
@@ -1980,10 +2358,49 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           const titleLeft = m.title ? String(m.title) : '';
           const isProgress = titleLeft === '进度';
           div.className = 'msg ' + (m.role || 'assistant') + (isProgress ? ' progress' : '');
-          const title = (!isProgress && titleLeft)
-            ? '<div class=\"title\"><span>' + escapeHtml(titleLeft) + '</span><span></span></div>'
-            : '';
-          div.innerHTML = title + '<pre>' + escapeHtml(m.text || '') + '</pre>';
+
+          if (!isProgress && titleLeft) {
+            const title = document.createElement('div');
+            title.className = 'title';
+            const left = document.createElement('span');
+            left.textContent = titleLeft;
+            const right = document.createElement('span');
+            right.textContent = '';
+            title.appendChild(left);
+            title.appendChild(right);
+            div.appendChild(title);
+          }
+
+          const rawText = String(m.text || '');
+          const lines = rawText.split(/\\r?\\n/);
+          let openPath = '';
+          const kept = [];
+          for (const line of lines) {
+            const mm = String(line || '').match(/^查看详细 Diff：\\s*(.+)\\s*$/);
+            if (mm && mm[1]) {
+              openPath = String(mm[1]).trim();
+              continue;
+            }
+            kept.push(line);
+          }
+
+          const pre = document.createElement('pre');
+          pre.textContent = kept.join('\\n');
+          div.appendChild(pre);
+
+          if (openPath && !isProgress) {
+            const actions = document.createElement('div');
+            actions.className = 'actions';
+            const btn = document.createElement('button');
+            btn.className = 'secondary';
+            btn.type = 'button';
+            btn.textContent = '打开详细 Diff';
+            btn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'openFile', path: openPath });
+            });
+            actions.appendChild(btn);
+            div.appendChild(actions);
+          }
           elMessages.appendChild(div);
         }
         const st = (state && state.statusText) ? String(state.statusText) : '';
@@ -2006,13 +2423,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       function sendChat() {
         const text = (elInput.value || '').trim();
-        if (!text) return;
         const mode = (elMode && elMode.value) ? elMode.value : 'chat_only';
         const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
         const route = (elRoute && elRoute.value) ? elRoute.value : 'auto';
         const style = (elStyle && elStyle.value) ? elStyle.value : 'balanced';
-        vscode.postMessage({ type: 'chatSend', mode, route, agent, style, text, mock: false });
+        const images = stagedImages.slice(0, MAX_STAGED_IMAGES);
+        if (!text && !images.length) return;
+        vscode.postMessage({ type: 'chatSend', mode, route, agent, style, text, images, mock: false });
         elInput.value = '';
+        stagedImages = [];
+        renderStagedImages();
       }
 
       elSend.addEventListener('click', sendChat);
@@ -2023,13 +2443,19 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
           if (!img) return;
           const file = img.getAsFile();
           if (!file) return;
+          if (stagedImages.length >= MAX_STAGED_IMAGES) {
+            e.preventDefault();
+            flashStatus('最多只能添加 ' + MAX_STAGED_IMAGES + ' 张图片');
+            return;
+          }
           e.preventDefault();
           const reader = new FileReader();
           reader.onload = () => {
             const dataUrl = String(reader.result || '');
-            const mode = (elMode && elMode.value) ? elMode.value : 'chat_only';
-            const agent = (elAgent && elAgent.value) ? elAgent.value : 'pm';
-            vscode.postMessage({ type: 'pasteImage', dataUrl, mime: img.type || file.type || 'image/png', mode, agent });
+            const mime = (img.type || file.type || 'image/png');
+            stagedImages.push({ id: newStagedId(), dataUrl, mime });
+            if (stagedImages.length > MAX_STAGED_IMAGES) stagedImages = stagedImages.slice(0, MAX_STAGED_IMAGES);
+            renderStagedImages();
           };
           reader.readAsDataURL(file);
         } catch {}
@@ -2077,11 +2503,16 @@ export class VibeDashboardViewProvider implements vscode.WebviewViewProvider {
 
       document.getElementById('init').addEventListener('click', () => vscode.postMessage({type:'init'}));
       document.getElementById('stop').addEventListener('click', () => vscode.postMessage({type:'stop'}));
-      document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearChat'}));
+      document.getElementById('clear').addEventListener('click', () => {
+        stagedImages = [];
+        renderStagedImages();
+        vscode.postMessage({type:'clearChat'});
+      });
       document.getElementById('config').addEventListener('click', () => vscode.postMessage({type:'openConfig'}));
       document.getElementById('ledger').addEventListener('click', () => vscode.postMessage({type:'openLedger'}));
       document.getElementById('checkpoints').addEventListener('click', () => vscode.postMessage({type:'checkpoints'}));
 
+      renderStagedImages();
       vscode.postMessage({ type: 'ready' });
     </script>
   </body>
