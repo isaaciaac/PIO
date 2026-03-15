@@ -372,6 +372,32 @@ def test_static_python_skeleton_scanner_finds_export_and_signature_pitfalls(tmp_
     assert "py_local_call_signature_mismatch" in issue_ids
 
 
+def test_local_python_module_detection_supports_src_layout(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src" / "mypkg" / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "mypkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "mypkg" / "config" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    orch = Orchestrator(tmp_path)
+    assert orch._looks_like_local_python_module("mypkg") is True
+    assert orch._looks_like_local_python_module("mypkg.config") is True
+
+    blocker = "ModuleNotFoundError: No module named 'mypkg.config'"
+    report = packs.TestReport(
+        commands=["pytest -q"],
+        results=[packs.TestResult(command="pytest -q", returncode=1, passed=False, stdout="", stderr=blocker)],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+    error = orch._diagnose_test_failure(report=report, blocker_text=blocker)
+    assert error.error_type == "wrong_import_path"
+
+
 def test_failure_signature_includes_static_issue_ids(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()

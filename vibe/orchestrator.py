@@ -177,6 +177,7 @@ class Orchestrator(FailureDiagnosisMixin):
         self.main_ledger = Ledger(repo_root, branch_id="main")
         self.artifacts = ArtifactsStore(repo_root)
         self.checkpoints = CheckpointsStore(repo_root)
+        self._python_module_roots_cache: Optional[list[str]] = None
 
     def _detect_branch_id(self) -> str:
         if self.policy.mode == "chat_only":
@@ -1337,13 +1338,51 @@ class Orchestrator(FailureDiagnosisMixin):
         if not parts:
             return False
         top = parts[0].replace(".", "/")
-        if (self.repo_root / f"{top}.py").exists() or (self.repo_root / top / "__init__.py").exists():
-            return True
+        roots = self._python_module_roots()
+        for root in roots:
+            prefix = f"{root}/" if root else ""
+            if (self.repo_root / f"{prefix}{top}.py").exists() or (self.repo_root / prefix / top / "__init__.py").exists():
+                return True
         if len(parts) > 1:
             parent_rel = "/".join(parts[:-1])
-            if (self.repo_root / f"{parent_rel}.py").exists() and (self.repo_root / parent_rel / "__init__.py").exists():
-                return True
+            for root in roots:
+                prefix = f"{root}/" if root else ""
+                if (self.repo_root / f"{prefix}{parent_rel}.py").exists() and (self.repo_root / prefix / parent_rel / "__init__.py").exists():
+                    return True
         return False
+
+    def _python_module_roots(self) -> list[str]:
+        """
+        Determine likely Python import roots for local-module detection.
+
+        We keep this heuristic minimal and deterministic: repo root plus `src/` when it
+        contains Python files (common "src layout").
+        """
+        if self._python_module_roots_cache is not None:
+            return list(self._python_module_roots_cache)
+
+        roots: list[str] = [""]
+        try:
+            src = self.repo_root / "src"
+            if src.exists():
+                for _p in src.rglob("*.py"):
+                    roots.append("src")
+                    break
+        except Exception:
+            pass
+
+        # Normalize to avoid duplicates / weird slashes.
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in roots:
+            rr = _normalize_scope_pattern(r).rstrip("/")
+            if rr in seen:
+                continue
+            seen.add(rr)
+            out.append(rr)
+
+        self._python_module_roots_cache = out
+        return list(out)
 
     def _module_candidate_paths(self, module: str) -> list[str]:
         rel = str(module or "").replace(".", "/").replace("\\", "/").strip("/")
@@ -1359,12 +1398,35 @@ class Orchestrator(FailureDiagnosisMixin):
             seen.add(p)
             out.append(p)
 
-        add(f"{rel}.py")
-        add(f"{rel}/__init__.py")
-        parts = [part for part in rel.split("/") if part]
-        while len(parts) > 1:
-            parts = parts[:-1]
-            add("/".join(parts) + "/__init__.py")
+        rel_variants: list[str] = [rel]
+        if rel.startswith("src/"):
+            rel_variants.append(rel[len("src/") :].lstrip("/"))
+
+        roots = self._python_module_roots()
+
+        def add_module_paths(base_rel: str) -> None:
+            base = _normalize_scope_pattern(base_rel).strip("/")
+            if not base:
+                return
+            add(f"{base}.py")
+            add(f"{base}/__init__.py")
+            parts = [part for part in base.split("/") if part]
+            while len(parts) > 1:
+                parts = parts[:-1]
+                add("/".join(parts) + "/__init__.py")
+
+        for rv in rel_variants:
+            rv_norm = _normalize_scope_pattern(rv).strip("/")
+            if not rv_norm:
+                continue
+            # If the module string already includes a root prefix (e.g. `src.foo.bar`), use it as-is.
+            add_module_paths(rv_norm)
+            for root in roots:
+                if not root:
+                    continue
+                if rv_norm.startswith(root + "/"):
+                    continue
+                add_module_paths(f"{root}/{rv_norm}")
         return out
 
     def _test_paths_from_text(self, text: str, *, limit: int = 8) -> list[str]:

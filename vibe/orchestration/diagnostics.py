@@ -100,14 +100,9 @@ class FailureDiagnosisMixin(ContractAuditMixin):
                 symbol = ""
 
         if module:
-            rel = module.replace(".", "/").strip("/")
-            for candidate in [f"{rel}.py", f"{rel}/__init__.py"]:
+            for candidate in list(getattr(self, "_module_candidate_paths")(module))[:24]:
                 if (self.repo_root / candidate).exists():
                     add_file(candidate)
-            if "/" in rel:
-                parent_init = f"{'/'.join(rel.split('/')[:-1])}/__init__.py"
-                if (self.repo_root / parent_init).exists():
-                    add_file(parent_init)
 
         observation_seed = {
             "module": module,
@@ -170,6 +165,11 @@ class FailureDiagnosisMixin(ContractAuditMixin):
         text = str(blocker_text or "").strip()
         low = text.lower()
         obs = observation or {}
+        if not obs:
+            try:
+                obs, _ptr = self._observe_test_failure(report=report, blocker_text=text)
+            except Exception:
+                obs = {}
         failed_cmd = str(obs.get("failed_command") or self._failed_command_from_report(report) or "").strip()
         module = str(obs.get("module") or "").strip()
         symbol = str(obs.get("symbol") or "").strip()
