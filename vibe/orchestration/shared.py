@@ -66,8 +66,28 @@ def _matches_scope_pattern(rel: str, pat: str) -> bool:
     if not p:
         return False
     if any(ch in p for ch in ["*", "?", "["]):
+        def variants(pattern: str) -> list[str]:
+            # Interpret `**/` as "zero or more directories" (like globstar).
+            # Python's fnmatch doesn't treat `**` specially, and `**/*.py` would not match `base.py`.
+            seen: set[str] = set()
+            queue: list[str] = [pattern]
+            out: list[str] = []
+            while queue:
+                q = queue.pop(0)
+                if q in seen:
+                    continue
+                seen.add(q)
+                out.append(q)
+                if "/**/" in q:
+                    queue.append(q.replace("/**/", "/", 1))
+                if q.startswith("**/"):
+                    queue.append(q[3:])
+                if q.endswith("/**"):
+                    queue.append(q[: -3].rstrip("/"))
+            return out
+
         try:
-            return fnmatch.fnmatch(r, p)
+            return any(fnmatch.fnmatch(r, v) for v in variants(p)[:32])
         except Exception:
             return False
     p2 = p.rstrip("/")

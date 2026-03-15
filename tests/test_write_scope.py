@@ -115,3 +115,25 @@ def test_write_scope_denial_does_not_trigger_same_actor_repair(tmp_path: Path, m
         )
     assert ei.value.path == "tests/test_inference.py"
     assert called is False
+
+
+def test_write_scope_globstar_allows_zero_dir_match(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r1 = runner.invoke(app, ["init"])
+    assert r1.exit_code == 0, r1.output
+
+    orch = Orchestrator(tmp_path)
+    change = packs.CodeChange.model_validate(
+        {
+            "kind": "patch",
+            "summary": "write allowed file under globstar scope",
+            "writes": [{"path": "src/signal_unearth/modules/base.py", "content": "print('ok')\n"}],
+            "files_changed": ["src/signal_unearth/modules/base.py"],
+        }
+    )
+
+    # `**/*.py` should match files directly under the directory (zero subdir case).
+    orch._materialize_code_change(change, write_allowlist=["src/signal_unearth/modules/**/*.py"], write_denylist=[])
+    assert (tmp_path / "src" / "signal_unearth" / "modules" / "base.py").exists()
