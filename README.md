@@ -175,3 +175,7 @@ npm run compile
 - DashScope：设置 `DASHSCOPE_API_KEY`
 
 默认使用 OpenAI-compatible 接口（`base_url` 在 `.vibe/vibe.yaml` 中可见）。
+
+## License
+
+Apache License 2.0. See `LICENSE`.
