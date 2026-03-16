@@ -3523,6 +3523,24 @@ class Orchestrator(FailureDiagnosisMixin):
                     "- 如果清单缺了这个包，再补依赖清单与 README 的安装步骤。"
                 )
 
+        # 2) Missing local submodule: create the missing file/dir rather than re-exporting in __init__.py.
+        try:
+            static_ids = set(getattr(error, "static_issue_ids", []) or []) if error is not None else set()
+            mod = str(getattr(error, "module", "") or "").strip() if error is not None else ""
+            sym = str(getattr(error, "symbol", "") or "").strip() if error is not None else ""
+        except Exception:
+            static_ids = set()
+            mod = ""
+            sym = ""
+        if "py_missing_local_submodule" in static_ids and mod and sym:
+            rel = mod.replace(".", "/").strip("/")
+            return (
+                "检测到本地子模块缺失（不是环境缺依赖）：\n"
+                f"- `{mod}` 下缺少子模块 `{sym}`，需要新增 `{rel}/{sym}.py` 或 `{rel}/{sym}/__init__.py`（按项目风格二选一）。\n"
+                "- 不要只改包根 `__init__.py` 做 re-export；如果子模块文件本身不存在，导入仍会失败。\n"
+                "- 先让 `pytest --collect-only` 通过，再继续跑 full。"
+            )
+
         # Only attempt for TS/Node-ish errors.
         if not any(k in lower for k in ["tsc", "error ts", "typescript", "ts2349", "call signatures", "pool"]):
             return ""
