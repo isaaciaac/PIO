@@ -1384,6 +1384,50 @@ class Orchestrator(FailureDiagnosisMixin):
         self._python_module_roots_cache = out
         return list(out)
 
+    def _module_leaf_candidate_paths(self, module: str) -> list[str]:
+        """
+        Candidate file paths for the *module leaf* only.
+
+        Unlike `_module_candidate_paths`, this does not include parent package `__init__.py`
+        files. It is used when we must decide whether a *submodule exists on disk*.
+        """
+        rel = str(module or "").replace(".", "/").replace("\\", "/").strip("/")
+        if not rel:
+            return []
+
+        rel_variants: list[str] = [rel]
+        if rel.startswith("src/"):
+            rel_variants.append(rel[len("src/") :].lstrip("/"))
+
+        roots = self._python_module_roots()
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            p = _normalize_scope_pattern(path).strip("/")
+            if not p or p in seen:
+                return
+            seen.add(p)
+            out.append(p)
+
+        for rv in rel_variants:
+            rv_norm = _normalize_scope_pattern(rv).strip("/")
+            if not rv_norm:
+                continue
+            # As-is
+            add(f"{rv_norm}.py")
+            add(f"{rv_norm}/__init__.py")
+            # With import roots (e.g. src/)
+            for root in roots:
+                if not root:
+                    continue
+                if rv_norm.startswith(root + "/"):
+                    continue
+                add(f"{root}/{rv_norm}.py")
+                add(f"{root}/{rv_norm}/__init__.py")
+
+        return out
+
     def _module_candidate_paths(self, module: str) -> list[str]:
         rel = str(module or "").replace(".", "/").replace("\\", "/").strip("/")
         if not rel:
@@ -1579,6 +1623,21 @@ class Orchestrator(FailureDiagnosisMixin):
         def existing_module_files(mod_name: str) -> list[str]:
             return [rel for rel in self._module_candidate_paths(mod_name) if (self.repo_root / rel).exists()]
 
+        def existing_leaf_module_files(mod_name: str) -> list[str]:
+            return [rel for rel in self._module_leaf_candidate_paths(mod_name) if (self.repo_root / rel).exists()]
+
+        def looks_like_submodule_name(name: str) -> bool:
+            s = str(name or "").strip()
+            if not s:
+                return False
+            # Heuristic: submodules are almost always lowercase snake-case.
+            if not re.fullmatch(r"[a-z_][a-z0-9_]*", s):
+                return False
+            return True
+
+        def is_package_module(mod_name: str) -> bool:
+            return any(p.replace("\\", "/").endswith("/__init__.py") for p in existing_leaf_module_files(mod_name))
+
         if module:
             parts = [part for part in module.split(".") if part]
             if len(parts) > 1:
@@ -1599,6 +1658,17 @@ class Orchestrator(FailureDiagnosisMixin):
                     )
 
         if module and symbol and self._looks_like_local_python_module(module):
+            # Detect missing local submodule (common for `from pkg import submodule`).
+            if looks_like_submodule_name(symbol) and is_package_module(module):
+                sub_files = existing_leaf_module_files(f"{module}.{symbol}")
+                if not sub_files:
+                    add(
+                        "py_missing_local_submodule",
+                        f"本地包 `{module}` 下缺少子模块 `{symbol}`（未找到 `{module}.{symbol}` 对应的 .py 或包目录）。",
+                        files=existing_module_files(module) or [module.replace(".", "/") + "/__init__.py"],
+                        details=f"StaticIssue: py_missing_local_submodule | module={module} | submodule={symbol}",
+                    )
+
             target_files = existing_module_files(module)
             inventory: list[str] = []
             for candidate in target_files:
@@ -1690,6 +1760,21 @@ class Orchestrator(FailureDiagnosisMixin):
                     inventory.extend(self._python_symbol_inventory(candidate))
                 inventory = list(dict.fromkeys(inventory))
                 if inventory and imported_name not in inventory:
+                    # If importing a *submodule* from a local package, do not require `__init__.py` re-export.
+                    if looks_like_submodule_name(imported_name) and is_package_module(resolved):
+                        sub_files = existing_leaf_module_files(f"{resolved}.{imported_name}")
+                        if not sub_files:
+                            add(
+                                "py_missing_local_submodule",
+                                f"`{rel}` 从包 `{resolved}` 导入子模块 `{imported_name}`，但仓库未找到该子模块文件/目录。",
+                                files=[rel, *target_files],
+                                details=(
+                                    "StaticIssue: py_missing_local_submodule"
+                                    f" | importer={rel} | module={resolved} | submodule={imported_name}"
+                                ),
+                            )
+                        # Whether the submodule exists or not, this is not an "export symbol" drift.
+                        continue
                     detail = f"StaticIssue: py_missing_local_export_symbol | importer={rel} | module={resolved} | symbol={imported_name}"
                     match = difflib.get_close_matches(imported_name, inventory, n=1, cutoff=0.72)
                     if match:

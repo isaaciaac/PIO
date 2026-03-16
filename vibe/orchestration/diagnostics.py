@@ -235,8 +235,30 @@ class FailureDiagnosisMixin(ContractAuditMixin):
                 error_type = "circular_import"
                 root_cause = "模块相互导入，解释阶段未完成初始化就访问了符号。"
             elif "py_missing_local_export_symbol" in static_issue_ids or "cannot import name" in low or "has no exported member" in low or "has no attribute" in low:
-                error_type = "missing_export"
-                root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
+                # NOTE: `from pkg import submodule` raises "cannot import name" when the submodule file is missing.
+                # In that case the correct fix is to add the missing submodule (or correct the import path),
+                # not to "re-export" via __init__.py.
+                if module and symbol and self._looks_like_local_python_module(module):
+                    try:
+                        leaf = getattr(self, "_module_leaf_candidate_paths", None)
+                        if callable(leaf):
+                            sub_candidates = list(leaf(f"{module}.{symbol}"))[:16]
+                        else:
+                            sub_candidates = list(getattr(self, "_module_candidate_paths")(f"{module}.{symbol}"))[:16]
+                            # Filter out parent `__init__.py` files when using the broader candidate set.
+                            sub_candidates = [c for c in sub_candidates if re.search(r"/" + re.escape(symbol) + r"(\.py|/__init__\.py)$", c.replace("\\", "/"))]
+                        sub_exists = any((self.repo_root / c).exists() for c in sub_candidates)
+                    except Exception:
+                        sub_exists = False
+                    if not sub_exists and re.fullmatch(r"[a-z_][a-z0-9_]*", symbol or ""):
+                        error_type = "wrong_import_path"
+                        root_cause = f"本地包 `{module}` 下缺少子模块 `{symbol}`（未找到对应 .py 或包目录）。"
+                    else:
+                        error_type = "missing_export"
+                        root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
+                else:
+                    error_type = "missing_export"
+                    root_cause = "导入方需要的符号没有从目标模块/包根正确导出。"
                 if module:
                     rel = module.replace(".", "/").strip("/")
                     inventory: list[str] = []

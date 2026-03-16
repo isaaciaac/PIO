@@ -398,6 +398,29 @@ def test_local_python_module_detection_supports_src_layout(tmp_path: Path, monke
     assert error.error_type == "wrong_import_path"
 
 
+def test_cannot_import_submodule_reports_missing_submodule_not_missing_export(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    (tmp_path / "src" / "pkg").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    # NOTE: `pkg/constants.py` intentionally missing.
+
+    orch = Orchestrator(tmp_path)
+    blocker = "ImportError: cannot import name 'constants' from 'pkg' (C:/x/pkg/__init__.py)"
+    report = packs.TestReport(
+        commands=["pytest -q"],
+        results=[packs.TestResult(command="pytest -q", returncode=1, passed=False, stdout="", stderr=blocker)],
+        passed=False,
+        blockers=[blocker],
+        pointers=[],
+    )
+    err = orch._diagnose_test_failure(report=report, blocker_text=blocker)
+    assert err.error_type == "wrong_import_path"
+
+
 def test_failure_signature_includes_static_issue_ids(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()

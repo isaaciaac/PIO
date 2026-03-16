@@ -595,6 +595,8 @@ class ContractAuditMixin:
             add_files(files)
             issue_type_map = {
                 "py_package_shadow_root_module": "package_shadow",
+                # Missing local submodule is a path/layout issue (treat like package shadow for routing purposes).
+                "py_missing_local_submodule": "package_shadow",
                 "py_missing_local_export_symbol": "missing_export",
                 "py_local_call_signature_mismatch": "call_signature_mismatch",
                 "py_exception_taxonomy_split": "exception_taxonomy_mismatch",
