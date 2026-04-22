@@ -1,165 +1,382 @@
-# vibe-coding (MVP)
+# Vibe Coding
 
-本仓库提供一个可本地运行的 “vibe coding / 多代理编排” CLI：`vibe`。
+`Vibe Coding` 是一个本地优先的多代理软件交付 CLI。它不把模型当成“会自己完成一切的工程师”，而是把模型放进一个带事件账本、检查点、工件库、权限策略和 fix-loop 的运行时里。
 
-## 维护地图（建议先看）
+这个仓库现在已经不只是一个聊天脚本，也不是单纯的“多 agent prompt chaining”。它的核心形态更接近：
 
-- `docs/system-map.md`：系统地图、模块分工、运行链路、fix-loop 维护入口
-- `docs/prompt-index.md`：所有主要 runtime prompt 的位置索引
-- `docs/maintenance-guide.md`：当前系统状态、排错顺序、agent 维护边界
+- 一个命令行入口：`vibe`
+- 一个编排器：负责 route、plan、实现、验证、修复、恢复
+- 一组结构化对象：`RequirementPack`、`Plan`、`ImplementationBlueprint`、`CodeChange`、`IncidentPack`、`FixPlanPack`
+- 一套工作区状态目录：`.vibe/`
+- 一个可选的 VS Code 封装：`vscode-vibe/`
 
-## 提供的能力（MVP）
+如果你是第一次接手这个项目，建议先看：
 
-- `.vibe/ledger.jsonl`：事件账本（JSONL 追加写）
-- `.vibe/artifacts/`：工件库（内容寻址 sha256 去重）
-- `.vibe/checkpoints.json`：检查点（green/restore_steps 等）
-- `.vibe/branches/<branch_id>/ledger.jsonl`：分支 ledger stream
-- `.vibe/views/<agent_id>/`：每个工种的独立记忆域（结构化文件）
-- `.vibe/refstore.sqlite`：轻量 Reference Store（SQLite）
+- [docs/system-map.md](/D:/R/HongyouCoding/docs/system-map.md)
+- [docs/prompt-index.md](/D:/R/HongyouCoding/docs/prompt-index.md)
+- [docs/maintenance-guide.md](/D:/R/HongyouCoding/docs/maintenance-guide.md)
 
-## 上下文压缩（长对话防爆）
+## 项目现状
 
-当你在 VS Code 侧边栏或命令行反复 `vibe chat`，历史对话可能会逐渐变长。当前实现提供一个**简单但可审计**的压缩策略：
+当前版本已经具备这些骨架能力：
 
-- 触发：当“将要发送给模型的对话尾部 + 本轮用户消息”接近预算（按字符数估算）
-- 动作：把较早的对话归档到 `.vibe/artifacts/sha256/...*.chat.txt`（可按块拆分），并把结构化摘要写入 `.vibe/views/<agent_id>/memory.jsonl`
-- 保留：chat 里会插入一条 `system` 摘要（含 pointers + pinned 要点），并仅保留最后 N 条消息
+- `Route -> Plan -> ImplementationBlueprint -> Execute -> Verify -> Fix-loop -> Checkpoint`
+- `.vibe/ledger.jsonl` 事件账本
+- `.vibe/artifacts/` 内容寻址工件库
+- `.vibe/checkpoints.json` 检查点恢复
+- per-agent memory / lessons
+- CLI 和 VS Code 扩展两套入口
 
-你可以在 `.vibe/vibe.yaml` 里按 agent 覆盖默认预算：
+当前正在进行的治理重点：
 
-```yaml
-context:
-  defaults:
-    max_chars: 16000
-    compress_trigger_ratio: 0.85
-    keep_last_messages: 16
-    keep_last_digests: 3
-    pinned_max_items: 8
-    archive_chunk_chars: 20000
-  agents:
-    pm:
-      max_chars: 24000
-```
+- 拆分 [orchestrator.py](/D:/R/HongyouCoding/vibe/orchestrator.py)，让它更像调度器，而不是把所有规则层塞进 `run()`
+- 把“计划任务”和“修复任务”统一成工单语义
+- 让 fix-loop 更少靠临时补丁，多靠显式规则和结构化对象
 
-## 安装
+## 设计取向
+
+这个项目的设计目标不是“模拟一个会聊天的工程团队”，而是“把模型纳入一个可以审计、恢复、继续运行的工程运行时”。因此它的设计优先级大致是：
+
+1. 真实副作用可追踪
+2. 失败后可恢复
+3. 模型行为有边界
+4. 结构化对象比自然语言总结更可信
+5. prompt 只是实现细节，运行时约束才是骨架
+
+## 快速开始
+
+### 1. 安装 CLI
+
+推荐开发模式安装：
 
 ```bash
 pip install -e .
 ```
 
-## 自检
+`-e` 模式下修改 `vibe/` 里的 Python 代码后，不需要重新打包，重新运行命令即可生效。
+
+### 2. 初始化工作区
 
 ```bash
-pytest -q
+vibe init
 ```
 
-## 快速开始（mock 模式）
+这会创建 `.vibe/` 目录和默认配置。
+
+### 3. 添加任务
+
+```bash
+vibe task add "从 0 创建一个最小可运行的 Python 项目"
+```
+
+### 4. 运行工作流
+
+```bash
+vibe run --mock
+```
+
+如果你已经配置了模型密钥，也可以直接：
+
+```bash
+vibe run
+```
+
+### 5. 查看检查点
+
+```bash
+vibe checkpoint list
+```
+
+## Mock 模式
+
+如果你只是想验证“工作流骨架能不能跑通”，推荐先用 mock：
 
 ```bash
 set VIBE_MOCK_MODE=1
 vibe init
 vibe task add "hello"
 vibe run
-vibe checkpoint list
 ```
 
-## 从 0 开始搭建（空目录）
-
-在一个空目录里（可以没有 git）：
+或者：
 
 ```bash
-vibe init
-vibe task add "从 0 创建一个最小可运行的 Python 项目：包含 main.py、README、unittest 测试"
-vibe run
-```
-
-如果你还没配置 DeepSeek/DashScope key，可以用 mock 先验证“会写文件、能闭环”的能力：
-
-```bash
-vibe init
-vibe task add "从 0 创建一个最小 Python 项目"
 vibe run --mock --mock-writes
 ```
 
-## CLI 一览
+适合场景：
+
+- 验证 `.vibe/` 工作区能否正常初始化
+- 验证 CLI / checkpoint / ledger 是否通
+- 做回归测试而不依赖真实模型
+
+## 工作区目录
+
+运行过程中，绝大多数“真相”都在 `.vibe/` 里，而不在聊天总结里。
+
+关键目录和文件：
+
+- `.vibe/ledger.jsonl`
+  - 主事件账本
+  - 记录 route、plan、写文件、测试失败、incident、checkpoint 等
+
+- `.vibe/artifacts/`
+  - 保存 stdout/stderr/json 报告/patch/chat archive/fix plan
+  - 内容寻址，适合回放和审计
+
+- `.vibe/checkpoints.json`
+  - 记录恢复点
+  - resume / restore / replan 都依赖它
+
+- `.vibe/views/<agent_id>/`
+  - agent 的 memory / digest / lessons
+
+- `.vibe/branches/<branch_id>/`
+  - 分支级 ledger stream
+
+- `.vibe/refstore.sqlite`
+  - 轻量 reference store
+
+## 运行时主链路
+
+一次 `vibe run` 的主过程大致是：
+
+1. 找任务和 hints
+2. 构造 `ContextPacket`
+3. 决定 route level
+4. 生成 requirement / intent / usecases / decision / contract / plan
+5. 生成 `ImplementationBlueprint`
+6. 把 `PlanTask` 转成执行工单并逐个落地
+7. 运行 QA / verify
+8. 若失败，生成 `IncidentPack` 并进入 fix-loop
+9. 必要时 refresh blueprint / replan / restore
+10. 产出 checkpoint
+
+你可以把它理解成一个状态驱动的交付流程，而不是一次性的 prompt-response。
+
+## 核心结构化对象
+
+这些对象是整个系统的主语：
+
+- `RequirementPack`
+- `IntentExpansionPack`
+- `Plan`
+- `PlanTask`
+- `ImplementationBlueprint`
+- `ExecutionWorkOrder`
+- `CodeChange`
+- `TestReport`
+- `IncidentPack`
+- `FixPlanPack`
+
+它们的定义主要在 [packs.py](/D:/R/HongyouCoding/vibe/schemas/packs.py) 以及最近新增的运行时工单层 [work_orders.py](/D:/R/HongyouCoding/vibe/orchestration/work_orders.py)。
+
+### ExecutionWorkOrder
+
+最近的重构重点之一，是把计划任务和 fix-loop 工单统一成运行时工单对象。现在系统不再只是“拿到任务就直接交给某个 agent”，而是先把任务翻译成带边界的工单，再让执行器消费它。
+
+工单现在承载：
+
+- `owner`
+- `summary`
+- `reason`
+- `allowed_write_globs`
+- `denied_write_globs`
+- `commands`
+- `verify_commands`
+- `notes`
+- `invariants`
+
+这一步的目的，是把“哪些文件能改、为什么改、该怎么验证”从 prompt 文本里抬成正式结构。
+
+## 路由等级
+
+`vibe run` 支持 `L0` 到 `L4` 的 route level：
+
+- `L0`
+  - 快速草稿验证
+  - 不追求 green
+
+- `L1`
+  - 简单 MVP
+  - 默认档位
+
+- `L2`
+  - 多模块 / 契约 / 跨边界项目
+
+- `L3`
+  - 可发布交付
+  - 引入更多工程 gate
+
+- `L4`
+  - 生产级
+  - 包含 perf / compliance / rollback / runbook 等
+
+命令行示例：
+
+```bash
+vibe run --route auto
+vibe run --route L2
+vibe run --route L3 --style detailed
+```
+
+## 权限模式
+
+本地工具动作有 3 种权限模式：
+
+- `allow_all`
+- `prompt`
+- `chat_only`
+
+设置方式：
+
+```bash
+vibe --policy prompt run
+```
+
+或者：
+
+```bash
+set VIBE_POLICY_MODE=prompt
+```
+
+或者在 `.vibe/vibe.yaml` 中设置：
+
+```yaml
+policy:
+  mode: prompt
+```
+
+## 风格模式
+
+可通过 `behavior.style` 或命令行控制代理的“自由发挥程度”：
+
+- `free`
+- `balanced`
+- `detailed`
+
+示例：
+
+```bash
+vibe chat "帮我总结当前工程问题" --style free
+vibe run --style detailed
+```
+
+## CLI 命令总览
+
+常用命令：
 
 - `vibe init`
 - `vibe config show`
-- `vibe task add "..."`（写入 `REQ_CREATED` 到 ledger）
-- `vibe hint add "..."`（写入 `USER_HINT_ADDED`；下一次 `vibe run` 会注入到 ContextPacket.constraints）
-- `vibe chat "..."`（PM 自然语言对话；可用 `--json` 输出结构化结果）
-- `vibe run [--task <event_id>] [--mock] [--route auto|L0|L1|L2|L3|L4]`（mock 下闭环并产出 checkpoint）
-- `vibe checkpoint list/create/restore`
-- `vibe branch create --from <checkpoint_id> [--name <git_branch>]`
+- `vibe task add "..." `
+- `vibe hint add "..." `
+- `vibe chat "..."`
+- `vibe run`
+- `vibe checkpoint list`
+- `vibe checkpoint restore <id>`
+- `vibe branch create --from <checkpoint_id>`
 
-## 路由等级（L0–L4）
-
-`vibe run` 支持按风险/范围选择不同的**最小门禁档位**：
-
-- `--route auto`（默认）：由 `RouteDecider` 硬逻辑选择（低风险默认走 `L1`）
-- `--route L0`：快速（草稿验证；仅 smoke；检查点一定是 `green=false` / draft）
-- `--route L1`：简单 MVP（默认；PM→Router→Coder→QA(unit+lint)；通过才允许 `green=true`；如未检测到可跑命令，会按需调用 `env_engineer` 生成最小可运行命令并继续）
-- `--route L2`：多模块 MVP（跨模块/契约/鉴权等风险域；加 ADR-lite/契约确认/代码审查；QA 升级为 full/integration；通过才允许 `green=true`）
-- `--route L3`：可发布（交付/可复现；加 env/security/doc/release 门禁）
-- `--route L4`：生产级（高风险；含 perf/compliance/runbook/迁移回滚等门禁）
-
-说明：门禁是硬约束；但**启用哪些 agent 是按需的**（到某个 gate 才激活该 gate 需要的 agent，并写入 `AGENTS_ACTIVATED` 事件，便于审计与回放）。
-没有密钥时可用 `--mock` 先跑通闭环。
-
-## UserHint（用户提示管道）
-
-当系统卡住时，你可以把“你希望它遵守的规则/修复方向”写入 ledger，下一次 `vibe run` 会把它注入 `ContextPacket.constraints`，从而影响 PM/Router/Coder 的决策：
+推荐工作流：
 
 ```bash
-vibe hint add "不要引入不存在的库；优先用仓库已有 scripts；必要时补齐依赖声明。"
+vibe init
+vibe task add "实现一个最小可运行的 FastAPI 服务"
+vibe run --route L2
+vibe checkpoint list
+```
+
+## 用户 Hint 管道
+
+当系统卡住时，可以通过 hint 注入高优先级约束：
+
+```bash
+vibe hint add "不要引入不存在的依赖；优先使用仓库已有脚本；必要时补齐 pyproject.toml。"
 vibe run
 ```
 
-> 说明：hint 会被作为“高优先级约束”注入（并用 artifacts 指针留痕），不会替代 repo facts；repo 事实仍以 pointers/artifacts/git 为准。
+它会影响后续 `ContextPacket.constraints`，但不会覆盖 repo 事实。
 
-## Incident 胶囊（失败诊断）
+## Incident 与 Fix-loop
 
-当 QA/build/lint/test 失败进入 fix-loop 时，编排器会生成一个**确定性的 IncidentPack**（结构化诊断胶囊），并写入：
+当验证失败时，系统会生成 `IncidentPack` 和相关 artifact，然后进入 fix-loop。这里的目标不是“再猜一次”，而是：
 
-- ledger 事件：`INCIDENT_CREATED`
-- 工件：`.vibe/artifacts/sha256/...*.incident.json`
+1. 把失败压缩成结构化诊断
+2. 选一个主根因
+3. 决定是否需要 `env_engineer / ops_engineer / implementation_lead / coder / integration_engineer`
+4. 在尽量小的 write scope 内修复
+5. 分层验证
 
-IncidentPack 会把噪声日志收敛成“可执行简报”（category/summary/evidence/next_steps/required_capabilities），并注入下一轮修复提示，减少反复猜错。
+fix-loop 的“工单化”和“委派命令执行”逻辑最近已经开始从 [orchestrator.py](/D:/R/HongyouCoding/vibe/orchestrator.py) 往 [fix_runtime.py](/D:/R/HongyouCoding/vibe/orchestration/fix_runtime.py) 抽离。
 
-## 权限模式（允许 / 每次提示 / 仅聊天）
+## 当前主要代码入口
 
-你可以用三种权限模式控制本地工具（`run_cmd/git/read_file/write_file/search`）：
+如果你要读代码，建议顺序如下：
 
-- `allow_all`：全部允许（默认）
-- `prompt`：每次工具动作都会提示是否允许
-- `chat_only`：禁止本地工具动作（不会跑命令/改代码）
+1. [vibe/cli.py](/D:/R/HongyouCoding/vibe/cli.py)
+2. [vibe/orchestrator.py](/D:/R/HongyouCoding/vibe/orchestrator.py)
+3. [vibe/orchestration/planning.py](/D:/R/HongyouCoding/vibe/orchestration/planning.py)
+4. [vibe/orchestration/fix_runtime.py](/D:/R/HongyouCoding/vibe/orchestration/fix_runtime.py)
+5. [vibe/orchestration/work_orders.py](/D:/R/HongyouCoding/vibe/orchestration/work_orders.py)
+6. [vibe/routes.py](/D:/R/HongyouCoding/vibe/routes.py)
+7. [vibe/policy.py](/D:/R/HongyouCoding/vibe/policy.py)
+8. [vibe/storage/](/D:/R/HongyouCoding/vibe/storage)
+9. [vibe/schemas/packs.py](/D:/R/HongyouCoding/vibe/schemas/packs.py)
 
-设置方式三选一（优先级：命令行 > 环境变量 > 配置文件）：
+## 最近的结构治理
 
-- 命令行：`vibe --policy prompt run`
-- 环境变量：`VIBE_POLICY_MODE=prompt`
-- 配置文件：`.vibe/vibe.yaml` -> `policy.mode`
+为了让这个项目不再继续长成一整坨，最近做了两件基础治理：
 
-## “自由发挥 / 细致程度”调节
+### 1. 引入统一执行工单
 
-你可以控制代理是“少追问、先给方案”，还是“更严谨、更细化验收”。
+新增：
 
-- 配置文件：`.vibe/vibe.yaml` -> `behavior.style`（`free|balanced|detailed`）
-- 命令行覆盖：
-  - `vibe chat "..." --style free`
-  - `vibe run --style detailed`
-- VS Code 扩展：侧边栏有 `风格` 下拉框，会把选择作为 `--style` 传给 CLI
+- [vibe/orchestration/work_orders.py](/D:/R/HongyouCoding/vibe/orchestration/work_orders.py)
 
-## 默认模型分工（建议）
+作用：
 
-- **DeepSeek `deepseek-reasoner`**：需求/架构/审计/安全/合规/性能/契约确认（更偏推理、把关）
-- **DashScope `qwen-plus/qwen-flash`**：路由编排、日志压缩、文案/文档整理（更偏通用与速度）
-- **DashScope `qwen3-coder-*`**：所有“写代码/写脚本/写 CI”的工种（更偏代码生成与修复）
+- 把 `PlanTask` 和 `FixWorkOrder` 统一成 `ExecutionWorkOrder`
+- 让 write scope / commands / verification 从 prompt 里抬成正式运行时对象
 
-## VS Code 扩展（最小 IDE 封装）
+### 2. 把 planning 和 fix runtime 规则层从 orchestrator 拔出来
 
-扩展源码在 `vscode-vibe/`，提供 Dashboard + 一组 `Vibe:` 命令（调用本机 `vibe` CLI）。
-扩展支持把 DeepSeek/DashScope key 存到 VS Code SecretStorage，并在运行时自动注入给 CLI（详见 `vscode-vibe/README.md`）。
+新增：
+
+- [vibe/orchestration/planning.py](/D:/R/HongyouCoding/vibe/orchestration/planning.py)
+- [vibe/orchestration/fix_runtime.py](/D:/R/HongyouCoding/vibe/orchestration/fix_runtime.py)
+
+作用：
+
+- 让 `orchestrator` 更像调度器
+- 让 blueprint 清洗、prompt 生成、fix-loop 委派执行变成独立规则层
+- 为后续继续拆 `run()` 留出稳定边界
+
+## 安装和打包
+
+### 开发模式
+
+推荐：
+
+```bash
+pip install -e .
+```
+
+好处：
+
+- 修改 Python 代码后无需重新构建 wheel
+- 适合日常开发和本地调试
+
+### 重新安装 wheel
+
+如果你不是 `-e` 安装，而是普通安装，则修改代码后需要重新安装：
+
+```bash
+python -m build
+pip install dist/vibe_coding-*.whl --force-reinstall
+```
+
+### VS Code 扩展
+
+如果你改了 `vscode-vibe/` 下的 TypeScript，需要重新编译：
 
 ```bash
 cd vscode-vibe
@@ -167,15 +384,135 @@ npm install
 npm run compile
 ```
 
-然后在 VS Code 中打开仓库，按 `F5` 启动 Extension Development Host。
+如果你要生成 `.vsix`：
 
-## 国内模型接入（可选）
+```bash
+npm run package:vsix
+```
 
-- DeepSeek：设置 `DEEPSEEK_API_KEY`
-- DashScope：设置 `DASHSCOPE_API_KEY`
+## 配置模型
 
-默认使用 OpenAI-compatible 接口（`base_url` 在 `.vibe/vibe.yaml` 中可见）。
+当前主要支持：
+
+- DeepSeek
+- DashScope
+- OpenAI-compatible provider
+
+常见环境变量：
+
+- `DEEPSEEK_API_KEY`
+- `DASHSCOPE_API_KEY`
+
+provider/model 的默认配置见：
+
+- [vibe/config.py](/D:/R/HongyouCoding/vibe/config.py)
+
+## 测试
+
+完整回归：
+
+```bash
+pytest -q
+```
+
+开发时建议先跑聚焦测试：
+
+```bash
+pytest -q tests/test_execution_work_orders.py
+pytest -q tests/test_planning_runtime.py
+pytest -q tests/test_fix_runtime.py
+pytest -q tests/test_fix_loop_budget.py
+pytest -q tests/test_resume.py
+```
+
+这些测试覆盖了最近的核心治理方向：
+
+- 工单抽象
+- planning runtime
+- delegated fix runtime
+- fix-loop 预算
+- resume / checkpoint
+
+## 仓库结构
+
+```text
+HongyouCoding/
+├─ vibe/
+│  ├─ cli.py
+│  ├─ orchestrator.py
+│  ├─ orchestration/
+│  │  ├─ planning.py
+│  │  ├─ fix_runtime.py
+│  │  ├─ work_orders.py
+│  │  ├─ contracts.py
+│  │  └─ diagnostics.py
+│  ├─ schemas/
+│  ├─ storage/
+│  ├─ providers/
+│  ├─ tools/
+│  └─ agents/
+├─ tests/
+├─ docs/
+├─ vscode-vibe/
+└─ README.md
+```
+
+## VS Code 扩展
+
+扩展位于 [vscode-vibe/](/D:/R/HongyouCoding/vscode-vibe)。
+
+它做的事情很克制：
+
+- 提供 Dashboard / Webview
+- 调用本地 `vibe` CLI
+- 用 SecretStorage 存密钥
+- 提供一些快捷命令
+
+也就是说：**真正的核心逻辑在 Python CLI，不在扩展里。**
+
+## 维护建议
+
+如果你要继续改这个项目，建议遵守这几个原则：
+
+- 先改结构化对象，再改 prompt
+- 先补规则层，再补 UI 层
+- 先缩小边界，再放大能力
+- 先看 artifact 和 ledger，再看自然语言总结
+- 先做聚焦测试，再做大范围重构
+
+### 不建议的做法
+
+- 看到一个现象就直接改 `orchestrator.py` 某一段 prompt
+- 再继续往 `run()` 里塞一层判断
+- 遇到 fix-loop 卡住就优先补新 agent
+- 让模块既负责判断、又负责执行、又负责恢复、又负责写日志
+
+### 更建议的做法
+
+- 把规则层继续往 `vibe/orchestration/` 拆
+- 让失败语义变成显式对象，而不是临时变量
+- 用结构化测试保护边界
+- 把 README / system-map / prompt-index 同步维护
+
+## 已知局限
+
+当前系统仍然存在这些现实问题：
+
+- [orchestrator.py](/D:/R/HongyouCoding/vibe/orchestrator.py) 仍然过大
+- fix-loop 还没完全模板化
+- 仍有一部分逻辑过度依赖 prompt 收敛
+- 文档和代码之间偶尔会有滞后
+- 更复杂的 replan / restore / gate 拆分还没有彻底完成
+
+## 路线建议
+
+如果后面继续治理，我建议按这个顺序推进：
+
+1. 继续拆 fix-loop 的 diagnose / repair / verify 子域
+2. 给 `ExecutionWorkOrder` 和失败语义增加更多直接测试
+3. 让 `orchestrator` 只保留编排主线
+4. 逐步把关键 prompt 收敛成规则层 + 辅助提示
 
 ## License
 
-Apache License 2.0. See `LICENSE`.
+Apache License 2.0. See [LICENSE](/D:/R/HongyouCoding/LICENSE).
